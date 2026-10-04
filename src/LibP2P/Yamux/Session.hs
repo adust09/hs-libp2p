@@ -7,6 +7,8 @@
 -- Two background loops run per session:
 --   recvLoop: reads 12-byte headers from transport, dispatches to streams
 --   sendLoop: dequeues from ysessSendCh, writes to transport
+-- A third, keepaliveLoop, is optional and detects a peer that went
+-- silent without closing the transport.
 module LibP2P.Yamux.Session
   ( newSession
   , newSessionWith
@@ -16,6 +18,7 @@ module LibP2P.Yamux.Session
   , ping
   , pingWithTimeout
   , sendGoAway
+  , keepaliveLoop
   , recvLoop
   , sendLoop
   , acceptBacklog
@@ -175,6 +178,53 @@ pingWithTimeout timeoutUs sess = bracket register unregister $ \(pingId, waiter)
       pure (pid, w)
     unregister (pingId, _) =
       atomically $ modifyTVar' (ysessPings sess) (Map.delete pingId)
+
+-- | Keepalive loop: every 'ycKeepAliveIntervalMicros', send a Ping and
+-- wait for its ACK (spec.md, Type Field: a Ping "can also be used to
+-- heart-beat and do keep-alives over TCP").
+--
+-- An unanswered Ping means the peer is gone even though the transport
+-- never reported EOF, so the session is torn down via failSession and
+-- the ping error is returned; the caller must then stop recvLoop, which
+-- is still blocked on the dead transport.
+--
+-- Returns @Right ()@ without failing the session when there is nothing
+-- left to keep alive: keepalive is disabled, a local or remote GoAway is
+-- in effect, or the session shut down while a Ping was pending.
+keepaliveLoop :: YamuxSession -> IO (Either YamuxError ())
+keepaliveLoop sess
+  | ycEnableKeepAlive config = go
+  | otherwise = pure (Right ())
+  where
+    config = ysessConfig sess
+
+    go = do
+      timer <- registerDelay (ycKeepAliveIntervalMicros config)
+      -- Wake on the interval or as soon as a GoAway takes effect,
+      -- whichever comes first, so the loop never outlives the session
+      -- by a full interval.
+      goingAway <- atomically $ do
+        stopped <- goAwayInEffect
+        if stopped
+          then pure True
+          else do
+            elapsed <- readTVar timer
+            if elapsed then pure False else retry
+      if goingAway
+        then pure (Right ())
+        else do
+          result <- ping sess
+          case result of
+            Right () -> go
+            Left YamuxSessionShutdown -> pure (Right ())
+            Left err -> do
+              failSession sess
+              pure (Left err)
+
+    goAwayInEffect = do
+      local <- readTVar (ysessShutdown sess)
+      remote <- readTVar (ysessRemoteGoAway sess)
+      pure (local || remote /= Nothing)
 
 -- | Send a GoAway frame with the specified error code.
 -- Sets ysessShutdown to True so no new streams can be opened.

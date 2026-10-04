@@ -17,6 +17,7 @@
 module LibP2P.Yamux.HostilePeer
   ( HostilePeer (..)
   , withHostilePeer
+  , withHostilePeerWithConfig
   , injectFrame
   , expectFrame
   , expectBytes
@@ -102,10 +103,15 @@ pipeRead p n = go [] n
 
 -- | Run an action against a session wired to a raw byte peer.
 withHostilePeer :: SessionRole -> (HostilePeer -> IO a) -> IO a
-withHostilePeer role action = do
+withHostilePeer = withHostilePeerWithConfig defaultYamuxConfig
+
+-- | Like 'withHostilePeer', with an explicit session configuration.
+-- The keepalive loop is not started; tests that need it run it themselves.
+withHostilePeerWithConfig :: YamuxConfig -> SessionRole -> (HostilePeer -> IO a) -> IO a
+withHostilePeerWithConfig config role action = do
   toSession <- newPipe
   fromSession <- newPipe
-  sess <- newSession role (pipeWrite fromSession) (pipeRead toSession)
+  sess <- newSessionWith config role (pipeWrite fromSession) (pipeRead toSession)
   let nextFrame = do
         hdrBytes <- pipeRead fromSession headerSize
         case decodeHeader hdrBytes of

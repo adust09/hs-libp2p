@@ -229,6 +229,56 @@ spec = do
         yhType ack `shouldBe` FramePing
         yhLength ack `shouldBe` 7
 
+  describe "Keepalive" $ do
+    it "emits a Ping on every interval while the session is idle" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp ->
+        withAsync (keepaliveLoop (hpSession hp)) $ \_ -> do
+          (first, _) <- expectFrame hp
+          yhType first `shouldBe` FramePing
+          flagSYN (yhFlags first) `shouldBe` True
+          yhStreamId first `shouldBe` 0
+          injectFrame hp (YamuxHeader 0 FramePing (defaultFlags {flagACK = True}) 0 (yhLength first)) BS.empty
+          (second, _) <- expectFrame hp
+          yhType second `shouldBe` FramePing
+          yhLength second `shouldNotBe` yhLength first
+
+    it "fails the session and unblocks readers when a Ping goes unanswered" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp -> do
+        Right stream <- openStream (hpSession hp)
+        _ <- expectFrame hp
+        withAsync (streamRead stream) $ \readerA ->
+          withAsync (keepaliveLoop (hpSession hp)) $ \keepaliveA -> do
+            keepaliveRes <- timeout 1000000 (wait keepaliveA)
+            keepaliveRes `shouldBe` Just (Left YamuxPingTimeout)
+            readerRes <- timeout 1000000 (wait readerA)
+            readerRes `shouldBe` Just (Left YamuxStreamReset)
+        openRes <- openStream (hpSession hp)
+        shouldBeLeft YamuxSessionShutdown openRes
+
+    it "stops without pinging once closeSession sent a GoAway" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp ->
+        withAsync (keepaliveLoop (hpSession hp)) $ \keepaliveA -> do
+          closeSession (hpSession hp)
+          keepaliveRes <- timeout 1000000 (wait keepaliveA)
+          keepaliveRes `shouldBe` Just (Right ())
+          (goAway, _) <- expectFrame hp
+          yhType goAway `shouldBe` FrameGoAway
+          expectNoFrame hp
+
+    it "does not ping while a remote GoAway is in effect" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp -> do
+        injectFrame hp (YamuxHeader 0 FrameGoAway defaultFlags 0 0) BS.empty
+        awaitRemoteGoAway (hpSession hp) GoAwayNormal
+        keepaliveRes <- timeout 1000000 (keepaliveLoop (hpSession hp))
+        keepaliveRes `shouldBe` Just (Right ())
+        expectNoFrame hp
+
+    it "does nothing when keepalive is disabled" $
+      withHostilePeerWithConfig keepaliveConfig {ycEnableKeepAlive = False} RoleClient $ \hp -> do
+        keepaliveRes <- timeout 1000000 (keepaliveLoop (hpSession hp))
+        keepaliveRes `shouldBe` Just (Right ())
+        expectNoFrame hp
+
   describe "GoAway" $ do
     it "GoAway Normal (0x00) sets ysessShutdown" $ do
       withSessionPair $ \(client, _server) -> do
@@ -600,6 +650,21 @@ readAll stream n = go BS.empty
           go (acc <> chunk)
 
 -- | Helper to assert an Either is a Left with a specific error value.
+-- | Short keepalive timings so the tests finish well within a second
+-- (go-yamux's test config uses 100ms / 350ms the same way).
+keepaliveConfig :: YamuxConfig
+keepaliveConfig =
+  defaultYamuxConfig
+    { ycKeepAliveIntervalMicros = 100000
+    , ycPingTimeoutMicros = 350000
+    }
+
+-- | Assert the session writes nothing for three keepalive intervals.
+expectNoFrame :: HostilePeer -> Expectation
+expectNoFrame hp = do
+  mFrame <- timeout 300000 (hpNextFrame hp)
+  fmap fst mFrame `shouldBe` Nothing
+
 shouldBeLeft :: (Show e, Eq e) => e -> Either e a -> Expectation
 shouldBeLeft expected (Left actual) = actual `shouldBe` expected
 shouldBeLeft expected (Right _) =
