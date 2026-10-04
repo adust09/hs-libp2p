@@ -11,6 +11,8 @@ module LibP2P.Yamux.Types
   , YamuxStream (..)
   , YamuxSession (..)
   , PingWaiter
+  , YamuxConfig (..)
+  , defaultYamuxConfig
   ) where
 
 import Control.Concurrent.STM (TBQueue, TMVar, TQueue, TVar)
@@ -22,6 +24,23 @@ import LibP2P.Yamux.Frame (GoAwayCode, YamuxHeader)
 -- | Result delivered to a pending ping waiter: Right on a matching ACK,
 -- Left when the session dies before the ACK arrives.
 type PingWaiter = TMVar (Either YamuxError ())
+
+-- | Session tunables that spec.md leaves to the implementation.
+data YamuxConfig = YamuxConfig
+  { ycEnableKeepAlive :: !Bool
+  , ycKeepAliveIntervalMicros :: !Int -- ^ Time between keepalive pings
+  , ycPingTimeoutMicros :: !Int -- ^ How long to wait for a Ping ACK before the session is considered dead
+  }
+  deriving (Show, Eq)
+
+-- | go-yamux defaults: keepalive enabled, 30s interval, 10s ping timeout.
+defaultYamuxConfig :: YamuxConfig
+defaultYamuxConfig =
+  YamuxConfig
+    { ycEnableKeepAlive = True
+    , ycKeepAliveIntervalMicros = 30000000
+    , ycPingTimeoutMicros = 10000000
+    }
 
 -- | SessionRole determines stream ID parity (spec.md §Stream Identification).
 -- Client uses odd IDs (1, 3, 5, ...), Server uses even IDs (2, 4, 6, ...).
@@ -63,7 +82,8 @@ data YamuxStream = YamuxStream
 
 -- | Session state.
 data YamuxSession = YamuxSession
-  { ysessRole :: !SessionRole
+  { ysessConfig :: !YamuxConfig
+  , ysessRole :: !SessionRole
   , ysessNextStreamId :: !(TVar Word32) -- ^ Next ID to allocate
   , ysessStreams :: !(TVar (Map.Map Word32 YamuxStream)) -- ^ Active streams
   , ysessAcceptCh :: !(TBQueue YamuxStream) -- ^ Inbound streams, bounded to acceptBacklog (256); excess SYNs are reset

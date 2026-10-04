@@ -9,6 +9,7 @@
 --   sendLoop: dequeues from ysessSendCh, writes to transport
 module LibP2P.Yamux.Session
   ( newSession
+  , newSessionWith
   , closeSession
   , openStream
   , acceptStream
@@ -38,7 +39,11 @@ acceptBacklog = 256
 -- | Create a new Yamux session over a transport connection.
 -- Client uses odd stream IDs starting at 1, server uses even starting at 2.
 newSession :: SessionRole -> (ByteString -> IO ()) -> (Int -> IO ByteString) -> IO YamuxSession
-newSession role writeFn readFn = do
+newSession = newSessionWith defaultYamuxConfig
+
+-- | Like 'newSession', with an explicit configuration.
+newSessionWith :: YamuxConfig -> SessionRole -> (ByteString -> IO ()) -> (Int -> IO ByteString) -> IO YamuxSession
+newSessionWith config role writeFn readFn = do
   let startId = case role of
         RoleClient -> 1
         RoleServer -> 2
@@ -52,7 +57,8 @@ newSession role writeFn readFn = do
   nextPingId <- newTVarIO 1
   pure
     YamuxSession
-      { ysessRole = role
+      { ysessConfig = config
+      , ysessRole = role
       , ysessNextStreamId = nextId
       , ysessStreams = streams
       , ysessAcceptCh = acceptCh
