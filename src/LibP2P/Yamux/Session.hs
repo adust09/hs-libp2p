@@ -189,8 +189,12 @@ pingWithTimeout timeoutUs sess = bracket register unregister $ \(pingId, waiter)
 -- is still blocked on the dead transport.
 --
 -- Returns @Right ()@ without failing the session when there is nothing
--- left to keep alive: keepalive is disabled, a local or remote GoAway is
--- in effect, or the session shut down while a Ping was pending.
+-- left to keep alive: keepalive is disabled, or the session was shut
+-- down locally (GoAway sent, or torn down by failSession).
+--
+-- A remote GoAway does not stop the loop. The session stays open after
+-- one until the transport reports EOF, so a peer that sends GoAway and
+-- then goes silent still has to be detected here.
 keepaliveLoop :: YamuxSession -> IO (Either YamuxError ())
 keepaliveLoop sess
   | ycEnableKeepAlive config = go
@@ -200,17 +204,17 @@ keepaliveLoop sess
 
     go = do
       timer <- registerDelay (ycKeepAliveIntervalMicros config)
-      -- Wake on the interval or as soon as a GoAway takes effect,
+      -- Wake on the interval or as soon as the session shuts down,
       -- whichever comes first, so the loop never outlives the session
       -- by a full interval.
-      goingAway <- atomically $ do
-        stopped <- goAwayInEffect
+      shutDown <- atomically $ do
+        stopped <- readTVar (ysessShutdown sess)
         if stopped
           then pure True
           else do
             elapsed <- readTVar timer
             if elapsed then pure False else retry
-      if goingAway
+      if shutDown
         then pure (Right ())
         else do
           result <- ping sess
@@ -220,11 +224,6 @@ keepaliveLoop sess
             Left err -> do
               failSession sess
               pure (Left err)
-
-    goAwayInEffect = do
-      local <- readTVar (ysessShutdown sess)
-      remote <- readTVar (ysessRemoteGoAway sess)
-      pure (local || remote /= Nothing)
 
 -- | Send a GoAway frame with the specified error code.
 -- Sets ysessShutdown to True so no new streams can be opened.

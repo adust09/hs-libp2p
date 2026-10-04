@@ -265,13 +265,18 @@ spec = do
           yhType goAway `shouldBe` FrameGoAway
           expectNoFrame hp
 
-    it "does not ping while a remote GoAway is in effect" $
+    it "keeps pinging after a remote GoAway and fails the session if the peer then goes silent" $
       withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp -> do
         injectFrame hp (YamuxHeader 0 FrameGoAway defaultFlags 0 0) BS.empty
         awaitRemoteGoAway (hpSession hp) GoAwayNormal
-        keepaliveRes <- timeout 1000000 (keepaliveLoop (hpSession hp))
-        keepaliveRes `shouldBe` Just (Right ())
-        expectNoFrame hp
+        withAsync (keepaliveLoop (hpSession hp)) $ \keepaliveA -> do
+          (first, _) <- expectFrame hp
+          yhType first `shouldBe` FramePing
+          injectFrame hp (YamuxHeader 0 FramePing (defaultFlags {flagACK = True}) 0 (yhLength first)) BS.empty
+          (second, _) <- expectFrame hp
+          yhType second `shouldBe` FramePing
+          keepaliveRes <- timeout 1000000 (wait keepaliveA)
+          keepaliveRes `shouldBe` Just (Left YamuxPingTimeout)
 
     it "does nothing when keepalive is disabled" $
       withHostilePeerWithConfig keepaliveConfig {ycEnableKeepAlive = False} RoleClient $ \hp -> do
