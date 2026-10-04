@@ -14,6 +14,7 @@ module LibP2P.Yamux.Session
   , openStream
   , acceptStream
   , ping
+  , pingWithTimeout
   , sendGoAway
   , recvLoop
   , sendLoop
@@ -21,14 +22,16 @@ module LibP2P.Yamux.Session
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (finally)
+import Control.Exception (bracket, finally)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
+import Data.Maybe (fromMaybe)
 import Data.Word (Word32)
 import LibP2P.Yamux.Frame
 import LibP2P.Yamux.Types
 import Numeric.Natural (Natural)
+import System.Timeout (timeout)
 
 -- | Maximum number of inbound streams buffered while the application
 -- is not accepting (go-yamux AcceptBacklog). The spec requires this
@@ -136,16 +139,20 @@ acceptStream sess = do
       _ -> pure ()
   pure (Right stream)
 
--- | Send a Ping and wait for the ACK response.
+-- | Send a Ping and wait for the ACK response, for at most the
+-- session's configured 'ycPingTimeoutMicros'.
 -- Ping uses StreamID 0 and the Length field carries an opaque value.
 ping :: YamuxSession -> IO (Either YamuxError ())
-ping sess = do
-  (pingId, waiter) <- atomically $ do
-    pid <- readTVar (ysessNextPingId sess)
-    writeTVar (ysessNextPingId sess) (pid + 1)
-    w <- newEmptyTMVar
-    modifyTVar' (ysessPings sess) (Map.insert pid w)
-    pure (pid, w)
+ping sess = pingWithTimeout (ycPingTimeoutMicros (ysessConfig sess)) sess
+
+-- | Send a Ping and wait at most the given number of microseconds for
+-- the ACK. Returns YamuxPingTimeout when no ACK arrives in time.
+--
+-- The waiter is removed from ysessPings on every exit path (ACK,
+-- timeout, session failure, cancellation), so an ACK that arrives late
+-- is ignored like any other unsolicited ACK.
+pingWithTimeout :: Int -> YamuxSession -> IO (Either YamuxError ())
+pingWithTimeout timeoutUs sess = bracket register unregister $ \(pingId, waiter) -> do
   -- Send Ping SYN frame
   let hdr =
         YamuxHeader
@@ -157,10 +164,17 @@ ping sess = do
           }
   atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
   -- Wait for ACK (or a session-failure notification)
-  result <- atomically $ takeTMVar waiter
-  -- Cleanup
-  atomically $ modifyTVar' (ysessPings sess) (Map.delete pingId)
-  pure result
+  result <- timeout timeoutUs $ atomically $ takeTMVar waiter
+  pure (fromMaybe (Left YamuxPingTimeout) result)
+  where
+    register = atomically $ do
+      pid <- readTVar (ysessNextPingId sess)
+      writeTVar (ysessNextPingId sess) (pid + 1)
+      w <- newEmptyTMVar
+      modifyTVar' (ysessPings sess) (Map.insert pid w)
+      pure (pid, w)
+    unregister (pingId, _) =
+      atomically $ modifyTVar' (ysessPings sess) (Map.delete pingId)
 
 -- | Send a GoAway frame with the specified error code.
 -- Sets ysessShutdown to True so no new streams can be opened.

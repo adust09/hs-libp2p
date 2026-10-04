@@ -67,6 +67,7 @@ data YamuxError
   | YamuxStreamReset -- ^ RST received
   | YamuxSessionShutdown -- ^ GoAway received or session closed
   | YamuxGoAway !GoAwayCode -- ^ Remote sent GoAway with specific code
+  | YamuxPingTimeout -- ^ No Ping ACK within the timeout
   deriving (Show, Eq)
 
 -- | Per-stream state (spec.md §Flow Control: per-stream windows only).

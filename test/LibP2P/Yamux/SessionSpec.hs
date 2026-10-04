@@ -199,6 +199,27 @@ spec = do
         result <- timeout 1000000 (wait pingA)
         result `shouldBe` Just (Right ())
 
+    it "times out with YamuxPingTimeout when no ACK arrives and drops the waiter" $
+      withHostilePeer RoleClient $ \hp -> do
+        result <- timeout 1000000 (pingWithTimeout 100000 (hpSession hp))
+        result `shouldBe` Just (Left YamuxPingTimeout)
+        waiters <- readTVarIO (ysessPings (hpSession hp))
+        null waiters `shouldBe` True
+
+    it "ignores a Ping ACK that arrives after the timeout" $
+      withHostilePeer RoleClient $ \hp -> do
+        pingA <- async (pingWithTimeout 100000 (hpSession hp))
+        (syn, _) <- expectFrame hp
+        result <- timeout 1000000 (wait pingA)
+        result `shouldBe` Just (Left YamuxPingTimeout)
+        injectFrame hp (YamuxHeader 0 FramePing (defaultFlags {flagACK = True}) 0 (yhLength syn)) BS.empty
+        -- Session must survive: a fresh ping still resolves on its own ACK
+        pingB <- async (pingWithTimeout 1000000 (hpSession hp))
+        (syn2, _) <- expectFrame hp
+        injectFrame hp (YamuxHeader 0 FramePing (defaultFlags {flagACK = True}) 0 (yhLength syn2)) BS.empty
+        result2 <- timeout 1000000 (wait pingB)
+        result2 `shouldBe` Just (Right ())
+
     it "ignores an unsolicited Ping ACK" $
       withHostilePeer RoleServer $ \hp -> do
         injectFrame hp (YamuxHeader 0 FramePing (defaultFlags {flagACK = True}) 0 99) BS.empty
