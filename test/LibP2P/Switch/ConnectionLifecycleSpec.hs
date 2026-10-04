@@ -189,6 +189,16 @@ mkFreezableTransport frozen inner = inner
       isFrozen <- readTVar frozen
       if isFrozen then retry else pure x
 
+-- | Keepalive short enough for a silent peer to be detected well inside
+-- the test's deadline (the 30s default would outlast it).
+fastKeepAliveConfig :: Public.SwitchConfig
+fastKeepAliveConfig = Public.defaultSwitchConfig
+  { Public.scYamuxConfig = Public.defaultYamuxConfig
+      { Public.ycKeepAliveIntervalMicros = 100000
+      , Public.ycPingTimeoutMicros = 350000
+      }
+  }
+
 -- | Run with a dialer A whose TCP connections can be frozen and a plain
 -- TCP listener B. The flag is cleared before teardown so cleanup never
 -- waits on a frozen read.
@@ -209,7 +219,7 @@ withFreezablePeers action = do
   where
     mkFreezableNode frozen = do
       (pid, kp) <- mkTestIdentity
-      sw <- newSwitch pid kp
+      sw <- Public.newSwitchWith fastKeepAliveConfig pid kp
       tcp <- newTCPTransport
       addTransport sw (mkFreezableTransport frozen tcp)
       pure (sw, pid)
