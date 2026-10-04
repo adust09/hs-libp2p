@@ -203,20 +203,15 @@ keepaliveLoop sess
     config = ysessConfig sess
 
     go = do
-      timer <- registerDelay (ycKeepAliveIntervalMicros config)
       -- Wake on the interval or as soon as the session shuts down,
       -- whichever comes first, so the loop never outlives the session
-      -- by a full interval.
-      shutDown <- atomically $ do
-        stopped <- readTVar (ysessShutdown sess)
-        if stopped
-          then pure True
-          else do
-            elapsed <- readTVar timer
-            if elapsed then pure False else retry
-      if shutDown
-        then pure (Right ())
-        else do
+      -- by a full interval. System.Timeout rather than registerDelay:
+      -- the latter throws on the non-threaded runtime.
+      shutDown <- timeout (ycKeepAliveIntervalMicros config) $
+        atomically (readTVar (ysessShutdown sess) >>= check)
+      case shutDown of
+        Just () -> pure (Right ())
+        Nothing -> do
           result <- ping sess
           case result of
             Right () -> go
