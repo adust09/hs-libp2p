@@ -5,7 +5,7 @@
 module LibP2P.Protocol.GossipSub.HandlerSpec (spec) where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (async)
+import Control.Concurrent.Async (Async, async, cancel)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( atomically
@@ -13,9 +13,12 @@ import Control.Concurrent.STM
   , readTVar
   , writeTVar
   )
+import Control.Monad (unless)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
+import LibP2P.Multiaddr (Multiaddr (..))
+import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair (..), publicKey, sign)
 import LibP2P.Crypto.PeerId (PeerId (..), fromPublicKey, peerIdBytes)
@@ -61,7 +64,13 @@ import LibP2P.Protocol.GossipSub.Types
   , maxRPCSize
   )
 import LibP2P.Switch (lookupStreamHandler, newSwitch, setStreamHandler)
-import LibP2P.Switch.Types (Switch (..))
+import LibP2P.Switch.Types
+  ( ConnState (..)
+  , Connection (..)
+  , Direction (..)
+  , MuxerSession (..)
+  , Switch (..)
+  )
 import System.Timeout (timeout)
 import Test.Hspec
 import Data.Time.Clock (getCurrentTime)
@@ -101,6 +110,45 @@ testParams :: GossipSubParams
 testParams = defaultGossipSubParams
   { paramHeartbeatInterval = 10.0  -- Long interval so heartbeat doesn't interfere
   }
+
+-- | Connection whose muxer yields one stream that accepts GossipSub.
+mkGossipConn :: PeerId -> IO (Connection, Async NegotiationResult)
+mkGossipConn pid = do
+  (localStream, remoteStream) <- mkMemoryStreamPair
+  responder <- async $ negotiateResponder remoteStream
+    [gossipSubProtocolId, gossipSubProtocolIdV10, floodSubProtocolId]
+  stateVar <- newTVarIO ConnOpen
+  let conn = Connection
+        { connPeerId     = pid
+        , connDirection  = Inbound
+        , connLocalAddr  = Multiaddr [IP4 0x7f000001, TCP 0]
+        , connRemoteAddr = Multiaddr [IP4 0x7f000001, TCP 4001]
+        , connSecurity   = "/noise"
+        , connMuxer      = "/yamux/1.0.0"
+        , connSession    = MuxerSession
+            { muxOpenStream   = pure localStream
+            , muxAcceptStream = fail "test: no accept"
+            , muxClose        = pure ()
+            }
+        , connState      = stateVar
+        }
+  pure (conn, responder)
+
+-- | Run every Switch connection notifier, as a new connection would.
+fireNotifiers :: Switch -> Connection -> IO ()
+fireNotifiers sw conn = do
+  notifiers <- atomically $ readTVar (swNotifiers sw)
+  mapM_ ($ conn) notifiers
+
+-- | Poll until the peer has a cached outbound GossipSub stream.
+waitForCachedStream :: GossipSubNode -> PeerId -> Int -> IO Bool
+waitForCachedStream node pid left
+  | left <= 0 = pure False
+  | otherwise = do
+      streams <- atomically $ readTVar (gsnStreams node)
+      if Map.member pid streams
+        then pure True
+        else threadDelay 50000 >> waitForCachedStream node pid (left - 1)
 
 -- | Empty RPC for testing.
 emptyRPC :: RPC
@@ -351,6 +399,61 @@ spec = do
       case hbAfter of
         Nothing -> pure ()
         Just _  -> expectationFailure "heartbeat should not be running after stop"
+
+    -- Issue #283: stop must detach the connection notifier. A later
+    -- connection must not open a GossipSub stream or call addPeer, and
+    -- a second start must not stack notifiers.
+    it "does not stack connection notifiers when started twice" $ do
+      (sw, _pid) <- mkTestSwitch
+      node <- newGossipSubNode sw testParams
+      notifiersBefore <- atomically $ length <$> readTVar (swNotifiers sw)
+      startGossipSub node
+      startGossipSub node
+      notifiersAfter <- atomically $ length <$> readTVar (swNotifiers sw)
+      (notifiersAfter - notifiersBefore) `shouldBe` 1
+      stopGossipSub node
+
+    it "opens a stream while started and ignores connections after stop" $ do
+      (sw, _pid) <- mkTestSwitch
+      (livePid, _) <- mkTestIdentity
+      (latePid, _) <- mkTestIdentity
+      node <- newGossipSubNode sw testParams
+      startGossipSub node
+      (liveConn, liveResponder) <- mkGossipConn livePid
+      fireNotifiers sw liveConn
+      opened <- waitForCachedStream node livePid 40
+      opened `shouldBe` True
+      cancel liveResponder
+      stopGossipSub node
+      (lateConn, lateResponder) <- mkGossipConn latePid
+      fireNotifiers sw lateConn
+      -- Give a stopped notifier time to misbehave if it is still live.
+      threadDelay 300000
+      streams <- atomically $ readTVar (gsnStreams node)
+      Map.member latePid streams `shouldBe` False
+      peers <- atomically $ readTVar (gsPeers (gsnRouter node))
+      unless (Map.notMember latePid peers) $ do
+        expectationFailure "stopped node must not addPeer"
+      cancel lateResponder
+
+    it "opens a stream again after stop and start" $ do
+      (sw, _pid) <- mkTestSwitch
+      (pid, _) <- mkTestIdentity
+      node <- newGossipSubNode sw testParams
+      notifiersBefore <- atomically $ length <$> readTVar (swNotifiers sw)
+      startGossipSub node
+      stopGossipSub node
+      startGossipSub node
+      notifiersAfter <- atomically $ length <$> readTVar (swNotifiers sw)
+      (notifiersAfter - notifiersBefore) `shouldBe` 1
+      (conn, responder) <- mkGossipConn pid
+      fireNotifiers sw conn
+      opened <- waitForCachedStream node pid 40
+      opened `shouldBe` True
+      peers <- atomically $ readTVar (gsPeers (gsnRouter node))
+      Map.member pid peers `shouldBe` True
+      cancel responder
+      stopGossipSub node
 
   describe "Two-node exchange" $ do
     it "two nodes exchange subscription announcements via memory streams" $ do

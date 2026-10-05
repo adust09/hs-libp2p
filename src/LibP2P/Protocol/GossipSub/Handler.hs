@@ -39,7 +39,9 @@ import Control.Concurrent.STM
   , modifyTVar'
   )
 import Control.Exception (SomeException, catch)
+import Control.Monad (when)
 import Data.ByteString (ByteString)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import Data.Time.Clock (getCurrentTime)
 import LibP2P.Crypto.PeerId (PeerId)
@@ -118,6 +120,15 @@ data GossipSubNode = GossipSubNode
   , gsnSwitch    :: !Switch
   , gsnHeartbeat :: !(TVar (Maybe (Async ())))
   , gsnStreams   :: !(TVar (Map.Map PeerId StreamIO))  -- ^ Cached outbound streams per peer
+  , gsnConnectHook :: !(IORef (Maybe (Connection -> IO ())))
+    -- ^ Connection notifier body. 'stopGossipSub' clears it so a stopped
+    -- node cannot open streams for connections that arrive later (#283).
+  , gsnNotifierInstalled :: !(TVar Bool)
+    -- ^ The Switch holds one wrapper. Start is idempotent so a second
+    -- start does not stack another wrapper on 'swNotifiers'.
+  , gsnStarted :: !(TVar Bool)
+    -- ^ True between a successful start and stop. A second start does
+    -- not register another handler set or heartbeat.
   }
 
 -- | Create a new GossipSub node with a Router wired to the Switch.
@@ -128,6 +139,9 @@ newGossipSubNode :: Switch -> GossipSubParams -> IO GossipSubNode
 newGossipSubNode sw params = do
   streamsVar <- newTVarIO Map.empty
   hbVar <- newTVarIO Nothing
+  hook <- newIORef Nothing
+  installed <- newTVarIO False
+  started <- newTVarIO False
   -- Create router with real sendRPC that uses the Switch
   let localPid = swLocalPeerId sw
   router <- newRouter params localPid (sendRPCviaSwitch sw streamsVar) getCurrentTime
@@ -136,6 +150,9 @@ newGossipSubNode sw params = do
     , gsnSwitch    = sw
     , gsnHeartbeat = hbVar
     , gsnStreams   = streamsVar
+    , gsnConnectHook = hook
+    , gsnNotifierInstalled = installed
+    , gsnStarted = started
     }
 
 -- | Send an RPC to a peer via cached or newly opened stream.
@@ -242,21 +259,58 @@ syncSignedPeerRecord node pid = do
     (Map.lookup pid store >>= idSignedPeerRecord)
 
 -- | Start the GossipSub node: register stream handler, notifier, and start heartbeat.
+--
+-- Idempotent. A second start does not stack connection notifiers or
+-- heartbeats. 'stopGossipSub' clears the notifier body so a later
+-- connection does not open a stream (#283).
 startGossipSub :: GossipSubNode -> IO ()
 startGossipSub node = do
-  -- Register inbound stream handlers for both protocol versions (#157)
+  writeIORef (gsnConnectHook node) (Just (onNewConnection node))
+  installConnectNotifier node
+  claimed <- claimStart node
+  when claimed $ do
+    registerHandlers node
+    hbAsync <- runHeartbeat (gsnRouter node)
+    atomically $ writeTVar (gsnHeartbeat node) (Just hbAsync)
+
+-- | Claim the start so two concurrent or repeated starts share one heartbeat.
+claimStart :: GossipSubNode -> IO Bool
+claimStart node = atomically $ do
+  started <- readTVar (gsnStarted node)
+  if started
+    then pure False
+    else do
+      writeTVar (gsnStarted node) True
+      pure True
+
+-- | Install the connection-notifier wrapper once. Later starts reuse it.
+installConnectNotifier :: GossipSubNode -> IO ()
+installConnectNotifier node = do
+  install <- atomically $ do
+    installed <- readTVar (gsnNotifierInstalled node)
+    if installed
+      then pure False
+      else do
+        writeTVar (gsnNotifierInstalled node) True
+        pure True
+  when install $ atomically $
+    modifyTVar' (swNotifiers (gsnSwitch node)) (runConnectHook node :)
+
+-- | Run the current connect hook, or do nothing after stop.
+runConnectHook :: GossipSubNode -> Connection -> IO ()
+runConnectHook node conn = do
+  mAct <- readIORef (gsnConnectHook node)
+  mapM_ ($ conn) mAct
+
+-- | Register inbound stream handlers for every advertised protocol id.
+registerHandlers :: GossipSubNode -> IO ()
+registerHandlers node =
   mapM_ (\protoId ->
       setStreamHandler (gsnSwitch node) protoId
         (\conn stream ->
           handleGossipSubStream node stream (connPeerId conn)
             (protocolFor protoId) (remoteIPBytes conn)))
     gossipSubProtocolIds
-  -- Register connection notifier to auto-open GossipSub streams to new peers
-  atomically $ modifyTVar' (swNotifiers (gsnSwitch node))
-    (onNewConnection node :)
-  -- Start heartbeat background thread
-  hbAsync <- runHeartbeat (gsnRouter node)
-  atomically $ writeTVar (gsnHeartbeat node) (Just hbAsync)
 
 -- | Called on new connection: open a GossipSub stream to the peer.
 -- Caches the stream for outbound writes and starts a read loop
@@ -318,10 +372,16 @@ outboundReadLoop node stream pid = loop
           handleRPC (gsnRouter node) pid rpc
           loop
 
--- | Stop the GossipSub node: cancel heartbeat and unregister handler.
+-- | Stop the GossipSub node: disable the connection notifier, cancel
+-- heartbeat, and unregister handlers.
+--
+-- The wrapper stays on 'swNotifiers' but reads a cleared hook, so a
+-- connection established after stop does not open a stream or call
+-- 'addPeer'. A later start re-arms the same wrapper (#283).
 stopGossipSub :: GossipSubNode -> IO ()
 stopGossipSub node = do
-  -- Cancel heartbeat
+  writeIORef (gsnConnectHook node) Nothing
+  atomically $ writeTVar (gsnStarted node) False
   mHb <- atomically $ do
     hb <- readTVar (gsnHeartbeat node)
     writeTVar (gsnHeartbeat node) Nothing
@@ -329,7 +389,6 @@ stopGossipSub node = do
   case mHb of
     Just hbAsync -> cancel hbAsync `catch` (\(_ :: SomeException) -> pure ())
     Nothing -> pure ()
-  -- Unregister stream handlers for both protocol versions
   mapM_ (removeStreamHandler (gsnSwitch node)) gossipSubProtocolIds
 
 -- | Subscribe to a topic.
