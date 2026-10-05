@@ -31,6 +31,7 @@ services:
     build:
       context: .
       dockerfile: interop/kad-dht-node/Dockerfile
+    image: hs-libp2p-kad-dht-node:latest
     depends_on:
       redis:
         condition: service_healthy
@@ -44,6 +45,7 @@ services:
     build:
       context: .
       dockerfile: interop/kad-dht-node/Dockerfile
+    image: hs-libp2p-kad-dht-node:latest
     depends_on:
       redis:
         condition: service_healthy
@@ -58,6 +60,7 @@ services:
     build:
       context: .
       dockerfile: interop/kad-dht-node/Dockerfile
+    image: hs-libp2p-kad-dht-node:latest
     depends_on:
       redis:
         condition: service_healthy

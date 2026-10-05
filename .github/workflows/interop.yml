@@ -142,13 +142,16 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build libp2p kad-dht node image
+      # Build the hs-libp2p Kademlia DHT image once with a GHA-backed Docker
+      # layer cache. All three compose test services consume the shared image
+      # via `image: hs-libp2p-kad-dht-node:latest`.
+      - name: Build hs-libp2p kad-dht node image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: interop/kad-dht-node/Dockerfile
           load: true
-          tags: libp2p-kad-dht-node:latest
+          tags: hs-libp2p-kad-dht-node:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
