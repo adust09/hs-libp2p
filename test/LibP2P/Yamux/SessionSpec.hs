@@ -208,6 +208,37 @@ spec = do
         yhType ack `shouldBe` FramePing
         yhLength ack `shouldBe` 7
 
+  describe "Frame counters" $ do
+    it "numbers queued frames consecutively from 1, including unnumbered enqueues" $ do
+      sess <- newSession RoleClient (\_ -> pure ()) (\_ -> pure BS.empty)
+      let pingSyn i = YamuxHeader 0 FramePing (defaultFlags {flagSYN = True}) 0 i
+      first <- atomically $ enqueueFrameNumbered sess (pingSyn 1) BS.empty
+      atomically $ enqueueFrame sess (pingSyn 2) BS.empty
+      third <- atomically $ enqueueFrameNumbered sess (pingSyn 3) BS.empty
+      (first, third) `shouldBe` (1, 3)
+
+    it "awaitFrameWritten returns only once sendLoop has written the frame" $ do
+      -- The transport write blocks until the gate opens, holding sendLoop
+      -- in the middle of writing the frame
+      gate <- newEmptyTMVarIO
+      sess <- newSession RoleClient (\_ -> atomically (takeTMVar gate)) (\_ -> pure BS.empty)
+      withAsync (sendLoop sess) $ \_ -> do
+        n <- atomically $ enqueueFrameNumbered sess (YamuxHeader 0 FramePing (defaultFlags {flagSYN = True}) 0 1) BS.empty
+        early <- timeout 100000 (atomically (awaitFrameWritten sess n))
+        early `shouldBe` Nothing
+        atomically $ putTMVar gate ()
+        written <- timeout 1000000 (atomically (awaitFrameWritten sess n))
+        written `shouldBe` Just ()
+
+    it "counts every frame header recvLoop reads, whatever its type" $
+      withHostilePeer RoleClient $ \hp -> do
+        injectFrame hp (YamuxHeader 0 FramePing (defaultFlags {flagACK = True}) 0 99) BS.empty
+        injectFrame hp (YamuxHeader 0 FramePing (defaultFlags {flagSYN = True}) 0 7) BS.empty
+        injectFrame hp (YamuxHeader 0 FrameGoAway defaultFlags 0 0) BS.empty
+        -- The GoAway is the last frame, so once it is handled all three were read
+        awaitRemoteGoAway (hpSession hp) GoAwayNormal
+        readTVarIO (ysessRecvCount (hpSession hp)) `shouldReturn` 3
+
   describe "GoAway" $ do
     it "GoAway Normal (0x00) sets ysessShutdown" $ do
       withSessionPair $ \(client, _server) -> do

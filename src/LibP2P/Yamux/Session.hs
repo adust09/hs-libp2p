@@ -50,6 +50,9 @@ newSession role writeFn readFn = do
   remoteGoAway <- newTVarIO Nothing
   pings <- newTVarIO Map.empty
   nextPingId <- newTVarIO 1
+  queuedCount <- newTVarIO 0
+  sentCount <- newTVarIO 0
+  recvCount <- newTVarIO 0
   pure
     YamuxSession
       { ysessRole = role
@@ -61,6 +64,9 @@ newSession role writeFn readFn = do
       , ysessRemoteGoAway = remoteGoAway
       , ysessPings = pings
       , ysessNextPingId = nextPingId
+      , ysessQueuedCount = queuedCount
+      , ysessSentCount = sentCount
+      , ysessRecvCount = recvCount
       , ysessWrite = writeFn
       , ysessRead = readFn
       }
@@ -186,6 +192,7 @@ recvLoop sess = go `finally` failSession sess
     go = do
       -- Read 12-byte header
       headerBytes <- ysessRead sess headerSize
+      atomically $ modifyTVar' (ysessRecvCount sess) (+ 1)
       case decodeHeader headerBytes of
         -- Malformed header (unknown frame type): tell the peer why we
         -- are leaving before terminating, as go-yamux does
@@ -452,6 +459,7 @@ sendLoop sess = go
       (hdr, payload) <- atomically $ readTQueue (ysessSendCh sess)
       ysessWrite sess (encodeHeader hdr)
       when (BS.length payload > 0) $ ysessWrite sess payload
+      atomically $ modifyTVar' (ysessSentCount sess) (+ 1)
       go
 
 -- | Create a new YamuxStream with the given initial state.
