@@ -103,7 +103,7 @@ openStream sess = do
               , yhStreamId = sid
               , yhLength = 0
               }
-      atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
+      atomically $ enqueueFrame sess hdr BS.empty
       pure (Right stream)
 
 -- | Accept an inbound stream. Blocks until a remote SYN arrives.
@@ -120,7 +120,7 @@ acceptStream sess = do
           , yhStreamId = ysStreamId stream
           , yhLength = 0
           }
-  atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
+  atomically $ enqueueFrame sess hdr BS.empty
   -- Transition to Established only from SYNReceived. The remote may have
   -- already half-closed (FIN) before we accepted; that state must survive.
   atomically $ do
@@ -149,7 +149,7 @@ ping sess = do
           , yhStreamId = 0
           , yhLength = pingId
           }
-  atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
+  atomically $ enqueueFrame sess hdr BS.empty
   -- Wait for ACK (or a session-failure notification)
   result <- atomically $ takeTMVar waiter
   -- Cleanup
@@ -170,7 +170,7 @@ sendGoAway sess code = do
           , yhStreamId = 0
           , yhLength = errCode
           }
-  atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
+  atomically $ enqueueFrame sess hdr BS.empty
 
 -- | Receive loop: reads 12-byte headers from transport and dispatches frames.
 -- This loop runs until the transport connection is closed or an error occurs.
@@ -322,7 +322,7 @@ acceptInboundSYN sess sid = do
       atomically $ do
         full <- isFullTBQueue (ysessAcceptCh sess)
         if full
-          then writeTQueue (ysessSendCh sess) (rstHeader sid, BS.empty)
+          then enqueueFrame sess (rstHeader sid) BS.empty
           else do
             modifyTVar' (ysessStreams sess) (Map.insert sid stream)
             writeTBQueue (ysessAcceptCh sess) stream
@@ -421,7 +421,7 @@ handlePing sess hdr
               , yhStreamId = 0
               , yhLength = yhLength hdr -- echo opaque value
               }
-      atomically $ writeTQueue (ysessSendCh sess) (respHdr, BS.empty)
+      atomically $ enqueueFrame sess respHdr BS.empty
   | flagACK (yhFlags hdr) = do
       -- Resolve pending ping
       let pingId = yhLength hdr

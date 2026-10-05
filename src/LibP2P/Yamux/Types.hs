@@ -11,9 +11,10 @@ module LibP2P.Yamux.Types
   , YamuxStream (..)
   , YamuxSession (..)
   , PingWaiter
+  , enqueueFrame
   ) where
 
-import Control.Concurrent.STM (TBQueue, TMVar, TQueue, TVar)
+import Control.Concurrent.STM (STM, TBQueue, TMVar, TQueue, TVar, writeTQueue)
 import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word32)
@@ -75,3 +76,9 @@ data YamuxSession = YamuxSession
   , ysessWrite :: !(ByteString -> IO ()) -- ^ Underlying transport write
   , ysessRead :: !(Int -> IO ByteString) -- ^ Underlying transport read exact N bytes
   }
+
+-- | Queue a frame for sendLoop to write. Every outbound frame goes
+-- through here, so this is the one place that sees each frame as it
+-- enters the send queue.
+enqueueFrame :: YamuxSession -> YamuxHeader -> ByteString -> STM ()
+enqueueFrame sess hdr payload = writeTQueue (ysessSendCh sess) (hdr, payload)
