@@ -436,6 +436,25 @@ spec = do
         expectationFailure "stopped node must not addPeer"
       cancel lateResponder
 
+    it "opens a stream again after stop and start" $ do
+      (sw, _pid) <- mkTestSwitch
+      (pid, _) <- mkTestIdentity
+      node <- newGossipSubNode sw testParams
+      notifiersBefore <- atomically $ length <$> readTVar (swNotifiers sw)
+      startGossipSub node
+      stopGossipSub node
+      startGossipSub node
+      notifiersAfter <- atomically $ length <$> readTVar (swNotifiers sw)
+      (notifiersAfter - notifiersBefore) `shouldBe` 1
+      (conn, responder) <- mkGossipConn pid
+      fireNotifiers sw conn
+      opened <- waitForCachedStream node pid 40
+      opened `shouldBe` True
+      peers <- atomically $ readTVar (gsPeers (gsnRouter node))
+      Map.member pid peers `shouldBe` True
+      cancel responder
+      stopGossipSub node
+
   describe "Two-node exchange" $ do
     it "two nodes exchange subscription announcements via memory streams" $ do
       -- Node A
