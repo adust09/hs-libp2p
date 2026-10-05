@@ -46,6 +46,7 @@ import Control.Concurrent.STM
 import Control.Exception (SomeException, catch, mask, onException, try)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.List (find)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -70,7 +71,8 @@ import LibP2P.DHT.Validator
   , namespacedValidator
   , pkValidator
   )
-import LibP2P.Multiaddr (Multiaddr, fromBytes, toBytes)
+import LibP2P.Multiaddr (Multiaddr, fromBytes, isRelayedAddr, protocols, toBytes)
+import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
   , StreamIO (..)
@@ -219,7 +221,8 @@ registerDHTHandler node = case dhtMode node of
   DHTClient -> pure ()
   DHTServer ->
     setStreamHandler (dhtSwitch node) dhtProtocolId
-      (\conn stream -> handleDHTRequest node stream (connPeerId conn))
+      (\conn stream ->
+        handleDHTRequest node stream (connPeerId conn) (connRemoteAddr conn))
 
 -- | Handle an inbound DHT stream.
 --
@@ -227,8 +230,8 @@ registerDHTHandler node = case dhtMode node of
 -- messages on the same incoming stream: go-libp2p keeps one long-lived
 -- stream per peer and pipelines requests over it. Loop until the stream
 -- errors, is reset, or reaches EOF.
-handleDHTRequest :: DHTNode -> StreamIO -> PeerId -> IO ()
-handleDHTRequest node stream remotePeerId = loop
+handleDHTRequest :: DHTNode -> StreamIO -> PeerId -> Multiaddr -> IO ()
+handleDHTRequest node stream remotePeerId remoteAddr = loop
   where
     loop = do
       result <- try $ do
@@ -242,14 +245,7 @@ handleDHTRequest node stream remotePeerId = loop
             -- us is a live contact; insert (or refresh) it. Note this
             -- cannot distinguish client-mode senders (the spec would
             -- exclude them) without identify-provided protocol lists.
-            now <- getCurrentTime
-            _ <- addPeerToTable node BucketEntry
-              { entryPeerId   = remotePeerId
-              , entryKey      = peerIdToKey remotePeerId
-              , entryAddrs    = []
-              , entryLastSeen = now
-              , entryConnType = Connected
-              }
+            rememberSender node remotePeerId remoteAddr
             pure (Right ())
       case result of
         Left (_ :: SomeException) -> pure ()  -- Stream closed or reset
@@ -265,6 +261,48 @@ processRequest node msg remotePeerId =
     PutValue -> handlePutValue node msg
     AddProvider -> handleAddProvider node msg remotePeerId
     GetProviders -> handleGetProviders node msg
+
+-- | Insert or refresh the RPC sender, seeding its dial address from
+-- the authenticated connection.
+--
+-- A direct IP address is unioned into whatever the table already
+-- holds. A relayed or address-less remote multiaddr is ignored so it
+-- cannot replace a richer list (#284).
+rememberSender :: DHTNode -> PeerId -> Multiaddr -> IO ()
+rememberSender node remotePeerId remoteAddr = do
+  now <- getCurrentTime
+  existing <- atomically $ do
+    rt <- readTVar (dhtRoutingTable node)
+    pure $ find (\e -> entryPeerId e == remotePeerId) (allPeers rt)
+  let addrs = mergeSenderAddrs (maybe [] entryAddrs existing) (usableRemoteAddr remoteAddr)
+  _ <- addPeerToTable node BucketEntry
+        { entryPeerId   = remotePeerId
+        , entryKey      = peerIdToKey remotePeerId
+        , entryAddrs    = addrs
+        , entryLastSeen = now
+        , entryConnType = Connected
+        }
+  pure ()
+
+-- | Keep known addresses and append a new direct address at most once.
+mergeSenderAddrs :: [Multiaddr] -> Maybe Multiaddr -> [Multiaddr]
+mergeSenderAddrs existing Nothing = existing
+mergeSenderAddrs existing (Just addr)
+  | addr `elem` existing = existing
+  | otherwise = existing ++ [addr]
+
+-- | A connection address is usable as a dial target only when it is a
+-- direct IP multiaddr. Relayed (/p2p-circuit) and non-IP addresses are
+-- not stored.
+usableRemoteAddr :: Multiaddr -> Maybe Multiaddr
+usableRemoteAddr addr
+  | isRelayedAddr addr = Nothing
+  | not (any isIP (protocols addr)) = Nothing
+  | otherwise = Just addr
+  where
+    isIP (IP4 _) = True
+    isIP (IP6 _) = True
+    isIP _ = False
 
 -- | FIND_NODE: return k closest peers to the requested key.
 handleFindNode :: DHTNode -> DHTMessage -> IO DHTMessage
