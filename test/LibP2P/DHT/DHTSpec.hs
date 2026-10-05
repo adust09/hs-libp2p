@@ -951,6 +951,18 @@ spec = do
       let sender = [e | e <- allPeers rt, entryPeerId e == remotePid]
       map entryAddrs sender `shouldBe` [[extra]]
 
+    it "does not store a relayed address for a previously unknown sender" $ do
+      node <- mkTestNode localPid
+      let relayed = Multiaddr [IP4 0xCB007101, TCP 4001, P2P (BS.pack [1, 2, 3]), P2PCircuit]
+      (clientStream, serverStream) <- mkStreamPair
+      writeFramedMessage clientStream
+        (emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [5] })
+      streamClose clientStream
+      handleDHTRequest node serverStream remotePid relayed
+      rt <- readTVarIO (dhtRoutingTable node)
+      let sender = [e | e <- allPeers rt, entryPeerId e == remotePid]
+      map entryAddrs sender `shouldBe` [[]]
+
     it "addPeerToTable evicts an unresponsive LRS peer from a full bucket" $ do
       node0 <- mkTestNode localPid
       let node = node0 { dhtSendRequest = \_ _ -> pure (Left "unreachable") }
