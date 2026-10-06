@@ -9,25 +9,29 @@
 --   sendLoop: dequeues from ysessSendCh, writes to transport
 module LibP2P.Yamux.Session
   ( newSession
+  , newSessionWith
   , closeSession
   , openStream
   , acceptStream
   , ping
   , sendGoAway
+  , keepaliveLoop
   , recvLoop
   , sendLoop
   , acceptBacklog
   ) where
 
 import Control.Concurrent.STM
-import Control.Exception (finally)
+import Control.Exception (bracket, finally)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
+import Data.Maybe (fromMaybe, isJust)
 import Data.Word (Word32)
 import LibP2P.Yamux.Frame
 import LibP2P.Yamux.Types
 import Numeric.Natural (Natural)
+import System.Timeout (timeout)
 
 -- | Maximum number of inbound streams buffered while the application
 -- is not accepting (go-yamux AcceptBacklog). The spec requires this
@@ -38,7 +42,11 @@ acceptBacklog = 256
 -- | Create a new Yamux session over a transport connection.
 -- Client uses odd stream IDs starting at 1, server uses even starting at 2.
 newSession :: SessionRole -> (ByteString -> IO ()) -> (Int -> IO ByteString) -> IO YamuxSession
-newSession role writeFn readFn = do
+newSession = newSessionWith defaultYamuxConfig
+
+-- | Like 'newSession', with an explicit configuration.
+newSessionWith :: YamuxConfig -> SessionRole -> (ByteString -> IO ()) -> (Int -> IO ByteString) -> IO YamuxSession
+newSessionWith config role writeFn readFn = do
   let startId = case role of
         RoleClient -> 1
         RoleServer -> 2
@@ -55,7 +63,8 @@ newSession role writeFn readFn = do
   recvCount <- newTVarIO 0
   pure
     YamuxSession
-      { ysessRole = role
+      { ysessConfig = config
+      , ysessRole = role
       , ysessNextStreamId = nextId
       , ysessStreams = streams
       , ysessAcceptCh = acceptCh
@@ -138,15 +147,18 @@ acceptStream sess = do
 
 -- | Send a Ping and wait for the ACK response.
 -- Ping uses StreamID 0 and the Length field carries an opaque value.
+--
+-- Fails with YamuxPingTimeout when the SYN is not written within
+-- 'ycPingTimeoutMicros', or when its ACK does not arrive within another
+-- 'ycPingTimeoutMicros' after the write. Timing the ACK from the write,
+-- as hashicorp/yamux does, keeps time spent behind queued frames out of
+-- it. Fails with YamuxSessionShutdown when the session dies first.
+--
+-- The waiter is removed from ysessPings on every exit path (ACK,
+-- timeout, session failure, cancellation), so an ACK that arrives late
+-- is ignored like any other unsolicited ACK.
 ping :: YamuxSession -> IO (Either YamuxError ())
-ping sess = do
-  (pingId, waiter) <- atomically $ do
-    pid <- readTVar (ysessNextPingId sess)
-    writeTVar (ysessNextPingId sess) (pid + 1)
-    w <- newEmptyTMVar
-    modifyTVar' (ysessPings sess) (Map.insert pid w)
-    pure (pid, w)
-  -- Send Ping SYN frame
+ping sess = bracket register unregister $ \(pingId, waiter) -> do
   let hdr =
         YamuxHeader
           { yhVersion = 0
@@ -155,12 +167,78 @@ ping sess = do
           , yhStreamId = 0
           , yhLength = pingId
           }
-  atomically $ enqueueFrame sess hdr BS.empty
-  -- Wait for ACK (or a session-failure notification)
-  result <- atomically $ takeTMVar waiter
-  -- Cleanup
-  atomically $ modifyTVar' (ysessPings sess) (Map.delete pingId)
-  pure result
+  frame <- atomically $ enqueueFrameNumbered sess hdr BS.empty
+  -- Wait for the SYN to be written. The waiter is watched too, so a
+  -- session failure (or an ACK racing the write count) ends the wait.
+  written <- timeout timeoutUs $ atomically $
+    (Just <$> takeTMVar waiter) `orElse` (Nothing <$ awaitFrameWritten sess frame)
+  case written of
+    Nothing -> pure (Left YamuxPingTimeout)
+    Just (Just result) -> pure result
+    Just Nothing ->
+      -- Written: wait for the ACK (or a session-failure notification)
+      fromMaybe (Left YamuxPingTimeout)
+        <$> timeout timeoutUs (atomically (takeTMVar waiter))
+  where
+    timeoutUs = ycPingTimeoutMicros (ysessConfig sess)
+    register = atomically $ do
+      pid <- readTVar (ysessNextPingId sess)
+      writeTVar (ysessNextPingId sess) (pid + 1)
+      w <- newEmptyTMVar
+      modifyTVar' (ysessPings sess) (Map.insert pid w)
+      pure (pid, w)
+    unregister (pingId, _) =
+      atomically $ modifyTVar' (ysessPings sess) (Map.delete pingId)
+
+-- | Keepalive loop: once 'ycKeepAliveIntervalMicros' passes without a
+-- frame from the peer, send a Ping (spec.md, Type Field: a Ping "can
+-- also be used to heart-beat and do keep-alives over TCP").
+--
+-- Every received frame restarts the timer: The timer also restarts once a Ping
+-- completes, so at most one keepalive Ping is in flight.
+--
+-- Returns @Right ()@ without pinging when keepalive is disabled, and as
+-- soon as a local or remote GoAway is in effect (closeSession,
+-- sendGoAway, failSession, or a GoAway from the peer).
+keepaliveLoop :: YamuxSession -> IO (Either YamuxError ())
+keepaliveLoop sess
+  | ycEnableKeepAlive config = go
+  | otherwise = pure (Right ())
+  where
+    config = ysessConfig sess
+
+    goingAway = do
+      shut <- readTVar (ysessShutdown sess)
+      remote <- readTVar (ysessRemoteGoAway sess)
+      pure (shut || isJust remote)
+
+    go = do
+      seen <- readTVarIO (ysessRecvCount sess)
+      -- Wake on the interval, on a received frame, or on GoAway,
+      -- whichever comes first. System.Timeout rather than registerDelay:
+      -- the latter throws on the non-threaded runtime.
+      woke <- timeout (ycKeepAliveIntervalMicros config) $ atomically $ do
+        stopping <- goingAway
+        count <- readTVar (ysessRecvCount sess)
+        check (stopping || count /= seen)
+        pure stopping
+      case woke of
+        Just True -> pure (Right ())
+        -- A frame arrived: the peer is alive, restart the timer
+        Just False -> go
+        Nothing -> do
+          -- A GoAway may have landed just as the interval ran out
+          stopping <- atomically goingAway
+          if stopping
+            then pure (Right ())
+            else do
+              result <- ping sess
+              case result of
+                Right () -> go
+                Left YamuxSessionShutdown -> pure (Right ())
+                Left err -> do
+                  failSession sess
+                  pure (Left err)
 
 -- | Send a GoAway frame with the specified error code.
 -- Sets ysessShutdown to True so no new streams can be opened.

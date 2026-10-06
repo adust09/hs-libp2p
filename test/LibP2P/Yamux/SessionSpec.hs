@@ -3,8 +3,10 @@ module LibP2P.Yamux.SessionSpec (spec) where
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, concurrently, concurrently_, poll, wait, withAsync)
 import Control.Concurrent.STM
+import Control.Monad (replicateM_)
 import qualified Data.ByteString as BS
 import Data.Maybe (isNothing)
+import Data.Word (Word32)
 import System.Timeout (timeout)
 import LibP2P.Yamux.Frame
 import LibP2P.Yamux.HostilePeer
@@ -207,6 +209,123 @@ spec = do
         (ack, _) <- expectFrame hp
         yhType ack `shouldBe` FramePing
         yhLength ack `shouldBe` 7
+
+    it "fails with YamuxPingTimeout when no ACK arrives in time, and drops the waiter" $
+      withHostilePeerWithConfig (pingTimeoutConfig 100000) RoleClient $ \hp -> do
+        result <- timeout 1000000 (ping (hpSession hp))
+        result `shouldBe` Just (Left YamuxPingTimeout)
+        waiters <- readTVarIO (ysessPings (hpSession hp))
+        null waiters `shouldBe` True
+
+    it "ignores an ACK that arrives after the timeout" $
+      withHostilePeerWithConfig (pingTimeoutConfig 100000) RoleClient $ \hp -> do
+        Left YamuxPingTimeout <- ping (hpSession hp)
+        (syn, _) <- expectFrame hp
+        injectFrame hp (pingAck (yhLength syn)) BS.empty
+        -- The late ACK is dropped and the session keeps working
+        pingA <- async (ping (hpSession hp))
+        (syn2, _) <- expectFrame hp
+        injectFrame hp (pingAck (yhLength syn2)) BS.empty
+        result <- timeout 1000000 (wait pingA)
+        result `shouldBe` Just (Right ())
+
+    it "fails with YamuxPingTimeout when the SYN cannot be written in time" $ do
+      -- The transport write never returns, so sendLoop never finishes
+      -- writing the SYN
+      gate <- newEmptyTMVarIO :: IO (TMVar ())
+      sess <-
+        newSessionWith (pingTimeoutConfig 100000) RoleClient
+          (\_ -> atomically (takeTMVar gate)) (\_ -> pure BS.empty)
+      withAsync (sendLoop sess) $ \_ -> do
+        result <- timeout 1000000 (ping sess)
+        result `shouldBe` Just (Left YamuxPingTimeout)
+        waiters <- readTVarIO (ysessPings sess)
+        null waiters `shouldBe` True
+
+    it "times the ACK from the write, so waiting to write does not count against it" $ do
+      -- A 400ms limit, 250ms to write the SYN, then 250ms more for the
+      -- ACK: 500ms in all, yet each wait stays within its own limit
+      ((writeA, readA), (writeB, _)) <- mkMemoryTransportPair
+      gate <- newEmptyTMVarIO
+      let gatedWrite bs = atomically (takeTMVar gate) >> writeA bs
+      sess <- newSessionWith (pingTimeoutConfig 400000) RoleClient gatedWrite readA
+      withAsync (sendLoop sess) $ \_ ->
+        withAsync (recvLoop sess) $ \_ ->
+          withAsync (ping sess) $ \pingA -> do
+            threadDelay 250000
+            atomically $ putTMVar gate ()
+            threadDelay 250000
+            -- The session's first ping id is 1
+            writeB (encodeHeader (pingAck 1))
+            result <- timeout 1000000 (wait pingA)
+            result `shouldBe` Just (Right ())
+
+  describe "Keepalive" $ do
+    it "sends a Ping only after an interval with no frame received" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp ->
+        withAsync (keepaliveLoop (hpSession hp)) $ \_ -> do
+          -- Feed a frame every half interval for longer than a full
+          -- interval: the peer is never silent, so no Ping goes out. An
+          -- unsolicited Ping ACK is ignored by the session, so it draws
+          -- no reply of its own.
+          replicateM_ 3 $ do
+            injectFrame hp (pingAck 99) BS.empty
+            noFrame <- timeout 50000 (hpNextFrame hp)
+            fmap fst noFrame `shouldBe` Nothing
+          -- Stop feeding: a Ping follows once a full interval passes
+          -- with nothing received
+          (syn, _) <- expectFrame hp
+          yhType syn `shouldBe` FramePing
+          flagSYN (yhFlags syn) `shouldBe` True
+          yhStreamId syn `shouldBe` 0
+
+    it "keeps pinging while the Pings are answered" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp ->
+        withAsync (keepaliveLoop (hpSession hp)) $ \_ -> do
+          (first, _) <- expectFrame hp
+          yhType first `shouldBe` FramePing
+          injectFrame hp (pingAck (yhLength first)) BS.empty
+          (second, _) <- expectFrame hp
+          yhType second `shouldBe` FramePing
+          yhLength second `shouldNotBe` yhLength first
+
+    it "fails the session and unblocks readers when a Ping goes unanswered" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp -> do
+        Right stream <- openStream (hpSession hp)
+        _ <- expectFrame hp
+        withAsync (streamRead stream) $ \readerA ->
+          withAsync (keepaliveLoop (hpSession hp)) $ \keepaliveA -> do
+            keepaliveRes <- timeout 1000000 (wait keepaliveA)
+            keepaliveRes `shouldBe` Just (Left YamuxPingTimeout)
+            readerRes <- timeout 1000000 (wait readerA)
+            readerRes `shouldBe` Just (Left YamuxStreamReset)
+        openRes <- openStream (hpSession hp)
+        shouldBeLeft YamuxSessionShutdown openRes
+
+    it "stops without pinging once closeSession sent a GoAway" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp ->
+        withAsync (keepaliveLoop (hpSession hp)) $ \keepaliveA -> do
+          closeSession (hpSession hp)
+          keepaliveRes <- timeout 500000 (wait keepaliveA)
+          keepaliveRes `shouldBe` Just (Right ())
+          (goAway, _) <- expectFrame hp
+          yhType goAway `shouldBe` FrameGoAway
+          expectNoFrame hp
+
+    it "stops without pinging once the peer sent a GoAway" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp -> do
+        injectFrame hp (YamuxHeader 0 FrameGoAway defaultFlags 0 0) BS.empty
+        awaitRemoteGoAway (hpSession hp) GoAwayNormal
+        withAsync (keepaliveLoop (hpSession hp)) $ \keepaliveA -> do
+          keepaliveRes <- timeout 500000 (wait keepaliveA)
+          keepaliveRes `shouldBe` Just (Right ())
+          expectNoFrame hp
+
+    it "does nothing when keepalive is disabled" $
+      withHostilePeerWithConfig keepaliveConfig {ycEnableKeepAlive = False} RoleClient $ \hp -> do
+        keepaliveRes <- timeout 1000000 (keepaliveLoop (hpSession hp))
+        keepaliveRes `shouldBe` Just (Right ())
+        expectNoFrame hp
 
   describe "Frame counters" $ do
     it "numbers queued frames consecutively from 1, including unnumbered enqueues" $ do
@@ -614,3 +733,25 @@ shouldBeLeft :: (Show e, Eq e) => e -> Either e a -> Expectation
 shouldBeLeft expected (Left actual) = actual `shouldBe` expected
 shouldBeLeft expected (Right _) =
   expectationFailure $ "Expected Left " <> show expected <> " but got Right"
+
+-- | A Ping ACK echoing the given opaque value.
+pingAck :: Word32 -> YamuxHeader
+pingAck = YamuxHeader 0 FramePing (defaultFlags {flagACK = True}) 0
+
+-- | The default configuration with a different ping timeout.
+pingTimeoutConfig :: Int -> YamuxConfig
+pingTimeoutConfig us = defaultYamuxConfig {ycPingTimeoutMicros = us}
+
+-- | Short keepalive timings so the tests finish well within a second.
+keepaliveConfig :: YamuxConfig
+keepaliveConfig =
+  defaultYamuxConfig
+    { ycKeepAliveIntervalMicros = 100000 -- 100ms
+    , ycPingTimeoutMicros = 350000 -- 350ms
+    }
+
+-- | Assert the session writes nothing for three keepalive intervals.
+expectNoFrame :: HostilePeer -> Expectation
+expectNoFrame hp = do
+  mFrame <- timeout 300000 (hpNextFrame hp)
+  fmap fst mFrame `shouldBe` Nothing
