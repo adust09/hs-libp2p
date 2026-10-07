@@ -12,7 +12,8 @@
 -- Also implements Identify Push (/ipfs/id/push/1.0.0) for proactive
 -- updates when local state changes.
 module LibP2P.Protocol.Identify
-  ( agentVersion
+  ( -- * Agent version
+    agentVersion
     -- * Protocol IDs
   , identifyProtocolId
   , identifyPushProtocolId
@@ -85,6 +86,9 @@ import LibP2P.Switch.Types
 import qualified PackageInfo_hs_libp2p as Pkg
 import Data.Version (showVersion)
 
+-- | Agent version for the locally built IdentifyInfo,
+-- derived from the Cabal package name and version,
+-- e.g. "hs-libp2p/0.1.0.0".
 agentVersion :: Text
 agentVersion =
   let version = showVersion Pkg.version
