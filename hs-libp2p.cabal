@@ -29,6 +29,7 @@ library
   import:          warnings, lang
   hs-source-dirs:  src
   other-modules: PackageInfo_hs_libp2p
+  autogen-modules: PackageInfo_hs_libp2p
   exposed-modules:
     LibP2P
     LibP2P.Core.Binary
