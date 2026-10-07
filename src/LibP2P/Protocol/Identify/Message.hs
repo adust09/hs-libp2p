@@ -34,7 +34,7 @@ import Proto3.Wire.Types (FieldNumber (..))
 -- | Identify message payload.
 data IdentifyInfo = IdentifyInfo
   { idProtocolVersion :: !(Maybe Text)       -- ^ e.g. "ipfs/0.1.0"
-  , idAgentVersion    :: !(Maybe Text)       -- ^ e.g. "hs-libp2p/0.1.0"
+  , idAgentVersion    :: !(Maybe Text)       -- ^ e.g. "hs-libp2p/0.1.0.0"
   , idPublicKey       :: !(Maybe ByteString) -- ^ Serialized PublicKey protobuf
   , idListenAddrs     :: ![ByteString]       -- ^ Binary-encoded multiaddrs
   , idObservedAddr    :: !(Maybe ByteString) -- ^ Binary-encoded observed multiaddr
