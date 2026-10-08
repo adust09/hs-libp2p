@@ -43,7 +43,12 @@ jobs:
 
       - name: Prepare docs directory
         run: |
-          HADDOCK_DIR=$(find dist-newstyle -path '*/doc/html/hs-libp2p' -type d | head -1)
+          HADDOCK_DIR=$(find dist-newstyle -path '*/doc/html/libp2p-hs' -type d | head -1)
+          if [ -z "$HADDOCK_DIR" ]; then
+            echo "[ERROR] no haddock docs directory found under dist-newstyle"
+            find dist-newstyle -type d -path '*/doc/html/*' | head -20
+            exit 1
+          fi
           cp -r "$HADDOCK_DIR" docs-out
 
       - uses: actions/configure-pages@v5

@@ -30,7 +30,8 @@ import LibP2P.DHT.Distance (peerIdToKey, sortByDistance)
 import LibP2P.DHT.Message
 import LibP2P.DHT.RoutingTable (allPeers, bucketForPeer, insertPeer, newRoutingTable)
 import LibP2P.DHT.Types
-import LibP2P.Multiaddr (Multiaddr, fromText, toBytes)
+import LibP2P.Multiaddr (Multiaddr (..), fromText, toBytes)
+import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkByteStreamIO, negotiateResponder)
 import LibP2P.Switch.Connection (closeConnection)
 import LibP2P.Switch.ConnPool (addConn)
@@ -218,7 +219,7 @@ spec = do
             }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
 
       result <- readFramedMessage clientStream maxDHTMessageSize
       case result of
@@ -242,7 +243,7 @@ spec = do
             }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
 
       result <- readFramedMessage clientStream maxDHTMessageSize
       case result of
@@ -274,7 +275,7 @@ spec = do
       let request = emptyDHTMessage { msgType = FindNode, msgKey = wireKey }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
 
       result <- readFramedMessage clientStream maxDHTMessageSize
       case result of
@@ -297,7 +298,7 @@ spec = do
       let request = emptyDHTMessage { msgType = GetValue, msgKey = wireKey }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
 
       result <- readFramedMessage clientStream maxDHTMessageSize
       case result of
@@ -320,7 +321,7 @@ spec = do
       let request = emptyDHTMessage { msgType = GetProviders, msgKey = wireKey }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
 
       result <- readFramedMessage clientStream maxDHTMessageSize
       case result of
@@ -337,7 +338,7 @@ spec = do
       let request = emptyDHTMessage { msgType = GetValue, msgKey = key }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
 
       result <- readFramedMessage clientStream maxDHTMessageSize
       case result of
@@ -350,7 +351,7 @@ spec = do
       let request = emptyDHTMessage { msgType = GetValue, msgKey = BS.pack [1, 2, 3] }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
 
       result <- readFramedMessage clientStream maxDHTMessageSize
       case result of
@@ -372,7 +373,7 @@ spec = do
             }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
       _ <- readFramedMessage clientStream maxDHTMessageSize
 
       stored <- lookupRecord node key
@@ -397,7 +398,7 @@ spec = do
             }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
 
       result <- readFramedMessage clientStream maxDHTMessageSize
       case result of
@@ -422,7 +423,7 @@ spec = do
             }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
 
       result <- readFramedMessage clientStream maxDHTMessageSize
       case result of
@@ -448,7 +449,7 @@ spec = do
             }
       writeFramedMessage clientStream1 addReq
       streamClose clientStream1
-      handleDHTRequest node serverStream1 remotePid
+      handleDHTRequest node serverStream1 remotePid testAddr
       _ <- readFramedMessage clientStream1 maxDHTMessageSize
 
       -- Send GET_PROVIDERS for the same key
@@ -459,7 +460,7 @@ spec = do
             }
       writeFramedMessage clientStream2 getReq
       streamClose clientStream2
-      handleDHTRequest node serverStream2 remotePid
+      handleDHTRequest node serverStream2 remotePid testAddr
 
       result <- readFramedMessage clientStream2 maxDHTMessageSize
       case result of
@@ -479,7 +480,7 @@ spec = do
       storeRecord node rec
 
       (clientStream, serverStream) <- mkStreamPair
-      handler <- async (handleDHTRequest node serverStream remotePid)
+      handler <- async (handleDHTRequest node serverStream remotePid testAddr)
 
       writeFramedMessage clientStream
         (emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [1] })
@@ -513,7 +514,7 @@ spec = do
       let request = emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [42] }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
 
       result <- readFramedMessage clientStream maxDHTMessageSize
       case result of
@@ -531,7 +532,7 @@ spec = do
       let request = emptyDHTMessage { msgType = GetProviders, msgKey = key }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
 
       result <- readFramedMessage clientStream maxDHTMessageSize
       case result of
@@ -552,7 +553,7 @@ spec = do
             }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
 
       stored <- getProviders node key
       map peAddrs stored `shouldBe` [[testAddr]]
@@ -578,7 +579,7 @@ spec = do
       -- Remote side: multistream-select responder, then the DHT handler.
       server <- async $ do
         _ <- negotiateResponder serverEnd [dhtProtocolId]
-        handleDHTRequest serverNode serverEnd localPid
+        handleDHTRequest serverNode serverEnd localPid testAddr
 
       let req1 = emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [42] }
       r1 <- timeout 2000000 (dhtSendRequest clientNode remotePid req1)
@@ -777,7 +778,7 @@ spec = do
             { msgType = PutValue, msgKey = key, msgRecord = Just rec }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
       resp <- readFramedMessage clientStream maxDHTMessageSize
 
       stored <- lookupRecord node key
@@ -796,7 +797,7 @@ spec = do
             { msgType = PutValue, msgKey = otherKey, msgRecord = Just rec }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
       _ <- readFramedMessage clientStream maxDHTMessageSize
 
       stored <- lookupRecord node otherKey
@@ -813,7 +814,7 @@ spec = do
             { msgType = PutValue, msgKey = msgOnlyKey, msgRecord = Just rec }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
       _ <- readFramedMessage clientStream maxDHTMessageSize
 
       storedUnderMsgKey <- lookupRecord node msgOnlyKey
@@ -849,7 +850,7 @@ spec = do
       let request = emptyDHTMessage { msgType = GetProviders, msgKey = key }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
       resp <- readFramedMessage clientStream maxDHTMessageSize
       fmap msgProviderPeers resp `shouldBe` Right []
 
@@ -874,9 +875,93 @@ spec = do
       let request = emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [7] }
       writeFramedMessage clientStream request
       streamClose clientStream
-      handleDHTRequest node serverStream remotePid
+      handleDHTRequest node serverStream remotePid testAddr
       rt <- readTVarIO (dhtRoutingTable node)
       map entryPeerId (allPeers rt) `shouldContain` [remotePid]
+
+    -- Issue #284: the sender must be stored with the authenticated
+    -- connection address, and a later FIND_NODE must hand that address
+    -- out. A relayed or non-IP remote address must not replace a richer
+    -- list already in the table.
+    it "stores the sender with the connection address" $ do
+      node <- mkTestNode localPid
+      (clientStream, serverStream) <- mkStreamPair
+      writeFramedMessage clientStream
+        (emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [7] })
+      streamClose clientStream
+      handleDHTRequest node serverStream remotePid testAddr
+      rt <- readTVarIO (dhtRoutingTable node)
+      let sender = [e | e <- allPeers rt, entryPeerId e == remotePid]
+      map entryAddrs sender `shouldBe` [[testAddr]]
+
+    it "includes that address in a subsequent FIND_NODE response" $ do
+      node <- mkTestNode localPid
+      (seedClient, seedServer) <- mkStreamPair
+      writeFramedMessage seedClient
+        (emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [1] })
+      streamClose seedClient
+      handleDHTRequest node seedServer remotePid testAddr
+
+      (clientStream, serverStream) <- mkStreamPair
+      writeFramedMessage clientStream
+        (emptyDHTMessage { msgType = FindNode, msgKey = peerIdBytes remotePid })
+      streamClose clientStream
+      handleDHTRequest node serverStream remotePid testAddr
+      result <- readFramedMessage clientStream maxDHTMessageSize
+      case result of
+        Left err -> expectationFailure $ "Failed to read response: " ++ err
+        Right resp -> do
+          let mine = filter (\p -> dhtPeerId p == peerIdBytes remotePid) (msgCloserPeers resp)
+          map dhtPeerAddrs mine `shouldBe` [[toBytes testAddr]]
+
+    it "does not reduce a richer address list to the connection address" $ do
+      node <- mkTestNode localPid
+      now <- getCurrentTime
+      let extra = Multiaddr [IP4 0x0A000008, TCP 4001]
+          entry = BucketEntry remotePid (peerIdToKey remotePid) [extra, testAddr] now NotConnected
+      atomically $ modifyTVar' (dhtRoutingTable node) $ \rt -> fst (insertPeer entry rt)
+      (clientStream, serverStream) <- mkStreamPair
+      writeFramedMessage clientStream
+        (emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [9] })
+      streamClose clientStream
+      handleDHTRequest node serverStream remotePid testAddr
+      rt <- readTVarIO (dhtRoutingTable node)
+      let sender = [e | e <- allPeers rt, entryPeerId e == remotePid]
+      map entryAddrs sender `shouldBe` [[extra, testAddr]]
+
+    it "does not store a relayed or non-IP connection address" $ do
+      node <- mkTestNode localPid
+      now <- getCurrentTime
+      let extra = Multiaddr [IP4 0x0A000008, TCP 4001]
+          relayed = Multiaddr [IP4 0xCB007101, TCP 4001, P2P (BS.pack [1, 2, 3]), P2PCircuit]
+          emptyAddr = Multiaddr []
+          entry = BucketEntry remotePid (peerIdToKey remotePid) [extra] now NotConnected
+      atomically $ modifyTVar' (dhtRoutingTable node) $ \rt -> fst (insertPeer entry rt)
+      (clientStream, serverStream) <- mkStreamPair
+      writeFramedMessage clientStream
+        (emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [3] })
+      streamClose clientStream
+      handleDHTRequest node serverStream remotePid relayed
+      (clientStream2, serverStream2) <- mkStreamPair
+      writeFramedMessage clientStream2
+        (emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [4] })
+      streamClose clientStream2
+      handleDHTRequest node serverStream2 remotePid emptyAddr
+      rt <- readTVarIO (dhtRoutingTable node)
+      let sender = [e | e <- allPeers rt, entryPeerId e == remotePid]
+      map entryAddrs sender `shouldBe` [[extra]]
+
+    it "does not store a relayed address for a previously unknown sender" $ do
+      node <- mkTestNode localPid
+      let relayed = Multiaddr [IP4 0xCB007101, TCP 4001, P2P (BS.pack [1, 2, 3]), P2PCircuit]
+      (clientStream, serverStream) <- mkStreamPair
+      writeFramedMessage clientStream
+        (emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [5] })
+      streamClose clientStream
+      handleDHTRequest node serverStream remotePid relayed
+      rt <- readTVarIO (dhtRoutingTable node)
+      let sender = [e | e <- allPeers rt, entryPeerId e == remotePid]
+      map entryAddrs sender `shouldBe` [[]]
 
     it "addPeerToTable evicts an unresponsive LRS peer from a full bucket" $ do
       node0 <- mkTestNode localPid
