@@ -152,7 +152,8 @@ spec = do
       -- Track rejected connections
       rejectedMVar <- newEmptyMVar
       let rejectGater = ConnectionGater
-            { gateAccept  = \_ -> putMVar rejectedMVar () >> pure False
+            { gateAccept = \_ -> putMVar rejectedMVar () >> pure False
+            , gateDialAddr = \_ -> pure True
             , gateSecured = \_ -> pure True
             }
       addrs <- switchListen swB rejectGater [loopbackAddr]
@@ -179,7 +180,8 @@ spec = do
     it "gateSecured=False rejects after Noise handshake" $ do
       (swB, pidB, _kpB) <- mkTestSwitch
       let securedRejectGater = ConnectionGater
-            { gateAccept  = \_ -> pure True
+            { gateAccept = \_ -> pure True
+            , gateDialAddr = \_ -> pure True
             , gateSecured = \_ -> pure False  -- Accept at transport, reject after Noise
             }
       addrs <- switchListen swB securedRejectGater [loopbackAddr]

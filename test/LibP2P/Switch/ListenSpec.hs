@@ -18,12 +18,11 @@ import LibP2P.MultistreamSelect.Negotiation
 import LibP2P.Switch.ConnPool (lookupConn)
 import LibP2P.Switch.Listen
   ( ConnectionGater (..)
-  , defaultConnectionGater
   , dispatchStream
   , handleInbound
   , streamAcceptLoop
   )
-import LibP2P.Switch (newSwitch, setStreamHandler)
+import LibP2P.Switch (newSwitch, setConnectionGater, setStreamHandler)
 import LibP2P.Switch.Types
   ( Connection (..)
   , MuxerSession (..)
@@ -67,7 +66,7 @@ spec = do
       let rawConnA = mkMockRawConn streamA localAddr remoteAddr
           rawConnB = mkMockRawConn streamB remoteAddr localAddr
       -- handleInbound blocks on streamAcceptLoop, so spawn async
-      _listenerThread <- async $ handleInbound sw defaultConnectionGater rawConnB
+      _listenerThread <- async $ handleInbound sw rawConnB
       -- Dialer upgrades synchronously; both sides must handshake concurrently
       upgradeResult <- timeout 3000000 $ upgradeOutbound kpA rawConnA
       case upgradeResult of
@@ -96,11 +95,13 @@ spec = do
             , rcClose      = writeIORef closeRef True
             }
           denyGater = ConnectionGater
-            { gateAccept  = \_ -> pure False
+            { gateAccept = \_ -> pure False
+            , gateDialAddr = \_ -> pure True
             , gateSecured = \_ -> pure True
             }
       -- handleInbound should deny at gate and close raw connection
-      handleInbound sw denyGater rawConnB
+      setConnectionGater sw denyGater
+      handleInbound sw rawConnB
       -- Verify rcClose was called
       closed <- readIORef closeRef
       closed `shouldBe` True
@@ -113,14 +114,16 @@ spec = do
       let rawConnA = mkMockRawConn streamA localAddr remoteAddr
           rawConnB = mkMockRawConn streamB remoteAddr localAddr
           denyAfterSecure = ConnectionGater
-            { gateAccept  = \_ -> pure True
+            { gateAccept = \_ -> pure True
+            , gateDialAddr = \_ -> pure True
             , gateSecured = \_ -> pure False
             }
       -- Handshake completes but gateSecured denies.
       -- Both sides must run concurrently for the handshake to work.
+      setConnectionGater sw denyAfterSecure
       result <- timeout 3000000 $ concurrently
         (upgradeOutbound kpA rawConnA)
-        (handleInbound sw denyAfterSecure rawConnB)
+        (handleInbound sw rawConnB)
       case result of
         Nothing -> expectationFailure "timeout during handshake"
         Just _ -> pure ()

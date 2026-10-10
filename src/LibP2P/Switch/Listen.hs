@@ -24,7 +24,6 @@ import Control.Concurrent.STM (atomically, readTVar, writeTChan, writeTVar)
 import Control.Exception (SomeException, catch, finally, try)
 import Data.List (find, partition)
 import qualified Data.Map.Strict as Map
-import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Multiaddr (Multiaddr)
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
@@ -44,44 +43,31 @@ import LibP2P.Switch.ResourceManager
 import LibP2P.Switch.Types
   ( ActiveListener (..)
   , Connection (..)
+  , ConnectionGater (..)
   , MuxerSession (..)
   , Switch (..)
   , SwitchEvent (..)
+  , defaultConnectionGater
   )
 import LibP2P.Switch.Upgrade (upgradeInbound)
 import LibP2P.Transport (Listener (..), RawConnection (..), Transport (..))
-
--- | Connection gater: policy-based admission control.
---
--- Called at multiple points during connection establishment to allow
--- or deny based on policy (IP blocklist, Peer ID allowlist, etc.).
-data ConnectionGater = ConnectionGater
-  { gateAccept  :: !(Multiaddr -> IO Bool)  -- ^ Check after accepting raw connection (before upgrade)
-  , gateSecured :: !(PeerId -> IO Bool)     -- ^ Check after security handshake (remote PeerId known)
-  }
-
--- | Default gater that allows all connections.
-defaultConnectionGater :: ConnectionGater
-defaultConnectionGater = ConnectionGater
-  { gateAccept  = \_ -> pure True
-  , gateSecured = \_ -> pure True
-  }
 
 -- | Handle a single inbound connection: gate → upgrade → pool → stream accept loop.
 --
 -- This function blocks until the connection closes. Each accepted connection
 -- should be spawned in its own async thread from the accept loop.
-handleInbound :: Switch -> ConnectionGater -> RawConnection -> IO ()
-handleInbound sw gater rawConn = do
+handleInbound :: Switch -> RawConnection -> IO ()
+handleInbound sw rawConn = do
+  gater <- atomically $ readTVar (swConnectionGater sw)
   -- Gate 1: check remote address before any upgrade work
-  allowed <- gateAccept gater (rcRemoteAddr rawConn)
+  allowed <- runGate (gateAccept gater (rcRemoteAddr rawConn))
   if not allowed
     then rcClose rawConn
     else do
       -- Upgrade: Noise XX handshake + Yamux session
       conn <- upgradeInbound (swIdentityKey sw) rawConn
       -- Gate 2: check remote PeerId after security handshake
-      secured <- gateSecured gater (connPeerId conn)
+      secured <- runGate (gateSecured gater (connPeerId conn))
       if not secured
         then muxClose (connSession conn)
         else do
@@ -101,6 +87,10 @@ handleInbound sw gater rawConn = do
               -- Block on stream accept loop until the session dies, then
               -- tear down: pool removal, resource release, muxer close.
               streamAcceptLoop sw conn `finally` closeConnection sw conn
+
+-- | A faulty policy hook fails closed instead of leaking a connection.
+runGate :: IO Bool -> IO Bool
+runGate action = action `catch` \(_ :: SomeException) -> pure False
 
 -- | Accept inbound streams and dispatch to registered protocol handlers.
 --
@@ -165,9 +155,9 @@ dispatchStream sw conn stream = do
 
 -- | Start listening on the given addresses.
 --
--- For each address, selects a matching transport, binds a listener,
--- and spawns an accept loop that handles inbound connections.
--- Returns the actual bound addresses (port 0 resolved to actual port).
+-- Stores the supplied gater on the Switch, then selects a transport for each
+-- address, binds a listener, and spawns an accept loop. The same policy applies
+-- to subsequent outbound dials. Returns the actual bound addresses.
 -- Fails if the switch is already closed.
 switchListen :: Switch -> ConnectionGater -> [Multiaddr] -> IO [Multiaddr]
 switchListen sw gater addrs = do
@@ -175,8 +165,9 @@ switchListen sw gater addrs = do
   if closed
     then fail "switchListen: switch is closed"
     else do
+      atomically $ writeTVar (swConnectionGater sw) gater
       transports <- atomically $ readTVar (swTransports sw)
-      activeListeners <- mapM (bindAndListen transports gater sw) addrs
+      activeListeners <- mapM (bindAndListen transports sw) addrs
       let newListeners = concat activeListeners
       atomically $ do
         existing <- readTVar (swListeners sw)
@@ -187,12 +178,12 @@ switchListen sw gater addrs = do
       pure (map alAddress newListeners)
   where
     -- Find a transport for the address, bind, and spawn accept loop
-    bindAndListen transports gater' sw' addr = do
+    bindAndListen transports sw' addr = do
       case find (\t -> transportCanDial t addr) transports of
         Nothing -> fail $ "switchListen: no transport for " ++ show addr
         Just transport -> do
           listener <- transportListen transport addr
-          loopThread <- async $ acceptLoop sw' gater' listener
+          loopThread <- async $ acceptLoop sw' listener
           pure [ActiveListener
             { alListener   = listener
             , alAcceptLoop = loopThread
@@ -202,8 +193,8 @@ switchListen sw gater addrs = do
 -- | Accept loop: forever accepts connections and spawns handleInbound threads.
 -- Catches exceptions from individual connections without stopping the loop.
 -- Stops when the listener is closed (accept throws).
-acceptLoop :: Switch -> ConnectionGater -> Listener -> IO ()
-acceptLoop sw gater listener = loop
+acceptLoop :: Switch -> Listener -> IO ()
+acceptLoop sw listener = loop
   where
     loop = do
       result <- (Right <$> listenerAccept listener)
@@ -211,7 +202,7 @@ acceptLoop sw gater listener = loop
       case result of
         Left () -> pure ()  -- Listener closed, stop
         Right rawConn -> do
-          _ <- async $ handleInbound sw gater rawConn
+          _ <- async $ handleInbound sw rawConn
                          `catch` (\(_ :: SomeException) -> pure ())
           loop
 
