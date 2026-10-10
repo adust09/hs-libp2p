@@ -28,6 +28,7 @@ import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
   , StreamIO (..)
+  , mkByteStreamIO
   , mkMemoryStreamPair
   , negotiateResponder
   )
@@ -199,6 +200,17 @@ spec = do
       -- Verify peer is registered in router
       peers <- atomically $ readTVar (gsPeers (gsnRouter node))
       Map.member remotePid peers `shouldBe` True
+
+    it "keeps the outbound cache when the independent inbound stream ends" $ do
+      (sw, _localPid) <- mkTestSwitch
+      node <- newGossipSubNode sw testParams
+      (remotePid, _kp) <- mkTestIdentity
+      (cached, _) <- mkMemoryStreamPair
+      atomically $ writeTVar (gsnStreams node) (Map.singleton remotePid cached)
+      let eofStream = mkByteStreamIO (const (pure ())) (pure 0x80) (pure ())
+      handleGossipSubStream node eofStream remotePid GossipSubPeer Nothing
+      streams <- atomically $ readTVar (gsnStreams node)
+      Map.member remotePid streams `shouldBe` True
 
     it "feeds the peer's identify signed peer record into the router (#230)" $ do
       (sw, _localPid) <- mkTestSwitch

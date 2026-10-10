@@ -465,6 +465,7 @@ spec = do
     it "requestIdentify drops a publicKey that does not derive the remote peer id" $ do
       -- Response path of the same validation: the identify response is
       -- returned with the mismatched key removed, other fields intact.
+      sw <- mkTestSwitch
       Right remoteKp <- generateKeyPair
       Right otherKp  <- generateKeyPair
       let remotePid = fromPublicKey (kpPublic remoteKp)
@@ -481,7 +482,7 @@ spec = do
         negResult `shouldBe` Accepted identifyProtocolId
         streamWrite streamB (encodeFramedIdentify responseInfo)
         streamClose streamB
-      result <- requestIdentify conn
+      result <- requestIdentify sw conn
       wait remote
       case result of
         Left err -> expectationFailure $ "requestIdentify failed: " ++ err
@@ -490,6 +491,7 @@ spec = do
           idAgentVersion info `shouldBe` Just "impostor/1.0"
 
     it "requestIdentify keeps a publicKey that derives the remote peer id" $ do
+      sw <- mkTestSwitch
       Right remoteKp <- generateKeyPair
       let remotePid = fromPublicKey (kpPublic remoteKp)
           remoteKey = encodePublicKey (kpPublic remoteKp)
@@ -505,7 +507,7 @@ spec = do
         negResult `shouldBe` Accepted identifyProtocolId
         streamWrite streamB (encodeFramedIdentify responseInfo)
         streamClose streamB
-      result <- requestIdentify conn
+      result <- requestIdentify sw conn
       wait remote
       case result of
         Left err -> expectationFailure $ "requestIdentify failed: " ++ err
@@ -824,6 +826,7 @@ spec = do
           idSignedPeerRecord stored `shouldBe` Nothing
 
     it "requestIdentify prefers verified signed-record addresses in the response" $ do
+      sw <- mkTestSwitch
       Right remoteKp <- generateKeyPair
       let remotePid = fromPublicKey (kpPublic remoteKp)
           signedAddr   = encodeProtocols [IP4 0x7f000001, TCP 4001]
@@ -846,7 +849,7 @@ spec = do
         negResult `shouldBe` Accepted identifyProtocolId
         streamWrite streamB (encodeFramedIdentify responseInfo)
         streamClose streamB
-      result <- requestIdentify conn
+      result <- requestIdentify sw conn
       wait remote
       case result of
         Left err -> expectationFailure $ "requestIdentify failed: " ++ err

@@ -87,8 +87,8 @@ jobs:
 
       # nim-libp2p pinned to the commit unified-testing's perf/images.yaml
       # registers for nim-v1.15 (single source of truth: NIM_LIBP2P_COMMIT
-      # in interop/Makefile); docker-compose.perf-cross.yml builds its
-      # interop/perf/Dockerfile. The unified-testing go perf image is a
+      # in interop/Makefile); docker-compose.perf-cross.yml builds it with
+      # interop/nim-perf.Dockerfile. The unified-testing go perf image is a
       # placeholder that opens no perf streams, so nim is the partner that
       # actually exercises the /perf/1.0.0 wire format.
       - name: Clone nim-libp2p (pinned)

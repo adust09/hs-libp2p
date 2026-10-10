@@ -12,7 +12,7 @@ module LibP2P.Switch.Connection
   ) where
 
 import Control.Concurrent.STM (atomically, readTVar, writeTChan, writeTVar)
-import Control.Exception (SomeException, catch, finally, onException)
+import Control.Exception (SomeException, catch, finally, mask, onException)
 import Control.Monad (unless, when)
 import Data.IORef (atomicModifyIORef', newIORef)
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
@@ -74,14 +74,14 @@ closeAllConnections sw = do
 -- against the peer's resource scope. The slot is released when the
 -- returned stream is closed (exactly once, even on double close).
 newStream :: Switch -> Connection -> IO (Either ResourceError StreamIO)
-newStream sw conn = do
+newStream sw conn = mask $ \restore -> do
   let pid = connPeerId conn
       release = atomically $ releasePeerStream (swResourceMgr sw) pid Outbound
   reserved <- atomically $ reservePeerStream (swResourceMgr sw) pid Outbound
   case reserved of
     Left err -> pure (Left err)
     Right () -> do
-      stream <- muxOpenStream (connSession conn) `onException` release
+      stream <- restore (muxOpenStream (connSession conn)) `onException` release
       releasedRef <- newIORef False
       let releaseOnce = do
             already <- atomicModifyIORef' releasedRef (\r -> (True, r))

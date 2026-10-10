@@ -199,8 +199,8 @@ spec = do
 
   describe "Identify over real TCP" $ do
     it "requestIdentify returns correct protocols and agentVersion" $ do
-      withConnectedPair $ \_nodeA _nodeB conn -> do
-        result <- timeout 5000000 $ requestIdentify conn
+      withConnectedPair $ \(swA, _pidA) _nodeB conn -> do
+        result <- timeout 5000000 $ requestIdentify swA conn
         case result of
           Nothing -> expectationFailure "identify timed out"
           Just (Left err) -> expectationFailure $ "identify failed: " ++ err
@@ -209,8 +209,8 @@ spec = do
             idProtocols info `shouldSatisfy` (not . null)
 
     it "idListenAddrs populated after switchListen" $ do
-      withConnectedPair $ \_nodeA _nodeB conn -> do
-        result <- timeout 5000000 $ requestIdentify conn
+      withConnectedPair $ \(swA, _pidA) _nodeB conn -> do
+        result <- timeout 5000000 $ requestIdentify swA conn
         case result of
           Nothing -> expectationFailure "identify timed out"
           Just (Left err) -> expectationFailure $ "identify failed: " ++ err
@@ -222,8 +222,8 @@ spec = do
       -- Regression for #167: the responder must fill observedAddr with the
       -- initiator's source address. On loopback that address is exactly the
       -- dialer's local socket address (ephemeral port included).
-      withConnectedPair $ \_nodeA _nodeB conn -> do
-        result <- timeout 5000000 $ requestIdentify conn
+      withConnectedPair $ \(swA, _pidA) _nodeB conn -> do
+        result <- timeout 5000000 $ requestIdentify swA conn
         case result of
           Nothing -> expectationFailure "identify timed out"
           Just (Left err) -> expectationFailure $ "identify failed: " ++ err

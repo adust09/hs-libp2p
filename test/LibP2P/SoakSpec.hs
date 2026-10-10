@@ -193,7 +193,7 @@ spec = do
     it "leaves zero stream reservations after 50 identify exchanges" $
       withConnectedPair $ \(swA, _) (swB, _) conn -> do
         forM_ [1 .. oneShotCycles] $ \(i :: Int) -> do
-          result <- requestIdentify conn
+          result <- requestIdentify swA conn
           case result of
             Right _ -> pure ()
             Left err -> fail $ "identify cycle " ++ show i ++ " failed: " ++ err

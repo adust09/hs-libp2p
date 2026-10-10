@@ -49,6 +49,7 @@ mkAPITestNode pid sentLog = do
   provs <- newTVarIO Map.empty
   ks     <- newTVarIO Map.empty
   hook   <- newIORef Nothing
+  stopped <- newTVarIO False
   worker <- newTVarIO Nothing
   let sendFunc target msg = do
         atomically $ modifyTVar' sentLog ((target, msg) :)
@@ -56,7 +57,6 @@ mkAPITestNode pid sentLog = do
         -- as the closest peer for any lookup
         case msgType msg of
           FindNode -> do
-            now <- getCurrentTime
             let selfEntry = DHTPeer
                   { dhtPeerId = peerIdBytes pid
                   , dhtPeerAddrs = []
@@ -93,6 +93,7 @@ mkAPITestNode pid sentLog = do
         , dhtStreams        = ks
         , dhtSendRequest    = sendFunc
         , dhtDisconnectHook  = hook
+        , dhtStopped         = stopped
         , dhtQueryTimeout    = defaultQueryTimeoutMicros
         , dhtBootstrapWorker = worker
         }

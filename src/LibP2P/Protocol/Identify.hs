@@ -36,6 +36,7 @@ module LibP2P.Protocol.Identify
 import Control.Applicative ((<|>))
 import Control.Concurrent.STM (atomically, modifyTVar', readTVar, writeTVar)
 import Control.Exception (SomeException, bracket, catch, finally, try)
+import LibP2P.Switch.Connection (newStream)
 import Control.Monad (void)
 import System.Timeout (timeout)
 import qualified Data.ByteString as BS
@@ -75,7 +76,6 @@ import LibP2P.Switch.ConnPool (allConns)
 import LibP2P.Switch.Types
   ( ActiveListener (..)
   , Connection (..)
-  , MuxerSession (..)
   , Switch (..)
   )
 
@@ -119,13 +119,18 @@ identifyTimeoutMicros = 5000000
 -- otherwise leak a half-open stream per connection. The whole exchange
 -- is bounded by 'identifyTimeoutMicros': a peer that negotiates and then
 -- never answers must not pin a stream and a thread forever.
-requestIdentify :: Connection -> IO (Either String IdentifyInfo)
-requestIdentify conn = do
-  outcome <- try $ bracket (muxOpenStream (connSession conn)) closeQuietly exchange
-  pure $ case outcome of
-    Left (e :: SomeException) -> Left ("identify failed: " ++ show e)
-    Right Nothing             -> Left "identify timed out"
-    Right (Just result)       -> result
+requestIdentify :: Switch -> Connection -> IO (Either String IdentifyInfo)
+requestIdentify sw conn = do
+  opened <- newStream sw conn
+  case opened of
+    Left err ->
+      pure (Left ("stream reservation failed: " ++ show err))
+    Right stream -> do
+      outcome <- try $ bracket (pure stream) closeQuietly exchange
+      pure $ case outcome of
+        Left (e :: SomeException) -> Left ("identify failed: " ++ show e)
+        Right Nothing             -> Left "identify timed out"
+        Right (Just result)       -> result
   where
     exchange stream = timeout identifyTimeoutMicros $ do
       negotiated <- negotiateInitiator stream [identifyProtocolId]
@@ -150,7 +155,7 @@ requestIdentify conn = do
 -- sends one.
 identifyPeer :: Switch -> Connection -> IO (Either String ())
 identifyPeer sw conn = do
-  result <- requestIdentify conn
+  result <- requestIdentify sw conn
   case result of
     Left err -> pure (Left err)
     Right info -> do
@@ -297,14 +302,16 @@ pushIdentify sw = do
   mapM_ (\conn -> pushToConn conn `catch` \(_ :: SomeException) -> pure ()) conns
   where
     pushToConn conn = do
-      stream <- muxOpenStream (connSession conn)
-      result <- negotiateInitiator stream [identifyPushProtocolId]
-      case result of
-        Accepted _ -> do
-          info <- buildLocalIdentify sw (Just conn)
-          streamWrite stream (encodeFramedIdentify info)
-          streamClose stream
-        NoProtocol -> streamClose stream
+      opened <- newStream sw conn
+      case opened of
+        Left _ -> pure ()
+        Right stream -> bracket (pure stream) closeQuietly $ \s -> do
+          result <- negotiateInitiator s [identifyPushProtocolId]
+          case result of
+            Accepted _ -> do
+              info <- buildLocalIdentify sw (Just conn)
+              streamWrite s (encodeFramedIdentify info)
+            NoProtocol -> pure ()
 
 -- | Build our local IdentifyInfo from Switch state, including a signed
 -- peer record (RFC 0003) over our listen addresses, sealed with the

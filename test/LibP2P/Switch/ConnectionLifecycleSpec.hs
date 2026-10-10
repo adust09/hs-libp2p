@@ -10,8 +10,10 @@ import Control.Concurrent.Async (async)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TChan, atomically, newTVarIO, readTChan, readTVar, tryReadTChan)
 import Control.Exception (SomeException, bracket, try)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.List (isInfixOf)
 import Data.Maybe (isJust, isNothing)
+import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import qualified LibP2P as Public
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
@@ -19,21 +21,46 @@ import LibP2P.Crypto.Key (KeyPair, publicKey)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
 import LibP2P.Multiaddr (Multiaddr (..))
 import LibP2P.Multiaddr.Protocol (Protocol (..))
+import LibP2P.DHT
+  ( DHTMode (..)
+  , dhtProtocolId
+  , dhtSendRequest
+  , handleDHTRequest
+  , newDHTNode
+  , stopDHTNode
+  )
+import LibP2P.DHT.Message (DHTMessage (..), MessageType (..), emptyDHTMessage)
 import LibP2P.MultistreamSelect.Negotiation
   ( StreamIO (..)
   , mkByteStreamIO
   , mkMemoryStreamPair
   , negotiateInitiator
+  , negotiateResponder
   )
+import LibP2P.Protocol.GossipSub.Handler
+  ( floodSubProtocolId
+  , gossipSubProtocolId
+  , gossipSubProtocolIdV10
+  , newGossipSubNode
+  , startGossipSub
+  , stopGossipSub
+  )
+import LibP2P.Protocol.GossipSub.Types (defaultGossipSubParams)
+import LibP2P.Protocol.Identify (identifyProtocolId, requestIdentify)
 import LibP2P.Switch (addTransport, newSwitch, setStreamHandler, switchClose)
 import LibP2P.Switch.ConnPool (addConn, lookupConn)
 import LibP2P.Switch.Connection (closeConnection, newStream)
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (defaultConnectionGater, dispatchStream, switchListen)
 import LibP2P.Switch.ResourceManager
-  ( ResourceManager (..)
+  ( DefaultLimits (..)
+  , ResourceLimits (..)
+  , ResourceManager (..)
   , ResourceScope (..)
   , ResourceUsage (..)
+  , defaultPeerLimits
+  , defaultSystemLimits
+  , newResourceManager
   )
 import LibP2P.Switch.Types
   ( ConnState (..)
@@ -80,6 +107,15 @@ peerUsage sw pid = atomically $ do
   case Map.lookup pid peers of
     Nothing -> pure Nothing
     Just scope -> Just <$> readTVar (rsUsage scope)
+
+-- | A switch that refuses every outbound stream reservation.
+tightOutbound :: Switch -> IO Switch
+tightOutbound sw = do
+  mgr <- newResourceManager DefaultLimits
+    { dlSystemLimits = defaultSystemLimits { rlMaxStreamsOutbound = Just 0 }
+    , dlPeerLimits = defaultPeerLimits { rlMaxStreamsOutbound = Just 0 }
+    }
+  pure sw { swResourceMgr = mgr }
 
 -- | A dummy connection whose muxer serves in-memory streams.
 mkDummyConnection :: PeerId -> IO StreamIO -> IO Connection
@@ -334,6 +370,233 @@ spec = do
           streamClose stream
           usageDouble <- peerUsage sw remotePid
           fmap ruStreamsOutbound usageDouble `shouldBe` Just 0
+
+    it "requestIdentify reserves an outbound slot and releases it" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, _) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      (localStream, remoteStream) <- mkMemoryStreamPair
+      gate <- newEmptyMVar
+      release <- newEmptyMVar
+      _ <- async $ do
+        _ <- negotiateResponder remoteStream [identifyProtocolId]
+        putMVar gate ()
+        takeMVar release
+        streamClose remoteStream
+      conn <- mkDummyConnection remotePid (pure localStream)
+      _ <- async $ requestIdentify sw conn
+      takeMVar gate
+      usageOpen <- peerUsage sw remotePid
+      fmap ruStreamsOutbound usageOpen `shouldBe` Just 1
+      putMVar release ()
+      -- A memory-stream close may not unblock the framed read, so the
+      -- exchange can run until identifyTimeoutMicros and then release.
+      usageClosed <- waitUntil 70 $ do
+        usage <- peerUsage sw remotePid
+        pure (fmap ruStreamsOutbound usage == Just 0)
+      usageClosed `shouldBe` True
+
+    it "requestIdentify does not open a mux stream when outbound streams are exhausted" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, _) <- mkTestIdentity
+      sw <- tightOutbound =<< newSwitch localPid localKP
+      opens <- newIORef (0 :: Int)
+      conn <- mkDummyConnection remotePid $ do
+        modifyIORef' opens (+ 1)
+        fst <$> mkMemoryStreamPair
+      result <- requestIdentify sw conn
+      case result of
+        Left err -> err `shouldSatisfy` ("stream reservation failed" `isInfixOf`)
+        Right _ -> expectationFailure "expected a resource error"
+      readIORef opens `shouldReturn` 0
+
+    it "GossipSub reserves an outbound slot and releases it on stop" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, _) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      node <- newGossipSubNode sw defaultGossipSubParams
+      startGossipSub node
+      (localStream, remoteStream) <- mkMemoryStreamPair
+      _ <- async $ negotiateResponder remoteStream
+        [gossipSubProtocolId, gossipSubProtocolIdV10, floodSubProtocolId]
+      conn <- mkDummyConnection remotePid (pure localStream)
+      notifiers <- atomically $ readTVar (swNotifiers sw)
+      mapM_ ($ conn) notifiers
+      reserved <- waitUntil 20 $ do
+        usage <- peerUsage sw remotePid
+        pure (fmap ruStreamsOutbound usage == Just 1)
+      reserved `shouldBe` True
+      stopGossipSub node
+      usageClosed <- peerUsage sw remotePid
+      fmap ruStreamsOutbound usageClosed `shouldBe` Just 0
+
+    it "GossipSub does not open a mux stream when outbound streams are exhausted" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, _) <- mkTestIdentity
+      sw <- tightOutbound =<< newSwitch localPid localKP
+      node <- newGossipSubNode sw defaultGossipSubParams
+      startGossipSub node
+      opens <- newIORef (0 :: Int)
+      conn <- mkDummyConnection remotePid $ do
+        modifyIORef' opens (+ 1)
+        fst <$> mkMemoryStreamPair
+      notifiers <- atomically $ readTVar (swNotifiers sw)
+      mapM_ ($ conn) notifiers
+      threadDelay 200000
+      readIORef opens `shouldReturn` 0
+      stopGossipSub node
+
+    it "GossipSub releases its outbound slot when the stream read loop fails" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, _) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      node <- newGossipSubNode sw defaultGossipSubParams
+      startGossipSub node
+      (localStream, remoteStream) <- mkMemoryStreamPair
+      negotiated <- newEmptyMVar
+      failRead <- newEmptyMVar
+      _ <- async $ do
+        _ <- negotiateResponder remoteStream
+          [gossipSubProtocolId, gossipSubProtocolIdV10, floodSubProtocolId]
+        putMVar negotiated ()
+        takeMVar failRead
+        streamWrite remoteStream (BS.replicate 10 0x80)
+      conn <- mkDummyConnection remotePid (pure localStream)
+      notifiers <- atomically $ readTVar (swNotifiers sw)
+      mapM_ ($ conn) notifiers
+      takeMVar negotiated
+      usageOpen <- peerUsage sw remotePid
+      fmap ruStreamsOutbound usageOpen `shouldBe` Just 1
+      putMVar failRead ()
+      released <- waitUntil 20 $ do
+        usage <- peerUsage sw remotePid
+        pure (fmap ruStreamsOutbound usage == Just 0)
+      released `shouldBe` True
+      stopGossipSub node
+
+    it "GossipSub releases a cached stream when its owning connection closes" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, _) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      node <- newGossipSubNode sw defaultGossipSubParams
+      startGossipSub node
+      -- Handler registration schedules identify pushes. Let those snapshot the
+      -- still-empty pool before installing the mock GossipSub connections.
+      threadDelay 200000
+      (localOne, remoteOne) <- mkMemoryStreamPair
+      (localTwo, remoteTwo) <- mkMemoryStreamPair
+      _ <- async $ negotiateResponder remoteOne
+        [gossipSubProtocolId, gossipSubProtocolIdV10, floodSubProtocolId]
+      _ <- async $ negotiateResponder remoteTwo
+        [gossipSubProtocolId, gossipSubProtocolIdV10, floodSubProtocolId]
+      first <- mkDummyConnection remotePid (pure localOne)
+      owner <- mkDummyConnection remotePid (pure localTwo)
+      notifiers <- atomically $ readTVar (swNotifiers sw)
+      withinEventTest "first GossipSub notifier" $ mapM_ ($ first) notifiers
+      withinEventTest "second GossipSub notifier" $ mapM_ ($ owner) notifiers
+      atomically $ do
+        addConn (swConnPool sw) first
+        addConn (swConnPool sw) owner
+      usageOpen <- peerUsage sw remotePid
+      fmap ruStreamsOutbound usageOpen `shouldBe` Just 1
+      withinEventTest "close GossipSub owner" $ closeConnection sw owner
+      remaining <- atomically $ lookupConn (swConnPool sw) remotePid
+      isJust remaining `shouldBe` True
+      usageClosed <- peerUsage sw remotePid
+      fmap ruStreamsOutbound usageClosed `shouldBe` Just 0
+      withinEventTest "stop GossipSub owner test" $ stopGossipSub node
+      withinEventTest "close remaining GossipSub connection" $
+        closeConnection sw first
+
+    it "DHT reserves an outbound slot and releases it on stop" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, _) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      node <- newDHTNode sw DHTServer
+      server <- newDHTNode sw DHTServer
+      (localStream, remoteStream) <- mkMemoryStreamPair
+      conn <- mkDummyConnection remotePid (pure localStream)
+      atomically $ addConn (swConnPool sw) conn
+      _ <- async $ do
+        _ <- negotiateResponder remoteStream [dhtProtocolId]
+        handleDHTRequest server remoteStream remotePid testAddr
+      result <- timeout 2000000 $ dhtSendRequest node remotePid
+        (emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [1] })
+      case result of
+        Just (Right _) -> pure ()
+        Just (Left err) -> expectationFailure err
+        Nothing -> expectationFailure "DHT request timed out"
+      usageOpen <- peerUsage sw remotePid
+      fmap ruStreamsOutbound usageOpen `shouldBe` Just 1
+      stopDHTNode node
+      usageClosed <- peerUsage sw remotePid
+      fmap ruStreamsOutbound usageClosed `shouldBe` Just 0
+
+    it "DHT does not open a mux stream when outbound streams are exhausted" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, _) <- mkTestIdentity
+      sw <- tightOutbound =<< newSwitch localPid localKP
+      node <- newDHTNode sw DHTServer
+      opens <- newIORef (0 :: Int)
+      conn <- mkDummyConnection remotePid $ do
+        modifyIORef' opens (+ 1)
+        fst <$> mkMemoryStreamPair
+      atomically $ addConn (swConnPool sw) conn
+      result <- dhtSendRequest node remotePid
+        (emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [1] })
+      case result of
+        Left err -> err `shouldSatisfy` ("stream reservation failed" `isInfixOf`)
+        Right _ -> expectationFailure "expected a resource error"
+      readIORef opens `shouldReturn` 0
+
+    it "DHT does not recreate a stream after stop" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, _) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      node <- newDHTNode sw DHTServer
+      opens <- newIORef (0 :: Int)
+      conn <- mkDummyConnection remotePid $ do
+        modifyIORef' opens (+ 1)
+        fst <$> mkMemoryStreamPair
+      atomically $ addConn (swConnPool sw) conn
+      stopDHTNode node
+      result <- dhtSendRequest node remotePid
+        (emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [1] })
+      case result of
+        Left err -> err `shouldSatisfy` ("stopped" `isInfixOf`)
+        Right _ -> expectationFailure "expected a stopped-node error"
+      readIORef opens `shouldReturn` 0
+
+    it "DHT releases a cached stream when its owning connection closes" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, _) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      node <- newDHTNode sw DHTServer
+      server <- newDHTNode sw DHTServer
+      (localStream, remoteStream) <- mkMemoryStreamPair
+      owner <- mkDummyConnection remotePid (pure localStream)
+      survivor <- mkDummyConnection remotePid (fail "survivor should not open")
+      atomically $ do
+        addConn (swConnPool sw) owner
+        addConn (swConnPool sw) survivor
+      _ <- async $ do
+        _ <- negotiateResponder remoteStream [dhtProtocolId]
+        handleDHTRequest server remoteStream remotePid testAddr
+      result <- timeout 2000000 $ dhtSendRequest node remotePid
+        (emptyDHTMessage { msgType = FindNode, msgKey = BS.pack [2] })
+      case result of
+        Just (Right _) -> pure ()
+        Just (Left err) -> expectationFailure err
+        Nothing -> expectationFailure "DHT request timed out"
+      usageOpen <- peerUsage sw remotePid
+      fmap ruStreamsOutbound usageOpen `shouldBe` Just 1
+      closeConnection sw owner
+      remaining <- atomically $ lookupConn (swConnPool sw) remotePid
+      isJust remaining `shouldBe` True
+      usageClosed <- peerUsage sw remotePid
+      fmap ruStreamsOutbound usageClosed `shouldBe` Just 0
+      stopDHTNode node
+      stopDHTNode server
 
     it "dispatchStream counts an inbound stream against the peer limit and releases it" $ do
       (localPid, localKP) <- mkTestIdentity
