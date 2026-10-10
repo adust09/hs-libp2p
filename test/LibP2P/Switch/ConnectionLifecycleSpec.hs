@@ -480,6 +480,9 @@ spec = do
       sw <- newSwitch localPid localKP
       node <- newGossipSubNode sw defaultGossipSubParams
       startGossipSub node
+      -- Handler registration schedules identify pushes. Let those snapshot the
+      -- still-empty pool before installing the mock GossipSub connections.
+      threadDelay 200000
       (localOne, remoteOne) <- mkMemoryStreamPair
       (localTwo, remoteTwo) <- mkMemoryStreamPair
       _ <- async $ negotiateResponder remoteOne
@@ -488,21 +491,22 @@ spec = do
         [gossipSubProtocolId, gossipSubProtocolIdV10, floodSubProtocolId]
       first <- mkDummyConnection remotePid (pure localOne)
       owner <- mkDummyConnection remotePid (pure localTwo)
+      notifiers <- atomically $ readTVar (swNotifiers sw)
+      withinEventTest "first GossipSub notifier" $ mapM_ ($ first) notifiers
+      withinEventTest "second GossipSub notifier" $ mapM_ ($ owner) notifiers
       atomically $ do
         addConn (swConnPool sw) first
         addConn (swConnPool sw) owner
-      notifiers <- atomically $ readTVar (swNotifiers sw)
-      mapM_ ($ first) notifiers
-      mapM_ ($ owner) notifiers
       usageOpen <- peerUsage sw remotePid
       fmap ruStreamsOutbound usageOpen `shouldBe` Just 1
-      closeConnection sw owner
+      withinEventTest "close GossipSub owner" $ closeConnection sw owner
       remaining <- atomically $ lookupConn (swConnPool sw) remotePid
       isJust remaining `shouldBe` True
       usageClosed <- peerUsage sw remotePid
       fmap ruStreamsOutbound usageClosed `shouldBe` Just 0
-      stopGossipSub node
-      closeConnection sw first
+      withinEventTest "stop GossipSub owner test" $ stopGossipSub node
+      withinEventTest "close remaining GossipSub connection" $
+        closeConnection sw first
 
     it "DHT reserves an outbound slot and releases it on stop" $ do
       (localPid, localKP) <- mkTestIdentity
