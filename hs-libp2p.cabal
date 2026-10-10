@@ -1,4 +1,4 @@
-cabal-version:   3.0
+cabal-version:   3.12
 name:            hs-libp2p
 version:         0.1.0.0
 synopsis:        Haskell implementation of the libp2p networking stack
@@ -15,6 +15,10 @@ build-type:      Simple
 extra-doc-files: README.md
 tested-with:     GHC == 9.10.1
 
+source-repository head
+  type:     git
+  location: https://github.com/adust09/hs-libp2p
+
 common warnings
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates
                -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints
@@ -28,6 +32,8 @@ common lang
 library
   import:          warnings, lang
   hs-source-dirs:  src
+  other-modules: PackageInfo_hs_libp2p
+  autogen-modules: PackageInfo_hs_libp2p
   exposed-modules:
     LibP2P
     LibP2P.Core.Binary

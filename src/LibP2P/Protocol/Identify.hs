@@ -12,8 +12,10 @@
 -- Also implements Identify Push (/ipfs/id/push/1.0.0) for proactive
 -- updates when local state changes.
 module LibP2P.Protocol.Identify
-  ( -- * Protocol IDs
-    identifyProtocolId
+  ( -- * Agent version
+    agentVersion
+    -- * Protocol IDs
+  , identifyProtocolId
   , identifyPushProtocolId
     -- * Protocol logic
   , handleIdentify
@@ -38,6 +40,8 @@ import Control.Concurrent.STM (atomically, modifyTVar', readTVar, writeTVar)
 import Control.Exception (SomeException, bracket, catch, finally, try)
 import LibP2P.Switch.Connection (newStream)
 import Control.Monad (void)
+import Data.Text (Text)
+import qualified Data.Text as T
 import System.Timeout (timeout)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
@@ -78,6 +82,21 @@ import LibP2P.Switch.Types
   , Connection (..)
   , Switch (..)
   )
+
+import qualified PackageInfo_hs_libp2p as Pkg
+import Data.Version (showVersion)
+
+-- | Agent version for the locally built IdentifyInfo,
+-- derived from the Cabal package name and version,
+-- e.g. "hs-libp2p/0.1.0.0".
+agentVersion :: Text
+agentVersion =
+  let version = showVersion Pkg.version
+      name = map kebab Pkg.name
+  in T.pack $ name <> "/" <> version
+  where
+    kebab '_' = '-'
+    kebab c = c
 
 -- | Identify protocol ID.
 identifyProtocolId :: ProtocolId
@@ -335,7 +354,7 @@ buildLocalIdentify sw mConn = do
                        (sealPeerRecord (swIdentityKey sw) record)
   pure IdentifyInfo
     { idProtocolVersion = Just "ipfs/0.1.0"
-    , idAgentVersion    = Just "hs-libp2p/0.1.0"
+    , idAgentVersion    = Just agentVersion
     , idPublicKey       = Just (encodePublicKey (kpPublic (swIdentityKey sw)))
     , idListenAddrs     = addrBytes
     , idObservedAddr    = (\(Multiaddr ps) -> encodeProtocols ps) . connRemoteAddr <$> mConn

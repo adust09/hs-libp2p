@@ -59,6 +59,7 @@ import LibP2P.Protocol.GossipSub.Types
 import LibP2P.Protocol.Identify
   ( registerIdentifyHandlers
   , requestIdentify
+  , agentVersion
   )
 import LibP2P.Protocol.Identify.Message (IdentifyInfo (..))
 import LibP2P.Protocol.Ping
@@ -205,7 +206,7 @@ spec = do
           Nothing -> expectationFailure "identify timed out"
           Just (Left err) -> expectationFailure $ "identify failed: " ++ err
           Just (Right info) -> do
-            idAgentVersion info `shouldBe` Just "hs-libp2p/0.1.0"
+            idAgentVersion info `shouldBe` Just agentVersion
             idProtocols info `shouldSatisfy` (not . null)
 
     it "idListenAddrs populated after switchListen" $ do
