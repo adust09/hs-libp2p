@@ -55,7 +55,7 @@ services:
   nim-perf-listener:
     build:
       context: ./nim-libp2p
-      dockerfile: interop/perf/Dockerfile
+      dockerfile: ../interop/nim-perf.Dockerfile
     image: nim-libp2p-perf:latest
     depends_on:
       redis:
@@ -97,7 +97,7 @@ services:
   nim-perf-dialer:
     build:
       context: ./nim-libp2p
-      dockerfile: interop/perf/Dockerfile
+      dockerfile: ../interop/nim-perf.Dockerfile
     image: nim-libp2p-perf:latest
     depends_on:
       redis:
