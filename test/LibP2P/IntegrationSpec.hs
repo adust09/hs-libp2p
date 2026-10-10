@@ -481,7 +481,8 @@ spec = do
       tcpB <- newTCPTransport
       addTransport swB tcpB
       let securedRejectGater = ConnectionGater
-            { gateAccept  = \_ -> pure True
+            { gateAccept = \_ -> pure True
+            , gateDialAddr = \_ -> pure True
             , gateSecured = \_ -> pure False
             }
       addrs <- switchListen swB securedRejectGater [loopbackAddr]

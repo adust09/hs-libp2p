@@ -4,7 +4,7 @@ import Control.Concurrent.Async (async, concurrently)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
-import Data.Time.Clock (NominalDiffTime, UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
+import Data.Time.Clock (addUTCTime, diffUTCTime, getCurrentTime)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair, publicKey)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
@@ -13,14 +13,18 @@ import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkMemoryStreamPair)
 import LibP2P.Switch.ConnPool (addConn, lookupConn)
 import LibP2P.Switch.Dial
-  ( checkBackoff
+  ( DialOpts (..)
+  , checkBackoff
   , clearBackoff
+  , defaultDialOpts
   , dial
+  , dialWith
   , initialBackoffSeconds
   , maxBackoffSeconds
   , recordBackoff
   )
-import LibP2P.Switch (addTransport, newSwitch, switchClose)
+import LibP2P.Switch (addTransport, newSwitch, setConnectionGater, switchClose)
+import LibP2P.Switch.Listen (defaultConnectionGater, gateDialAddr, gateSecured)
 import LibP2P.Switch.ResourceManager
   ( ResourceManager (..)
   , ResourceScope (..)
@@ -131,6 +135,35 @@ mkCountingMockTransport responderKP counterRef = pure Transport
         , rcClose      = pure ()
         }
 
+-- | Create a mock transport that records when the upgraded connection closes.
+mkClosingMockTransport :: KeyPair -> IORef Int -> IO Transport
+mkClosingMockTransport responderKP closeCount = pure Transport
+  { transportDial = dialFn
+  , transportDialFrom = \_ -> dialFn
+  , transportListen = \_ -> error "mock: listen not supported"
+  , transportCanDial = \(Multiaddr ps) -> case ps of
+      (IP4 _ : TCP _ : _) -> True
+      _ -> False
+  }
+  where
+    dialFn addr = do
+      (streamA, streamB) <- mkMemoryStreamPair
+      let rawConnB = RawConnection
+            { rcEndpoint = ByteStreamEndpoint streamB
+            , rcLocalAddr = addr
+            , rcRemoteAddr = Multiaddr [IP4 0x7f000001, TCP 0]
+            , rcClose = pure ()
+            }
+      _ <- async $ do
+        _ <- upgradeInbound responderKP rawConnB
+        pure ()
+      pure RawConnection
+        { rcEndpoint = ByteStreamEndpoint streamA
+        , rcLocalAddr = Multiaddr [IP4 0x7f000001, TCP 0]
+        , rcRemoteAddr = addr
+        , rcClose = atomicModifyIORef' closeCount (\n -> (n + 1, ()))
+        }
+
 -- | Create a mock transport that always fails to dial.
 mkFailingTransport :: IO Transport
 mkFailingTransport = pure Transport
@@ -199,7 +232,6 @@ spec = do
       (pid, _kp) <- mkTestIdentity
       beforeRecord <- getCurrentTime
       recordBackoff backoffs pid
-      afterRecord <- getCurrentTime
       entry <- atomically $ do
         boffs <- readTVar backoffs
         pure $ Map.lookup pid boffs
@@ -310,6 +342,72 @@ spec = do
             Nothing -> expectationFailure "connection not found in pool"
             Just _  -> pure ()
 
+    it "should not call transportDial when the outbound address is gated" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      counter <- newIORef (0 :: Int)
+      addTransport sw =<< mkCountingMockTransport remoteKP counter
+      setConnectionGater sw defaultConnectionGater
+        { gateDialAddr = \_ -> pure False }
+
+      result <- dial sw remotePid [testAddr]
+
+      result `shouldBeLeft` DialGatedAddress testAddr
+      readIORef counter `shouldReturn` 0
+      checkBackoff (swDialBackoffs sw) remotePid `shouldReturn` Right ()
+
+    it "should skip a gated address and dial an allowed address" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      counter <- newIORef (0 :: Int)
+      addTransport sw =<< mkCountingMockTransport remoteKP counter
+      let allowedAddr = Multiaddr [IP4 0x7f000001, TCP 4002]
+      setConnectionGater sw defaultConnectionGater
+        { gateDialAddr = \addr -> pure (addr /= testAddr) }
+
+      result <- dial sw remotePid [testAddr, allowedAddr]
+
+      case result of
+        Left err -> expectationFailure $ "expected allowed address to connect: " <> show err
+        Right conn -> connRemoteAddr conn `shouldBe` allowedAddr
+      readIORef counter `shouldReturn` 1
+
+    it "should close an upgraded connection when the authenticated peer is gated" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      closeCount <- newIORef (0 :: Int)
+      addTransport sw =<< mkClosingMockTransport remoteKP closeCount
+      setConnectionGater sw defaultConnectionGater
+        { gateSecured = \_ -> pure False }
+
+      result <- dial sw remotePid [testAddr]
+
+      result `shouldBeLeft` DialGatedPeer remotePid
+      readIORef closeCount `shouldReturn` 1
+      poolConn <- atomically $ lookupConn (swConnPool sw) remotePid
+      case poolConn of
+        Nothing -> pure ()
+        Just _ -> expectationFailure "gated connection should not enter the pool"
+      checkBackoff (swDialBackoffs sw) remotePid `shouldReturn` Right ()
+
+    it "should apply address gating to force-direct DCUtR dials" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      counter <- newIORef (0 :: Int)
+      addTransport sw =<< mkCountingMockTransport remoteKP counter
+      setConnectionGater sw defaultConnectionGater
+        { gateDialAddr = \_ -> pure False }
+      let opts = defaultDialOpts { doForceDirect = True }
+
+      result <- dialWith sw opts remotePid [testAddr]
+
+      result `shouldBeLeft` DialGatedAddress testAddr
+      readIORef counter `shouldReturn` 0
+
     it "failed dial records backoff" $ do
       (localPid, localKP) <- mkTestIdentity
       (remotePid, _remoteKP) <- mkTestIdentity
@@ -380,3 +478,8 @@ spec = do
       -- Only one actual transport dial should have occurred
       count <- readIORef counter
       count `shouldBe` 1
+
+shouldBeLeft :: (Eq a, Show a) => Either a b -> a -> Expectation
+shouldBeLeft result expected = case result of
+  Left actual -> actual `shouldBe` expected
+  Right _ -> expectationFailure "expected Left, got Right"

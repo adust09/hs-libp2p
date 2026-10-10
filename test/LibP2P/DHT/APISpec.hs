@@ -24,7 +24,7 @@ import LibP2P.DHT.RoutingTable (insertPeer, newRoutingTable)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair)
 import LibP2P.Multiaddr (Multiaddr, fromText)
-import LibP2P.Switch.Types (Switch (..))
+import LibP2P.Switch.Types (Switch (..), defaultConnectionGater)
 import LibP2P.Switch.ResourceManager (ResourceManager, newResourceManager, DefaultLimits (..), noLimits)
 import qualified Data.Map.Strict as Map
 
@@ -232,6 +232,7 @@ mkMockSwitch pid = do
   closed <- newTVarIO False
   backoffs <- newTVarIO Map.empty
   pendingDials <- newTVarIO Map.empty
+  connectionGater <- newTVarIO defaultConnectionGater
   resMgr <- mkMockResourceMgr
   peerStore <- newTVarIO Map.empty
   certifiedRecords <- newTVarIO Map.empty
@@ -249,6 +250,7 @@ mkMockSwitch pid = do
     , swClosed       = closed
     , swDialBackoffs = backoffs
     , swPendingDials = pendingDials
+    , swConnectionGater = connectionGater
     , swResourceMgr  = resMgr
     , swPeerStore    = peerStore
     , swCertifiedRecords = certifiedRecords
