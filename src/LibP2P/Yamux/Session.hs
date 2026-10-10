@@ -50,6 +50,9 @@ newSession role writeFn readFn = do
   remoteGoAway <- newTVarIO Nothing
   pings <- newTVarIO Map.empty
   nextPingId <- newTVarIO 1
+  queuedCount <- newTVarIO 0
+  sentCount <- newTVarIO 0
+  recvCount <- newTVarIO 0
   pure
     YamuxSession
       { ysessRole = role
@@ -61,6 +64,9 @@ newSession role writeFn readFn = do
       , ysessRemoteGoAway = remoteGoAway
       , ysessPings = pings
       , ysessNextPingId = nextPingId
+      , ysessQueuedCount = queuedCount
+      , ysessSentCount = sentCount
+      , ysessRecvCount = recvCount
       , ysessWrite = writeFn
       , ysessRead = readFn
       }
@@ -103,7 +109,7 @@ openStream sess = do
               , yhStreamId = sid
               , yhLength = 0
               }
-      atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
+      atomically $ enqueueFrame sess hdr BS.empty
       pure (Right stream)
 
 -- | Accept an inbound stream. Blocks until a remote SYN arrives.
@@ -120,7 +126,7 @@ acceptStream sess = do
           , yhStreamId = ysStreamId stream
           , yhLength = 0
           }
-  atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
+  atomically $ enqueueFrame sess hdr BS.empty
   -- Transition to Established only from SYNReceived. The remote may have
   -- already half-closed (FIN) before we accepted; that state must survive.
   atomically $ do
@@ -149,7 +155,7 @@ ping sess = do
           , yhStreamId = 0
           , yhLength = pingId
           }
-  atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
+  atomically $ enqueueFrame sess hdr BS.empty
   -- Wait for ACK (or a session-failure notification)
   result <- atomically $ takeTMVar waiter
   -- Cleanup
@@ -170,7 +176,7 @@ sendGoAway sess code = do
           , yhStreamId = 0
           , yhLength = errCode
           }
-  atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
+  atomically $ enqueueFrame sess hdr BS.empty
 
 -- | Receive loop: reads 12-byte headers from transport and dispatches frames.
 -- This loop runs until the transport connection is closed or an error occurs.
@@ -186,6 +192,7 @@ recvLoop sess = go `finally` failSession sess
     go = do
       -- Read 12-byte header
       headerBytes <- ysessRead sess headerSize
+      atomically $ modifyTVar' (ysessRecvCount sess) (+ 1)
       case decodeHeader headerBytes of
         -- Malformed header (unknown frame type): tell the peer why we
         -- are leaving before terminating, as go-yamux does
@@ -322,7 +329,7 @@ acceptInboundSYN sess sid = do
       atomically $ do
         full <- isFullTBQueue (ysessAcceptCh sess)
         if full
-          then writeTQueue (ysessSendCh sess) (rstHeader sid, BS.empty)
+          then enqueueFrame sess (rstHeader sid) BS.empty
           else do
             modifyTVar' (ysessStreams sess) (Map.insert sid stream)
             writeTBQueue (ysessAcceptCh sess) stream
@@ -421,7 +428,7 @@ handlePing sess hdr
               , yhStreamId = 0
               , yhLength = yhLength hdr -- echo opaque value
               }
-      atomically $ writeTQueue (ysessSendCh sess) (respHdr, BS.empty)
+      atomically $ enqueueFrame sess respHdr BS.empty
   | flagACK (yhFlags hdr) = do
       -- Resolve pending ping
       let pingId = yhLength hdr
@@ -452,6 +459,7 @@ sendLoop sess = go
       (hdr, payload) <- atomically $ readTQueue (ysessSendCh sess)
       ysessWrite sess (encodeHeader hdr)
       when (BS.length payload > 0) $ ysessWrite sess payload
+      atomically $ modifyTVar' (ysessSentCount sess) (+ 1)
       go
 
 -- | Create a new YamuxStream with the given initial state.

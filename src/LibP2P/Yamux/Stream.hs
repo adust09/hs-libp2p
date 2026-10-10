@@ -72,7 +72,7 @@ writeChunked stream payload
                   , yhLength = fromIntegral (BS.length chunk)
                   }
           let sess = ysSession stream
-          atomically $ writeTQueue (ysessSendCh sess) (hdr, chunk)
+          atomically $ enqueueFrame sess hdr chunk
           -- Continue with remaining data
           let remaining = BS.drop (BS.length chunk) payload
           writeChunked stream remaining
@@ -110,7 +110,7 @@ streamRead stream = do
               }
       let sess = ysSession stream
       atomically $ do
-        writeTQueue (ysessSendCh sess) (hdr, BS.empty)
+        enqueueFrame sess hdr BS.empty
         -- Increment recv window
         w <- readTVar (ysRecvWindow stream)
         writeTVar (ysRecvWindow stream) (w + consumed)
@@ -153,7 +153,7 @@ streamClose stream = do
               , yhLength = 0
               }
       let sess = ysSession stream
-      atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
+      atomically $ enqueueFrame sess hdr BS.empty
       pure (Right ())
     Left err -> pure (Left err)
 
@@ -173,4 +173,4 @@ streamReset stream = do
           , yhLength = 0
           }
   let sess = ysSession stream
-  atomically $ writeTQueue (ysessSendCh sess) (hdr, BS.empty)
+  atomically $ enqueueFrame sess hdr BS.empty
