@@ -26,7 +26,14 @@ import LibP2P.Multiaddr (Multiaddr)
 import LibP2P.MultistreamSelect.Negotiation (ProtocolId)
 import LibP2P.Protocol.Identify (pushIdentify)
 import LibP2P.Switch.Connection (closeAllConnections)
-import LibP2P.Switch.ResourceManager (DefaultLimits (..), defaultPeerLimits, defaultSystemLimits, newResourceManager)
+import LibP2P.Switch.ResourceManager
+  ( DefaultLimits (..)
+  , defaultConnectionLimits
+  , defaultPeerLimits
+  , defaultStreamLimits
+  , defaultSystemLimits
+  , newResourceManager
+  )
 import LibP2P.Switch.Types (ActiveListener (..), StreamHandler, Switch (..), SwitchEvent)
 import LibP2P.Transport (Listener (..), Transport (..))
 
@@ -43,7 +50,9 @@ newSwitch pid kp = do
   pendingDialsVar <- newTVarIO Map.empty
   resMgr <- newResourceManager DefaultLimits
     { dlSystemLimits = defaultSystemLimits
-    , dlPeerLimits   = defaultPeerLimits
+    , dlPeerLimits = defaultPeerLimits
+    , dlConnectionLimits = defaultConnectionLimits
+    , dlStreamLimits = defaultStreamLimits
     }
   peerStoreVar <- newTVarIO Map.empty
   certifiedRecordsVar <- newTVarIO Map.empty

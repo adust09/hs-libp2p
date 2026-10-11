@@ -42,7 +42,15 @@ import Control.Concurrent.STM
   , writeTChan
   , writeTVar
   )
-import Control.Exception (SomeException, bracketOnError, catch, finally, onException)
+import Control.Exception
+  ( SomeException
+  , bracketOnError
+  , catch
+  , finally
+  , fromException
+  , onException
+  , throwIO
+  )
 import Control.Monad (forM, forM_, when)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
@@ -53,7 +61,7 @@ import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.Switch.ConnPool (addConn, lookupConn)
 import LibP2P.Switch.Connection (closeConnection)
 import LibP2P.Switch.Listen (streamAcceptLoop, switchListenAddrs)
-import LibP2P.Switch.ResourceManager (Direction (..), releaseConnection, reserveConnection)
+import LibP2P.Switch.ResourceManager (Direction (..), ResourceError)
 import LibP2P.Switch.Types
   ( BackoffEntry (..)
   , Connection (..)
@@ -255,42 +263,29 @@ establishAndRegister
   -> IO (Either DialError Connection)
 establishAndRegister sw opts remotePeerId addrs = do
   let dir = if doUpgradeAsClient opts then Outbound else Inbound
-  resCheck <- atomically $ reserveConnection (swResourceMgr sw) remotePeerId dir
-  case resCheck of
-    Left resErr -> pure (Left (DialResourceLimit resErr))
-    Right () -> do
-      result <- dialNewInner sw opts dir addrs
-        `onException` atomically (releaseConnection (swResourceMgr sw) remotePeerId dir)
-      -- Verify remote PeerId matches expected target
-      let verified = case result of
-            Right conn
-              | connPeerId conn /= remotePeerId ->
-                  Left (DialPeerIdMismatch remotePeerId (connPeerId conn))
-            _ -> result
-      case verified of
-        Right conn -> do
-          clearBackoff (swDialBackoffs sw) remotePeerId
-          atomically $ do
-            addConn (swConnPool sw) conn
-            writeTChan (swEvents sw)
-              (Connected (connPeerId conn) dir (connRemoteAddr conn))
-          -- Start accepting inbound streams on the dialer side; tear the
-          -- connection down when the session dies (pool removal,
-          -- resource release, muxer + transport close).
-          _ <- async $ streamAcceptLoop sw conn `finally` closeConnection sw conn
-          -- Notify connection listeners (e.g. GossipSub auto-stream open)
-          notifiers <- atomically $ readTVar (swNotifiers sw)
-          mapM_ (\f -> async $ f conn) notifiers
-          pure (Right conn)
-        Left _ -> do
-          -- Close the muxer session on PeerId mismatch
-          case result of
-            Right conn -> muxClose (connSession conn)
-            Left _     -> pure ()
-          -- Release the reserved connection since dial failed
-          atomically $ releaseConnection (swResourceMgr sw) remotePeerId dir
-          recordBackoff (swDialBackoffs sw) remotePeerId
-          pure verified
+  result <- dialNewInner sw opts dir addrs
+  let verified = case result of
+        Right conn
+          | connPeerId conn /= remotePeerId ->
+              Left (DialPeerIdMismatch remotePeerId (connPeerId conn))
+        _ -> result
+  case verified of
+    Right conn -> do
+      clearBackoff (swDialBackoffs sw) remotePeerId
+      atomically $ do
+        addConn (swConnPool sw) conn
+        writeTChan (swEvents sw)
+          (Connected (connPeerId conn) dir (connRemoteAddr conn))
+      _ <- async $ streamAcceptLoop sw conn `finally` closeConnection sw conn
+      notifiers <- atomically $ readTVar (swNotifiers sw)
+      mapM_ (\f -> async $ f conn) notifiers
+      pure (Right conn)
+    Left _ -> do
+      case result of
+        Right conn -> muxClose (connSession conn)
+        Left _ -> pure ()
+      recordBackoff (swDialBackoffs sw) remotePeerId
+      pure verified
 
 -- | Inner dial logic: transport selection and staggered parallel dial.
 dialNewInner :: Switch -> DialOpts -> Direction -> [Multiaddr] -> IO (Either DialError Connection)
@@ -329,8 +324,8 @@ staggeredDial sw opts dir pairs =
         when (i > 0) $ threadDelay (i * staggerDelayUs)
         localBind <- localBindFor sw (doForceDirect opts) addr
         rawConn <- transportDialFrom transport localBind addr
-        upgradeAs dir (swIdentityKey sw) rawConn
-          `onException` rcClose rawConn
+        upgradeAs (swResourceMgr sw) dir (swIdentityKey sw) rawConn
+          `catch` \(err :: SomeException) -> rcClose rawConn >> throwIO err
 
 -- | Hole-punch dials bind the outgoing socket to a same-family listen
 -- address so the SYN shares the listen port. Ordinary dials leave the
@@ -359,8 +354,11 @@ collectResults workers errs = do
     Right conn -> do
       cancelAndCloseWorkers remaining
       pure (Right conn)
-    Left (ex :: SomeException) ->
-      collectResults remaining (show ex : errs)
+    Left (ex :: SomeException) -> case fromException ex of
+      Just resourceErr -> do
+        cancelAndCloseWorkers remaining
+        pure (Left (DialResourceLimit (resourceErr :: ResourceError)))
+      Nothing -> collectResults remaining (show ex : errs)
 
 -- | Stop losing dial workers and close any connection that crossed the
 -- upgrade finish line before cancellation reached it.

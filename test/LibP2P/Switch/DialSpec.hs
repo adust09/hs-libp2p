@@ -22,9 +22,13 @@ import LibP2P.Switch.Dial
   )
 import LibP2P.Switch (addTransport, newSwitch, switchClose)
 import LibP2P.Switch.ResourceManager
-  ( ResourceManager (..)
+  ( DefaultLimits (..)
+  , ResourceManager (..)
   , ResourceScope (..)
   , emptyUsage
+  , newResourceManager
+  , noLimits
+  , reserveConnection
   )
 import LibP2P.Switch.Types
   ( BackoffEntry (..)
@@ -51,9 +55,11 @@ testAddr :: Multiaddr
 testAddr = Multiaddr [IP4 0x7f000001, TCP 4001]
 
 -- | A dummy connection for pool tests.
-mkDummyConnection :: PeerId -> IO Connection
-mkDummyConnection pid = do
+mkDummyConnection :: Switch -> PeerId -> IO Connection
+mkDummyConnection sw pid = do
   stateVar <- newTVarIO ConnOpen
+  connScope <- atomically (reserveConnection (swResourceMgr sw) pid Outbound)
+    >>= either (fail . show) pure
   pure Connection
     { connPeerId     = pid
     , connDirection  = Outbound
@@ -62,12 +68,17 @@ mkDummyConnection pid = do
     , connSecurity   = "/noise"
     , connMuxer      = "/yamux/1.0.0"
     , connSession    = MuxerSession
-        { muxOpenStream   = fail "dummy: not connected"
+        { muxOpenStream   = \_ -> fail "dummy: not connected"
         , muxAcceptStream = fail "dummy: not connected"
         , muxClose        = pure ()
         }
     , connState      = stateVar
+    , connResourceScope = connScope
     }
+
+newTestResourceManager :: IO ResourceManager
+newTestResourceManager =
+  newResourceManager (DefaultLimits noLimits noLimits noLimits noLimits)
 
 -- | Create a mock transport where dial connects to a concurrent responder.
 -- The responder runs upgradeInbound concurrently on the other end of
@@ -91,7 +102,8 @@ mkMockDialTransport responderKP = pure Transport
             , rcClose      = pure ()
             }
       _ <- async $ do
-        _ <- upgradeInbound responderKP rawConnB
+        rm <- newTestResourceManager
+        _ <- upgradeInbound rm responderKP rawConnB
         pure ()
       pure RawConnection
         { rcEndpoint   = ByteStreamEndpoint streamA
@@ -122,7 +134,8 @@ mkCountingMockTransport responderKP counterRef = pure Transport
             , rcClose      = pure ()
             }
       _ <- async $ do
-        _ <- upgradeInbound responderKP rawConnB
+        rm <- newTestResourceManager
+        _ <- upgradeInbound rm responderKP rawConnB
         pure ()
       pure RawConnection
         { rcEndpoint   = ByteStreamEndpoint streamA
@@ -254,7 +267,7 @@ spec = do
       (remotePid, _remoteKP) <- mkTestIdentity
       sw <- newSwitch localPid localKP
       -- Pre-populate pool with an Open connection
-      conn <- mkDummyConnection remotePid
+      conn <- mkDummyConnection sw remotePid
       atomically $ addConn (swConnPool sw) conn
       -- Dial should return the existing connection
       result <- dial sw remotePid [testAddr]

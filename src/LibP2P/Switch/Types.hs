@@ -27,7 +27,13 @@ import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Multiaddr (Multiaddr)
 import LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO)
 import LibP2P.Protocol.Identify.Message (IdentifyInfo)
-import LibP2P.Switch.ResourceManager (Direction (..), ResourceError (..), ResourceManager)
+import LibP2P.Switch.ResourceManager
+  ( Direction (..)
+  , MemoryAccount
+  , ResourceError (..)
+  , ResourceManager
+  , ResourceScope
+  )
 import LibP2P.Transport (Listener, Transport)
 
 -- | Connection state machine.
@@ -45,9 +51,10 @@ data ConnState
 -- Decouples Switch from a specific muxer (Yamux, mplex, etc.).
 -- Each muxer implementation provides a MuxerSession adapter.
 data MuxerSession = MuxerSession
-  { muxOpenStream   :: !(IO StreamIO)   -- ^ Open a new outbound stream
-  , muxAcceptStream :: !(IO StreamIO)   -- ^ Accept an inbound stream (blocks)
-  , muxClose        :: !(IO ())         -- ^ Close the muxer session
+  { muxOpenStream :: !(MemoryAccount -> IO StreamIO)
+    -- ^ Open an outbound stream and close the account at terminal teardown
+  , muxAcceptStream :: !(IO StreamIO) -- ^ Accept an already-accounted inbound stream
+  , muxClose :: !(IO ()) -- ^ Close the muxer session
   }
 
 -- | An upgraded (secure + multiplexed) connection to a remote peer.
@@ -60,6 +67,7 @@ data Connection = Connection
   , connMuxer      :: !ProtocolId      -- ^ Negotiated muxer protocol (e.g. "/yamux/1.0.0")
   , connSession    :: !MuxerSession    -- ^ Muxer session for opening/accepting streams
   , connState      :: !(TVar ConnState) -- ^ Mutable connection state
+  , connResourceScope :: !ResourceScope -- ^ Resource scope owned by this connection
   }
 
 -- | A protocol stream handler.

@@ -13,6 +13,7 @@ import Control.Concurrent.STM
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
+import LibP2P.Switch.ResourceManager (MemoryAccount (..))
 import LibP2P.Yamux.Frame
 import LibP2P.Yamux.Types
 
@@ -56,26 +57,26 @@ writeChunked stream payload
               then retry -- blocks until ysSendWindow changes
               else do
                 let chunkSize = min (fromIntegral window) (BS.length payload)
-                let (c, _) = BS.splitAt chunkSize payload
-                writeTVar (ysSendWindow stream) (window - fromIntegral chunkSize)
-                pure (Right c)
+                    chunk = BS.take chunkSize payload
+                    hdr = YamuxHeader
+                      { yhVersion = 0
+                      , yhType = FrameData
+                      , yhFlags = defaultFlags
+                      , yhStreamId = ysStreamId stream
+                      , yhLength = fromIntegral chunkSize
+                      }
+                queued <- enqueueDataFrame
+                  (ysSession stream) (ysMemoryAccount stream) hdr chunk
+                case queued of
+                  Left err -> pure (Left (YamuxResourceLimit err))
+                  Right _ -> do
+                    writeTVar (ysSendWindow stream)
+                      (window - fromIntegral chunkSize)
+                    pure (Right chunk)
       case result of
         Left err -> pure (Left err)
-        Right chunk -> do
-          -- Enqueue Data frame
-          let hdr =
-                YamuxHeader
-                  { yhVersion = 0
-                  , yhType = FrameData
-                  , yhFlags = defaultFlags
-                  , yhStreamId = ysStreamId stream
-                  , yhLength = fromIntegral (BS.length chunk)
-                  }
-          let sess = ysSession stream
-          atomically $ enqueueFrame sess hdr chunk
-          -- Continue with remaining data
-          let remaining = BS.drop (BS.length chunk) payload
-          writeChunked stream remaining
+        Right chunk ->
+          writeChunked stream (BS.drop (BS.length chunk) payload)
 
 -- | Read data from a stream. Blocks on empty buffer.
 -- Readable states: SYNSent, SYNReceived, Established, LocalClose, RemoteClose (draining).
@@ -87,7 +88,9 @@ streamRead stream = do
     -- Try to read from buffer first (non-blocking check)
     mData <- tryReadTQueue (ysRecvBuf stream)
     case mData of
-      Just payload -> pure (Right payload)
+      Just payload -> do
+        maRelease (ysMemoryAccount stream) (BS.length payload)
+        pure (Right payload)
       Nothing -> do
         -- Buffer empty, check state
         st <- readTVar (ysState stream)
@@ -131,6 +134,7 @@ streamClose stream = do
         -- Both sides FIN'd: the stream is dead, reclaim its map slot
         writeTVar (ysState stream) StreamClosed
         unregisterStream stream
+        maClose (ysMemoryAccount stream)
         pure (Right ())
       StreamSYNSent -> do
         writeTVar (ysState stream) StreamLocalClose
@@ -163,6 +167,7 @@ streamReset stream = do
   atomically $ do
     writeTVar (ysState stream) StreamReset
     unregisterStream stream
+    maClose (ysMemoryAccount stream)
   -- Send RST frame
   let hdr =
         YamuxHeader

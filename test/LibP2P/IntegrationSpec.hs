@@ -14,7 +14,7 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (SomeException, bracket, try)
+import Control.Exception (bracket)
 import Control.Monad (replicateM)
 import qualified Data.ByteString as BS
 import Data.IORef (modifyIORef', newIORef, readIORef)
@@ -70,6 +70,7 @@ import LibP2P.Protocol.Ping
   , withPingSession
   )
 import LibP2P.Switch.ConnPool (lookupConn)
+import LibP2P.Switch.ResourceManager (unlimitedMemoryAccount)
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen
   ( ConnectionGater (..)
@@ -258,9 +259,9 @@ spec = do
         opensRef <- newIORef (0 :: Int)
         let realSession = connSession conn
             countingSession = realSession
-              { muxOpenStream = do
+              { muxOpenStream = \account -> do
                   modifyIORef' opensRef (+ 1)
-                  muxOpenStream realSession
+                  muxOpenStream realSession account
               }
             countingConn = conn { connSession = countingSession }
         result <- timeout 10000000 $ withPingSession swA countingConn $ \sess -> do
@@ -290,9 +291,9 @@ spec = do
         opensRef <- newIORef (0 :: Int)
         let realSession = connSession conn
             countingSession = realSession
-              { muxOpenStream = do
+              { muxOpenStream = \account -> do
                   modifyIORef' opensRef (+ 1)
-                  muxOpenStream realSession
+                  muxOpenStream realSession account
               }
             countingConn = conn { connSession = countingSession }
         result <- timeout 30000000 $ withPingSession swA countingConn $ \sess ->
@@ -313,7 +314,7 @@ spec = do
 
     it "unknown protocol gets na over real TCP and the connection stays usable" $ do
       withConnectedPair $ \(swA, _pidA) _nodeB conn -> do
-        stream <- muxOpenStream (connSession conn)
+        stream <- muxOpenStream (connSession conn) unlimitedMemoryAccount
         result <- timeout 5000000 $
           negotiateInitiator stream ["/test/does-not-exist/1.0.0"]
         result `shouldBe` Just NoProtocol
@@ -407,7 +408,7 @@ spec = do
           streamWrite stream payload
         result <- timeout 60000000 $
           forConcurrently [0 .. 3 :: Int] $ \i -> do
-            stream <- muxOpenStream (connSession conn)
+            stream <- muxOpenStream (connSession conn) unlimitedMemoryAccount
             negotiated <- negotiateInitiator stream [echoProto]
             negotiated `shouldBe` Accepted echoProto
             let payload = BS.replicate payloadSize (fromIntegral (0x41 + i))

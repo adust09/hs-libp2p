@@ -1,18 +1,29 @@
 module LibP2P.Switch.ConnPoolSpec (spec) where
 
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar)
+import Control.Exception (finally)
 import LibP2P.Crypto.PeerId (PeerId (..))
 import LibP2P.Multiaddr (Multiaddr (..))
 import LibP2P.Multiaddr.Protocol (Protocol (..))
-import LibP2P.MultistreamSelect.Negotiation (StreamIO, mkByteStreamIO)
+import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkByteStreamIO)
 import LibP2P.Switch.ConnPool
+import LibP2P.Switch.ResourceManager
+  ( DefaultLimits (..)
+  , MemoryAccount (..)
+  , newResourceManager
+  , noLimits
+  , reserveConnection
+  )
 import LibP2P.Switch.Types
 import Test.Hspec
 
 -- | Create a mock MuxerSession for testing (all operations are no-ops).
 mockMuxerSession :: MuxerSession
 mockMuxerSession = MuxerSession
-  { muxOpenStream   = pure mockStreamIO
+  { muxOpenStream = \account -> pure mockStreamIO
+      { streamClose = streamClose mockStreamIO
+          `finally` atomically (maClose account)
+      }
   , muxAcceptStream = pure mockStreamIO
   , muxClose        = pure ()
   }
@@ -25,6 +36,9 @@ mockStreamIO = mkByteStreamIO (\_ -> pure ()) (pure 0) (pure ())
 mkMockConn :: PeerId -> Direction -> Multiaddr -> IO Connection
 mkMockConn pid dir remoteAddr = do
   st <- newTVarIO ConnOpen
+  rm <- newResourceManager (DefaultLimits noLimits noLimits noLimits noLimits)
+  connScope <- atomically (reserveConnection rm pid dir)
+    >>= either (fail . show) pure
   pure Connection
     { connPeerId     = pid
     , connDirection  = dir
@@ -34,6 +48,7 @@ mkMockConn pid dir remoteAddr = do
     , connMuxer      = "/yamux/1.0.0"
     , connSession    = mockMuxerSession
     , connState      = st
+    , connResourceScope = connScope
     }
 
 -- | Two distinct PeerIds for testing.

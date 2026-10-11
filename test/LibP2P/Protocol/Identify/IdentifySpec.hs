@@ -15,7 +15,7 @@ import Control.Concurrent.STM
   , writeTQueue
   , writeTVar
   )
-import Control.Exception (SomeException, catch, throwIO)
+import Control.Exception (SomeException, catch, finally, throwIO)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sort)
@@ -44,6 +44,14 @@ import LibP2P.Protocol.Identify
 import LibP2P.Protocol.Identify.Message (IdentifyInfo (..), decodeIdentify, encodeIdentify, maxIdentifySize)
 import LibP2P.Switch (newSwitch, setStreamHandler)
 import LibP2P.Switch.CertifiedRecords (CertifiedRecord (..), lookupCertifiedRecord)
+import LibP2P.Switch.ResourceManager
+  ( DefaultLimits (..)
+  , MemoryAccount (..)
+  , ResourceScope
+  , newResourceManager
+  , noLimits
+  , reserveConnection
+  )
 import LibP2P.Switch.Types
   ( ConnState (..)
   , Connection (..)
@@ -65,10 +73,16 @@ mkTestSwitch = do
   setStreamHandler sw "/test/2.0.0" (\_ _ -> pure ())
   pure sw
 
+mkConnectionScope :: PeerId -> Direction -> IO ResourceScope
+mkConnectionScope pid direction = do
+  rm <- newResourceManager (DefaultLimits noLimits noLimits noLimits noLimits)
+  atomically (reserveConnection rm pid direction) >>= either (fail . show) pure
+
 -- | Create a dummy upgraded Connection with a known remote multiaddr.
 mkTestConnection :: PeerId -> Multiaddr -> IO Connection
 mkTestConnection pid remoteAddr = do
   stateVar <- newTVarIO ConnOpen
+  connScope <- mkConnectionScope pid Inbound
   pure Connection
     { connPeerId     = pid
     , connDirection  = Inbound
@@ -77,11 +91,12 @@ mkTestConnection pid remoteAddr = do
     , connSecurity   = "/noise"
     , connMuxer      = "/yamux/1.0.0"
     , connSession    = MuxerSession
-        { muxOpenStream   = fail "test connection: no muxer"
+        { muxOpenStream   = \_ -> fail "test connection: no muxer"
         , muxAcceptStream = fail "test connection: no muxer"
         , muxClose        = pure ()
         }
     , connState      = stateVar
+    , connResourceScope = connScope
     }
 
 -- | Create a stream pair where the writer can signal EOF via streamClose.
@@ -131,6 +146,7 @@ emptyInfo = IdentifyInfo
 mkPushConnection :: PeerId -> Multiaddr -> IO StreamIO -> IO Connection
 mkPushConnection pid remoteAddr openStream = do
   stateVar <- newTVarIO ConnOpen
+  connScope <- mkConnectionScope pid Outbound
   pure Connection
     { connPeerId     = pid
     , connDirection  = Outbound
@@ -139,11 +155,17 @@ mkPushConnection pid remoteAddr openStream = do
     , connSecurity   = "/noise"
     , connMuxer      = "/yamux/1.0.0"
     , connSession    = MuxerSession
-        { muxOpenStream   = openStream
+        { muxOpenStream = \account -> do
+            stream <- openStream
+            pure stream
+              { streamClose = streamClose stream
+                  `finally` atomically (maClose account)
+              }
         , muxAcceptStream = fail "test connection: no inbound streams"
         , muxClose        = pure ()
         }
     , connState      = stateVar
+    , connResourceScope = connScope
     }
 
 -- | Insert a connection into the Switch's connection pool.
@@ -648,9 +670,10 @@ spec = do
       (streamA, streamB) <- mkClosableStreamPair
       openCountRef <- newIORef (0 :: Int)
       stateVar <- newTVarIO ConnOpen
-      let remotePid  = PeerId "push-target"
+      let remotePid = PeerId "push-target"
           remoteAddr = Multiaddr [IP4 0x7f000001, TCP 45678]
-          conn = Connection
+      connScope <- mkConnectionScope remotePid Outbound
+      let conn = Connection
             { connPeerId     = remotePid
             , connDirection  = Outbound
             , connLocalAddr  = Multiaddr [IP4 0x7f000001, TCP 0]
@@ -658,13 +681,17 @@ spec = do
             , connSecurity   = "/noise"
             , connMuxer      = "/yamux/1.0.0"
             , connSession    = MuxerSession
-                { muxOpenStream   = do
+                { muxOpenStream = \account -> do
                     modifyIORef' openCountRef (+ 1)
                     pure streamA
+                      { streamClose = streamClose streamA
+                          `finally` atomically (maClose account)
+                      }
                 , muxAcceptStream = fail "not used in this test"
                 , muxClose        = pure ()
                 }
             , connState      = stateVar
+            , connResourceScope = connScope
             }
       atomically $ do
         pool <- readTVar (swConnPool sw)

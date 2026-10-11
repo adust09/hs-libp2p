@@ -11,6 +11,7 @@ import Control.Concurrent (ThreadId, myThreadId, threadDelay)
 import Control.Concurrent.Async (async, concurrently, wait)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
+import Control.Exception (finally)
 import Control.Monad (when)
 import Crypto.Hash (Digest, SHA256, hash)
 import Data.ByteArray (convert)
@@ -42,7 +43,14 @@ import LibP2P.Switch.Types
   , MuxerSession (..)
   , Switch (..)
   )
-import LibP2P.Switch.ResourceManager (ResourceManager, newResourceManager, DefaultLimits (..), noLimits)
+import LibP2P.Switch.ResourceManager
+  ( DefaultLimits (..)
+  , MemoryAccount (..)
+  , ResourceManager
+  , newResourceManager
+  , noLimits
+  , reserveConnection
+  )
 import System.Timeout (timeout)
 
 -- | Helper: create a PeerId from raw bytes.
@@ -99,7 +107,8 @@ mkMockSwitch pid = do
 
 -- | Create a mock resource manager with no limits (tests don't need resource enforcement).
 mkMockResourceMgr :: IO ResourceManager
-mkMockResourceMgr = newResourceManager (DefaultLimits noLimits noLimits)
+mkMockResourceMgr = newResourceManager
+  (DefaultLimits noLimits noLimits noLimits noLimits)
 
 -- | Independent SHA-256 (not via DHT.Distance) for asserting the spec metric.
 sha256 :: BS.ByteString -> BS.ByteString
@@ -172,9 +181,11 @@ mkStreamPair = do
 -- | A mock Connection that hands out the given stream on the first
 -- muxOpenStream call and counts opens; later opens fail so tests can
 -- assert that the sender reuses one stream per peer.
-mkMockConnection :: PeerId -> StreamIO -> TVar Int -> IO Connection
-mkMockConnection pid stream openCountVar = do
+mkMockConnection :: Switch -> PeerId -> StreamIO -> TVar Int -> IO Connection
+mkMockConnection sw pid stream openCountVar = do
   stateVar <- newTVarIO ConnOpen
+  connScope <- atomically (reserveConnection (swResourceMgr sw) pid Outbound)
+    >>= either (fail . show) pure
   handedOut <- newTVarIO False
   let openOnce = do
         first <- atomically $ do
@@ -194,11 +205,17 @@ mkMockConnection pid stream openCountVar = do
     , connSecurity   = "/noise"
     , connMuxer      = "/yamux/1.0.0"
     , connSession    = MuxerSession
-        { muxOpenStream   = openOnce
+        { muxOpenStream = \account -> do
+            opened <- openOnce
+            pure opened
+              { streamClose = streamClose opened
+                  `finally` atomically (maClose account)
+              }
         , muxAcceptStream = fail "mock: no inbound streams"
         , muxClose        = pure ()
         }
     , connState      = stateVar
+    , connResourceScope = connScope
     }
 
 spec :: Spec
@@ -573,7 +590,7 @@ spec = do
       serverNode <- mkTestNode remotePid
       (clientEnd, serverEnd) <- mkStreamPair
       openCountVar <- newTVarIO (0 :: Int)
-      conn <- mkMockConnection remotePid clientEnd openCountVar
+      conn <- mkMockConnection (dhtSwitch clientNode) remotePid clientEnd openCountVar
       atomically $ addConn (swConnPool (dhtSwitch clientNode)) conn
 
       -- Remote side: multistream-select responder, then the DHT handler.
@@ -666,7 +683,7 @@ spec = do
       session <- newPeerSession (Just tracked)
       atomically $ writeTVar (dhtStreams node) (Map.singleton remotePid session)
       openCountVar <- newTVarIO (0 :: Int)
-      conn <- mkMockConnection remotePid tracked openCountVar
+      conn <- mkMockConnection (dhtSwitch node) remotePid tracked openCountVar
       atomically $ addConn (swConnPool (dhtSwitch node)) conn
       closeConnection (dhtSwitch node) conn
       sessions <- readTVarIO (dhtStreams node)
@@ -681,8 +698,8 @@ spec = do
       session <- newPeerSession (Just tracked)
       atomically $ writeTVar (dhtStreams node) (Map.singleton remotePid session)
       openCountVar <- newTVarIO (0 :: Int)
-      conn1 <- mkMockConnection remotePid tracked openCountVar
-      conn2 <- mkMockConnection remotePid tracked openCountVar
+      conn1 <- mkMockConnection (dhtSwitch node) remotePid tracked openCountVar
+      conn2 <- mkMockConnection (dhtSwitch node) remotePid tracked openCountVar
       atomically $ do
         addConn (swConnPool (dhtSwitch node)) conn1
         addConn (swConnPool (dhtSwitch node)) conn2
@@ -707,7 +724,7 @@ spec = do
       session <- newPeerSession (Just tracked)
       atomically $ writeTVar (dhtStreams node) (Map.singleton remotePid session)
       openCountVar <- newTVarIO (0 :: Int)
-      conn <- mkMockConnection remotePid tracked openCountVar
+      conn <- mkMockConnection (dhtSwitch node) remotePid tracked openCountVar
       let conn' = conn { connSession = (connSession conn) { muxClose = killSession } }
       atomically $ addConn (swConnPool (dhtSwitch node)) conn'
       started <- newEmptyMVar
@@ -732,7 +749,7 @@ spec = do
       session <- newPeerSession (Just stream)
       atomically $ writeTVar (dhtStreams node) (Map.singleton remotePid session)
       openCountVar <- newTVarIO (0 :: Int)
-      conn <- mkMockConnection remotePid stream openCountVar
+      conn <- mkMockConnection (dhtSwitch node) remotePid stream openCountVar
       atomically $ addConn (swConnPool (dhtSwitch node)) conn
       closeConnection (dhtSwitch node) conn
       sessions <- readTVarIO (dhtStreams node)

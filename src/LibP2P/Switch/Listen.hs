@@ -37,9 +37,8 @@ import LibP2P.Switch.ConnPool (addConn)
 import LibP2P.Switch.Connection (closeConnection)
 import LibP2P.Switch.ResourceManager
   ( Direction (..)
-  , releasePeerStream
-  , reserveConnection
-  , reservePeerStream
+  , releaseStream
+  , reserveStream
   )
 import LibP2P.Switch.Types
   ( ActiveListener (..)
@@ -79,28 +78,19 @@ handleInbound sw gater rawConn = do
     then rcClose rawConn
     else do
       -- Upgrade: Noise XX handshake + Yamux session
-      conn <- upgradeInbound (swIdentityKey sw) rawConn
+      conn <- upgradeInbound (swResourceMgr sw) (swIdentityKey sw) rawConn
       -- Gate 2: check remote PeerId after security handshake
       secured <- gateSecured gater (connPeerId conn)
       if not secured
         then muxClose (connSession conn)
         else do
-          -- Gate 3: check resource limits (PeerId known after handshake)
-          resCheck <- atomically $ reserveConnection (swResourceMgr sw) (connPeerId conn) Inbound
-          case resCheck of
-            Left _ -> muxClose (connSession conn)
-            Right () -> do
-              -- Add to connection pool and publish Connected event
-              atomically $ do
-                addConn (swConnPool sw) conn
-                writeTChan (swEvents sw)
-                  (Connected (connPeerId conn) Inbound (connRemoteAddr conn))
-              -- Notify connection listeners (e.g. GossipSub auto-stream open)
-              notifiers <- atomically $ readTVar (swNotifiers sw)
-              mapM_ (\f -> async $ f conn) notifiers
-              -- Block on stream accept loop until the session dies, then
-              -- tear down: pool removal, resource release, muxer close.
-              streamAcceptLoop sw conn `finally` closeConnection sw conn
+          atomically $ do
+            addConn (swConnPool sw) conn
+            writeTChan (swEvents sw)
+              (Connected (connPeerId conn) Inbound (connRemoteAddr conn))
+          notifiers <- atomically $ readTVar (swNotifiers sw)
+          mapM_ (\f -> async $ f conn) notifiers
+          streamAcceptLoop sw conn `finally` closeConnection sw conn
 
 -- | Accept inbound streams and dispatch to registered protocol handlers.
 --
@@ -117,7 +107,7 @@ streamAcceptLoop sw conn = loop
         Nothing -> pure ()  -- Muxer closed or error, stop the loop
         Just stream -> do
           -- Spawn handler for this stream, continue accepting
-          _ <- async $ dispatchStream sw conn stream
+          _ <- async $ dispatchAccountedStream sw conn stream
           loop
     -- Catch exceptions from muxAcceptStream (e.g. session shutdown)
     safeAccept =
@@ -130,17 +120,17 @@ streamAcceptLoop sw conn = loop
 -- the remote peer wants, then looks up and invokes the registered handler.
 dispatchStream :: Switch -> Connection -> StreamIO -> IO ()
 dispatchStream sw conn stream = do
-  -- Reserve an inbound stream slot against the peer's resource scope
   reserved <- atomically $
-    reservePeerStream (swResourceMgr sw) (connPeerId conn) Inbound
+    reserveStream (swResourceMgr sw) (connResourceScope conn) Inbound
   case reserved of
-    Left _ ->
-      -- Over the stream limit: refuse the stream without negotiating
-      closeQuietly stream
-    Right () -> negotiateAndDispatch `finally` release
+    Left _ -> closeQuietly stream
+    Right streamScope -> dispatchAccountedStream sw conn stream
+      `finally` atomically (releaseStream (swResourceMgr sw) streamScope)
+
+-- | Dispatch a stream whose muxer already created its resource scope.
+dispatchAccountedStream :: Switch -> Connection -> StreamIO -> IO ()
+dispatchAccountedStream sw conn stream = negotiateAndDispatch
   where
-    release = atomically $
-      releasePeerStream (swResourceMgr sw) (connPeerId conn) Inbound
     negotiateAndDispatch = do
       -- Get the list of supported protocols from the Switch
       supportedProtos <- atomically $
