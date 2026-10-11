@@ -30,9 +30,6 @@ import LibP2P.Yamux.Frame (GoAwayCode, YamuxHeader)
 type PingWaiter = TMVar (Either YamuxError ())
 
 -- | Session tunables that spec.md leaves to the implementation.
--- The defaults are the values go-yamux uses: keepalive enabled, a 30s
--- interval (KeepAliveInterval) and a 10s timeout
--- (ConnectionWriteTimeout).
 data YamuxConfig = YamuxConfig
   { ycEnableKeepAlive :: !Bool -- ^ Run keepaliveLoop
   , ycKeepAliveIntervalMicros :: !Int -- ^ Time without a received frame before a keepalive Ping

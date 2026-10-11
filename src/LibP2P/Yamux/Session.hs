@@ -150,13 +150,8 @@ acceptStream sess = do
 --
 -- Fails with YamuxPingTimeout when the SYN is not written within
 -- 'ycPingTimeoutMicros', or when its ACK does not arrive within another
--- 'ycPingTimeoutMicros' after the write. Timing the ACK from the write,
--- as hashicorp/yamux does, keeps time spent behind queued frames out of
--- it. Fails with YamuxSessionShutdown when the session dies first.
---
--- The waiter is removed from ysessPings on every exit path (ACK,
--- timeout, session failure, cancellation), so an ACK that arrives late
--- is ignored like any other unsolicited ACK.
+-- 'ycPingTimeoutMicros' after the write. The former is just a fallback 
+-- to ensure that the operation doesn't hang indefinitely.
 ping :: YamuxSession -> IO (Either YamuxError ())
 ping sess = bracket register unregister $ \(pingId, waiter) -> do
   let hdr =
@@ -168,8 +163,7 @@ ping sess = bracket register unregister $ \(pingId, waiter) -> do
           , yhLength = pingId
           }
   frame <- atomically $ enqueueFrameNumbered sess hdr BS.empty
-  -- Wait for the SYN to be written. The waiter is watched too, so a
-  -- session failure (or an ACK racing the write count) ends the wait.
+  -- Wait for the SYN to be written.
   written <- timeout timeoutUs $ atomically $
     (Just <$> takeTMVar waiter) `orElse` (Nothing <$ awaitFrameWritten sess frame)
   case written of
@@ -194,12 +188,12 @@ ping sess = bracket register unregister $ \(pingId, waiter) -> do
 -- frame from the peer, send a Ping (spec.md, Type Field: a Ping "can
 -- also be used to heart-beat and do keep-alives over TCP").
 --
--- Every received frame restarts the timer: The timer also restarts once a Ping
--- completes, so at most one keepalive Ping is in flight.
---
 -- Returns @Right ()@ without pinging when keepalive is disabled, and as
 -- soon as a local or remote GoAway is in effect (closeSession,
 -- sendGoAway, failSession, or a GoAway from the peer).
+--
+-- Returns @Left@ when a Ping fails. The session is left as it is: the
+-- caller must stop recvLoop, which tears the session down.
 keepaliveLoop :: YamuxSession -> IO (Either YamuxError ())
 keepaliveLoop sess
   | ycEnableKeepAlive config = go
@@ -215,8 +209,7 @@ keepaliveLoop sess
     go = do
       seen <- readTVarIO (ysessRecvCount sess)
       -- Wake on the interval, on a received frame, or on GoAway,
-      -- whichever comes first. System.Timeout rather than registerDelay:
-      -- the latter throws on the non-threaded runtime.
+      -- whichever comes first.
       woke <- timeout (ycKeepAliveIntervalMicros config) $ atomically $ do
         stopping <- goingAway
         count <- readTVar (ysessRecvCount sess)
@@ -236,9 +229,7 @@ keepaliveLoop sess
               case result of
                 Right () -> go
                 Left YamuxSessionShutdown -> pure (Right ())
-                Left err -> do
-                  failSession sess
-                  pure (Left err)
+                Left err -> pure (Left err)
 
 -- | Send a GoAway frame with the specified error code.
 -- Sets ysessShutdown to True so no new streams can be opened.
