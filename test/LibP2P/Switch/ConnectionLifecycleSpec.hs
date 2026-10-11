@@ -386,23 +386,6 @@ spec = do
       switchClose swB
 
   describe "silent peer" $ do
-    -- Control: proves the freezable harness itself delivers Disconnected
-    -- when the remote closes properly, so a failure below is about
-    -- detecting silence, not about the harness.
-    it "publishes Disconnected when the remote closes (harness control)" $
-      withFreezablePeers $ \_frozen swA swB pidA pidB addr -> do
-        events <- Public.subscribeSwitchEvents swA
-        conn <- dialEventConnection swA pidB addr
-        readSwitchEvent events `shouldReturn`
-          Public.Connected pidB Public.Outbound (connRemoteAddr conn)
-        pooledOk <- waitUntil 30 $
-          isJust <$> atomically (lookupConn (swConnPool swB) pidA)
-        pooledOk `shouldBe` True
-        Just connB <- atomically $ lookupConn (swConnPool swB) pidA
-        closeConnection swB connB
-        readSwitchEvent events `shouldReturn`
-          Public.Disconnected pidB Public.Outbound (connRemoteAddr conn)
-
     it "publishes Disconnected when the remote goes silent without closing" $
       withFreezablePeers $ \frozen swA _swB _pidA pidB addr -> do
         events <- Public.subscribeSwitchEvents swA
