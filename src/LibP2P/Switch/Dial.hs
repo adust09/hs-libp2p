@@ -44,12 +44,15 @@ import Control.Concurrent.STM
   )
 import Control.Exception (SomeException, bracketOnError, catch, finally, onException)
 import Control.Monad (forM, forM_, when)
-import Data.List (find)
+import Data.ByteString (ByteString)
+import Data.List (find, nub)
 import qualified Data.Map.Strict as Map
 import Data.Time.Clock (NominalDiffTime, addUTCTime, getCurrentTime)
 import LibP2P.Crypto.PeerId (PeerId)
-import LibP2P.Multiaddr (Multiaddr (..), isRelayedAddr)
+import LibP2P.Multiaddr (Multiaddr (..), fromBytes, isRelayedAddr, splitP2P)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
+import LibP2P.Protocol.Identify.Message (IdentifyInfo (..))
+import LibP2P.Switch.CertifiedRecords (CertifiedRecord (..))
 import LibP2P.Switch.ConnPool (addConn, lookupConn)
 import LibP2P.Switch.Connection (closeConnection)
 import LibP2P.Switch.Listen (streamAcceptLoop, switchListenAddrs)
@@ -254,12 +257,13 @@ establishAndRegister
   :: Switch -> DialOpts -> PeerId -> [Multiaddr]
   -> IO (Either DialError Connection)
 establishAndRegister sw opts remotePeerId addrs = do
+  effectiveAddrs <- resolveDialAddresses sw remotePeerId addrs
   let dir = if doUpgradeAsClient opts then Outbound else Inbound
   resCheck <- atomically $ reserveConnection (swResourceMgr sw) remotePeerId dir
   case resCheck of
     Left resErr -> pure (Left (DialResourceLimit resErr))
     Right () -> do
-      result <- dialNewInner sw opts dir addrs
+      result <- dialNewInner sw opts dir effectiveAddrs
         `onException` atomically (releaseConnection (swResourceMgr sw) remotePeerId dir)
       -- Verify remote PeerId matches expected target
       let verified = case result of
@@ -291,6 +295,39 @@ establishAndRegister sw opts remotePeerId addrs = do
           atomically $ releaseConnection (swResourceMgr sw) remotePeerId dir
           recordBackoff (swDialBackoffs sw) remotePeerId
           pure verified
+
+-- | Resolve an empty explicit address list from peerstore state.
+-- Accepted certified records are authoritative over Identify listen addresses.
+-- Explicit addresses are returned untouched so callers retain full control.
+resolveDialAddresses :: Switch -> PeerId -> [Multiaddr] -> IO [Multiaddr]
+resolveDialAddresses _ _ explicit@(_ : _) = pure explicit
+resolveDialAddresses sw remotePeerId []
+  | remotePeerId == swLocalPeerId sw = pure []
+  | otherwise = do
+      rawAddrs <- atomically $ storedAddressBytes sw remotePeerId
+      localAddrs <- switchListenAddrs sw
+      let decoded = [addr | Right addr <- map fromBytes rawAddrs]
+          unique = nub decoded
+          usable = filter (not . isSelfAddress localAddrs) unique
+          direct = filter (not . isRelayedAddr) usable
+      pure $ if null direct then filter isRelayedAddr usable else direct
+
+-- | Prefer a retained certified record; otherwise use Identify listen addresses.
+storedAddressBytes :: Switch -> PeerId -> STM [ByteString]
+storedAddressBytes sw peerId = do
+  certified <- Map.lookup peerId <$> readTVar (swCertifiedRecords sw)
+  case certified of
+    Just record -> pure (crAddresses record)
+    Nothing -> do
+      peerStore <- readTVar (swPeerStore sw)
+      pure $ maybe [] idListenAddrs (Map.lookup peerId peerStore)
+
+-- | Exclude direct addresses that point back to one of our listeners.
+isSelfAddress :: [Multiaddr] -> Multiaddr -> Bool
+isSelfAddress localAddrs addr =
+  not (isRelayedAddr addr) && normalized addr `elem` map normalized localAddrs
+  where
+    normalized candidate = maybe candidate fst (splitP2P candidate)
 
 -- | Inner dial logic: transport selection and staggered parallel dial.
 dialNewInner :: Switch -> DialOpts -> Direction -> [Multiaddr] -> IO (Either DialError Connection)
