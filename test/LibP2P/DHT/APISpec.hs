@@ -24,7 +24,7 @@ import LibP2P.DHT.RoutingTable (insertPeer, newRoutingTable)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair)
 import LibP2P.Multiaddr (Multiaddr, fromText)
-import LibP2P.Switch.Types (Switch (..))
+import LibP2P.Switch.Types (Switch (..), defaultSwitchConfig)
 import LibP2P.Switch.ResourceManager (ResourceManager, newResourceManager, DefaultLimits (..), noLimits)
 import qualified Data.Map.Strict as Map
 
@@ -255,6 +255,7 @@ mkMockSwitch pid = do
     , swNotifiers    = notifiers
     , swDisconnectNotifiers = disconnectNotifiers
     , swListeners    = listeners
+    , swConfig       = defaultSwitchConfig
     }
 
 mkMockResourceMgr :: IO ResourceManager

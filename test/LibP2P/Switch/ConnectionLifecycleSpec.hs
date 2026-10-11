@@ -8,8 +8,8 @@ module LibP2P.Switch.ConnectionLifecycleSpec (spec) where
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (TChan, atomically, newTVarIO, readTChan, readTVar, tryReadTChan)
-import Control.Exception (SomeException, bracket, try)
+import Control.Concurrent.STM (TChan, TVar, atomically, newTVarIO, readTChan, readTVar, readTVarIO, retry, tryReadTChan, writeTVar)
+import Control.Exception (SomeException, bracket, finally, try)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
 import Data.Maybe (isJust, isNothing)
@@ -201,6 +201,66 @@ dialEventConnection sw pid addr = do
 readSwitchEvent :: TChan Public.SwitchEvent -> IO Public.SwitchEvent
 readSwitchEvent events = withinEventTest "read event" $ atomically $ readTChan events
 
+-- | Wrap a transport so its dialed connections can be silently frozen:
+-- while the flag is set, writes are swallowed and reads never return,
+-- but nothing is closed. This models a peer that vanished without a
+-- FIN (cable pulled, process stopped with SIGSTOP).
+mkFreezableTransport :: TVar Bool -> Transport -> Transport
+mkFreezableTransport frozen inner = inner
+  { transportDial = fmap freeze . transportDial inner
+  , transportDialFrom = \from addr -> freeze <$> transportDialFrom inner from addr
+  }
+  where
+    freeze raw = case rcEndpoint raw of
+      ByteStreamEndpoint io -> raw { rcEndpoint = ByteStreamEndpoint (gate io) }
+      NativeMuxerEndpoint _ -> raw
+    gate io = io
+      { streamWrite = \bs -> do
+          isFrozen <- readTVarIO frozen
+          if isFrozen then pure () else streamWrite io bs
+      , streamReadByte = streamReadByte io >>= held
+      , streamReadChunk = \n -> streamReadChunk io n >>= held
+      }
+    held x = atomically $ do
+      isFrozen <- readTVar frozen
+      if isFrozen then retry else pure x
+
+-- | Keepalive short enough for a silent peer to be detected well inside
+-- the test's deadline (the 30s default would outlast it).
+fastKeepAliveConfig :: Public.SwitchConfig
+fastKeepAliveConfig = Public.defaultSwitchConfig
+  { Public.scYamuxConfig = Public.defaultYamuxConfig
+      { Public.ycKeepAliveIntervalMicros = 100000
+      , Public.ycPingTimeoutMicros = 350000
+      }
+  }
+
+-- | Run with a dialer A whose TCP connections can be frozen and a plain
+-- TCP listener B. The flag is cleared before teardown so cleanup never
+-- waits on a frozen read.
+withFreezablePeers
+  :: (TVar Bool -> Switch -> Switch -> PeerId -> PeerId -> Multiaddr -> IO ())
+  -> IO ()
+withFreezablePeers action = do
+  frozen <- newTVarIO False
+  bracket (mkFreezableNode frozen) closeNode $ \(swA, pidA) ->
+    bracket mkTCPNode closeNode $ \(swB, pidB) -> do
+      addrs <- withinEventTest "listen" $
+        Public.switchListen swB Public.defaultConnectionGater [loopbackAddr]
+      case addrs of
+        addr : _ ->
+          action frozen swA swB pidA pidB addr
+            `finally` atomically (writeTVar frozen False)
+        [] -> expectationFailure "listen returned no addresses"
+  where
+    mkFreezableNode frozen = do
+      (pid, kp) <- mkTestIdentity
+      sw <- Public.newSwitchWithConfig fastKeepAliveConfig pid kp
+      tcp <- newTCPTransport
+      addTransport sw (mkFreezableTransport frozen tcp)
+      pure (sw, pid)
+    closeNode (sw, _) = withinEventTest "cleanup" $ Public.switchClose sw
+
 spec :: Spec
 spec = do
   describe "Switch event subscriptions" $ do
@@ -324,6 +384,19 @@ spec = do
           (connState conn2 == connState conn) `shouldBe` False
       switchClose swA
       switchClose swB
+
+  describe "silent peer" $ do
+    it "publishes Disconnected when the remote goes silent without closing" $
+      withFreezablePeers $ \frozen swA _swB _pidA pidB addr -> do
+        events <- Public.subscribeSwitchEvents swA
+        conn <- dialEventConnection swA pidB addr
+        readSwitchEvent events `shouldReturn`
+          Public.Connected pidB Public.Outbound (connRemoteAddr conn)
+        atomically $ writeTVar frozen True
+        -- Nothing else is done: the stack itself must notice the dead peer.
+        result <- timeout 3000000 $ atomically $ readTChan events
+        result `shouldBe`
+          Just (Public.Disconnected pidB Public.Outbound (connRemoteAddr conn))
 
   describe "switchClose" $ do
     it "closes pooled connections on both sides" $ do

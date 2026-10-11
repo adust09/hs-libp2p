@@ -5,6 +5,7 @@
 -- protocol handler registration, and shutdown.
 module LibP2P.Switch
   ( newSwitch
+  , newSwitchWithConfig
   , subscribeSwitchEvents
   , addTransport
   , selectTransport
@@ -27,13 +28,17 @@ import LibP2P.MultistreamSelect.Negotiation (ProtocolId)
 import LibP2P.Protocol.Identify (pushIdentify)
 import LibP2P.Switch.Connection (closeAllConnections)
 import LibP2P.Switch.ResourceManager (DefaultLimits (..), defaultPeerLimits, defaultSystemLimits, newResourceManager)
-import LibP2P.Switch.Types (ActiveListener (..), StreamHandler, Switch (..), SwitchEvent)
+import LibP2P.Switch.Types (ActiveListener (..), StreamHandler, Switch (..), SwitchConfig, SwitchEvent, defaultSwitchConfig)
 import LibP2P.Transport (Listener (..), Transport (..))
 
 -- | Create a new Switch with the given local identity.
 -- All internal state is initialized empty.
 newSwitch :: PeerId -> KeyPair -> IO Switch
-newSwitch pid kp = do
+newSwitch = newSwitchWithConfig defaultSwitchConfig
+
+-- | Like 'newSwitch', with an explicit configuration.
+newSwitchWithConfig :: SwitchConfig -> PeerId -> KeyPair -> IO Switch
+newSwitchWithConfig config pid kp = do
   transportsVar   <- newTVarIO []
   poolVar         <- newTVarIO Map.empty
   protosVar       <- newTVarIO Map.empty
@@ -66,6 +71,7 @@ newSwitch pid kp = do
     , swNotifiers    = notifiersVar
     , swDisconnectNotifiers = disconnectNotifiersVar
     , swListeners    = listenersVar
+    , swConfig       = config
     }
 
 -- | Subscribe independently to future per-connection events (no replay).

@@ -41,6 +41,7 @@ import LibP2P.Switch.Types
   , Direction (..)
   , MuxerSession (..)
   , Switch (..)
+  , defaultSwitchConfig
   )
 import LibP2P.Switch.ResourceManager (ResourceManager, newResourceManager, DefaultLimits (..), noLimits)
 import System.Timeout (timeout)
@@ -95,6 +96,7 @@ mkMockSwitch pid = do
     , swNotifiers    = notifiers
     , swDisconnectNotifiers = disconnectNotifiers
     , swListeners    = listeners
+    , swConfig       = defaultSwitchConfig
     }
 
 -- | Create a mock resource manager with no limits (tests don't need resource enforcement).
