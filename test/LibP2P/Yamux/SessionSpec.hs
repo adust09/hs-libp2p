@@ -234,7 +234,7 @@ spec = do
       -- writing the SYN
       gate <- newEmptyTMVarIO :: IO (TMVar ())
       sess <-
-        newSessionWith (pingTimeoutConfig 100000) RoleClient
+        newSessionWithConfig (pingTimeoutConfig 100000) RoleClient
           (\_ -> atomically (takeTMVar gate)) (\_ -> pure BS.empty)
       withAsync (sendLoop sess) $ \_ -> do
         result <- timeout 1000000 (ping sess)
@@ -248,7 +248,7 @@ spec = do
       ((writeA, readA), (writeB, _)) <- mkMemoryTransportPair
       gate <- newEmptyTMVarIO
       let gatedWrite bs = atomically (takeTMVar gate) >> writeA bs
-      sess <- newSessionWith (pingTimeoutConfig 400000) RoleClient gatedWrite readA
+      sess <- newSessionWithConfig (pingTimeoutConfig 400000) RoleClient gatedWrite readA
       withAsync (sendLoop sess) $ \_ ->
         withAsync (recvLoop sess) $ \_ ->
           withAsync (ping sess) $ \pingA -> do

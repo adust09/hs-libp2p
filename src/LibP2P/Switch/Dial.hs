@@ -63,7 +63,7 @@ import LibP2P.Switch.Types
   , SwitchConfig (..)
   , SwitchEvent (..)
   )
-import LibP2P.Switch.Upgrade (upgradeAsWith)
+import LibP2P.Switch.Upgrade (upgradeAsWithConfig)
 import LibP2P.Transport (RawConnection (..), Transport (..))
 
 -- | Initial backoff duration after first failure: 5 seconds.
@@ -330,7 +330,7 @@ staggeredDial sw opts dir pairs =
         when (i > 0) $ threadDelay (i * staggerDelayUs)
         localBind <- localBindFor sw (doForceDirect opts) addr
         rawConn <- transportDialFrom transport localBind addr
-        upgradeAsWith (scYamuxConfig (swConfig sw)) dir (swIdentityKey sw) rawConn
+        upgradeAsWithConfig (scYamuxConfig (swConfig sw)) dir (swIdentityKey sw) rawConn
           `onException` rcClose rawConn
 
 -- | Hole-punch dials bind the outgoing socket to a same-family listen

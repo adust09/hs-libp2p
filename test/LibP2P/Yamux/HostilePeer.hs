@@ -110,7 +110,7 @@ withHostilePeerWithConfig :: YamuxConfig -> SessionRole -> (HostilePeer -> IO a)
 withHostilePeerWithConfig config role action = do
   toSession <- newPipe
   fromSession <- newPipe
-  sess <- newSessionWith config role (pipeWrite fromSession) (pipeRead toSession)
+  sess <- newSessionWithConfig config role (pipeWrite fromSession) (pipeRead toSession)
   let nextFrame = do
         hdrBytes <- pipeRead fromSession headerSize
         case decodeHeader hdrBytes of

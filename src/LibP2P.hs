@@ -42,7 +42,7 @@ module LibP2P
   , Switch
   , Direction (..)
   , newSwitch
-  , newSwitchWith
+  , newSwitchWithConfig
   , SwitchConfig (..)
   , defaultSwitchConfig
   , YamuxConfig (..)
@@ -237,7 +237,7 @@ import LibP2P.Protocol.Ping
 import LibP2P.Switch.Connection (closeConnection, newStream)
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (ConnectionGater (..), defaultConnectionGater, switchListen, switchListenAddrs)
-import LibP2P.Switch (addTransport, newSwitch, newSwitchWith, removeStreamHandler, setStreamHandler, subscribeSwitchEvents, switchClose)
+import LibP2P.Switch (addTransport, newSwitch, newSwitchWithConfig, removeStreamHandler, setStreamHandler, subscribeSwitchEvents, switchClose)
 import LibP2P.Switch.Types (Connection (..), DialError (..), Direction (..), ResourceError (..), StreamHandler, Switch, SwitchConfig (..), SwitchEvent (..), defaultSwitchConfig)
 import LibP2P.Transport.TCP (newTCPTransport)
 import LibP2P.Transport.QUIC (newQUICTransport)

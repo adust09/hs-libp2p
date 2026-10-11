@@ -17,7 +17,7 @@ module LibP2P.Switch.Upgrade
   , yamuxToMuxerSession
     -- * Full upgrade pipeline
   , upgradeAs
-  , upgradeAsWith
+  , upgradeAsWithConfig
   , upgradeOutbound
   , upgradeInbound
     -- * Helpers (exported for testing)
@@ -38,7 +38,7 @@ import LibP2P.Core.Binary (readWord16BE)
 import LibP2P.Crypto.Key (KeyPair (..))
 import LibP2P.Crypto.PeerId (fromPublicKey)
 import LibP2P.Yamux.Frame (maxStreamWindowSize)
-import LibP2P.Yamux.Session (closeSession, keepaliveLoop, newSessionWith, recvLoop, sendLoop)
+import LibP2P.Yamux.Session (closeSession, keepaliveLoop, newSessionWithConfig, recvLoop, sendLoop)
 import qualified LibP2P.Yamux.Session as Yamux
 import LibP2P.Yamux.Stream (streamRead)
 import qualified LibP2P.Yamux.Stream as YS
@@ -384,12 +384,12 @@ yamuxStreamToStreamIO yamuxStream = do
 -- what lets a TCP simultaneous connect flip roles: the peer that must
 -- act as the server passes 'Inbound' even though it called connect().
 upgradeAs :: Direction -> KeyPair -> RawConnection -> IO Connection
-upgradeAs = upgradeAsWith defaultYamuxConfig
+upgradeAs = upgradeAsWithConfig defaultYamuxConfig
 
 -- | Like 'upgradeAs', with an explicit Yamux configuration. A native
 -- multiplexer (QUIC) does not run Yamux, so the configuration is unused there.
-upgradeAsWith :: YamuxConfig -> Direction -> KeyPair -> RawConnection -> IO Connection
-upgradeAsWith yamuxConfig dir identityKP rawConn = case rcEndpoint rawConn of
+upgradeAsWithConfig :: YamuxConfig -> Direction -> KeyPair -> RawConnection -> IO Connection
+upgradeAsWithConfig yamuxConfig dir identityKP rawConn = case rcEndpoint rawConn of
   ByteStreamEndpoint rawIO -> upgradeByteStream yamuxConfig dir identityKP rawConn rawIO
   NativeMuxerEndpoint native -> nativeToConnection dir rawConn native
 
@@ -424,7 +424,7 @@ upgradeByteStream yamuxConfig dir identityKP rawConn rawIO = do
   -- Step 5: Initialize Yamux session (client = odd IDs, server = even)
   let yamuxWrite = streamWrite encryptedIO
       yamuxRead  = \n -> readExact encryptedIO n
-  yamuxSess <- newSessionWith yamuxConfig (if isServer then RoleServer else RoleClient) yamuxWrite yamuxRead
+  yamuxSess <- newSessionWithConfig yamuxConfig (if isServer then RoleServer else RoleClient) yamuxWrite yamuxRead
   muxer <- yamuxToMuxerSession yamuxSess (rcClose rawConn)
 
   stateVar <- newTVarIO ConnOpen

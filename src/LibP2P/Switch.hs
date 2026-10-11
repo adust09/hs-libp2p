@@ -5,7 +5,7 @@
 -- protocol handler registration, and shutdown.
 module LibP2P.Switch
   ( newSwitch
-  , newSwitchWith
+  , newSwitchWithConfig
   , subscribeSwitchEvents
   , addTransport
   , selectTransport
@@ -34,11 +34,11 @@ import LibP2P.Transport (Listener (..), Transport (..))
 -- | Create a new Switch with the given local identity.
 -- All internal state is initialized empty.
 newSwitch :: PeerId -> KeyPair -> IO Switch
-newSwitch = newSwitchWith defaultSwitchConfig
+newSwitch = newSwitchWithConfig defaultSwitchConfig
 
 -- | Like 'newSwitch', with an explicit configuration.
-newSwitchWith :: SwitchConfig -> PeerId -> KeyPair -> IO Switch
-newSwitchWith config pid kp = do
+newSwitchWithConfig :: SwitchConfig -> PeerId -> KeyPair -> IO Switch
+newSwitchWithConfig config pid kp = do
   transportsVar   <- newTVarIO []
   poolVar         <- newTVarIO Map.empty
   protosVar       <- newTVarIO Map.empty

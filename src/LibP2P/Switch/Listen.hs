@@ -49,7 +49,7 @@ import LibP2P.Switch.Types
   , SwitchConfig (..)
   , SwitchEvent (..)
   )
-import LibP2P.Switch.Upgrade (upgradeAsWith)
+import LibP2P.Switch.Upgrade (upgradeAsWithConfig)
 import LibP2P.Transport (Listener (..), RawConnection (..), Transport (..))
 
 -- | Connection gater: policy-based admission control.
@@ -80,7 +80,7 @@ handleInbound sw gater rawConn = do
     then rcClose rawConn
     else do
       -- Upgrade: Noise XX handshake + Yamux session
-      conn <- upgradeAsWith (scYamuxConfig (swConfig sw)) Inbound (swIdentityKey sw) rawConn
+      conn <- upgradeAsWithConfig (scYamuxConfig (swConfig sw)) Inbound (swIdentityKey sw) rawConn
       -- Gate 2: check remote PeerId after security handshake
       secured <- gateSecured gater (connPeerId conn)
       if not secured

@@ -255,7 +255,7 @@ withFreezablePeers action = do
   where
     mkFreezableNode frozen = do
       (pid, kp) <- mkTestIdentity
-      sw <- Public.newSwitchWith fastKeepAliveConfig pid kp
+      sw <- Public.newSwitchWithConfig fastKeepAliveConfig pid kp
       tcp <- newTCPTransport
       addTransport sw (mkFreezableTransport frozen tcp)
       pure (sw, pid)

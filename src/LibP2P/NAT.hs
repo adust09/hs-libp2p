@@ -99,7 +99,7 @@ import LibP2P.Switch.Types
   , Switch (..)
   , SwitchConfig (..)
   )
-import LibP2P.Switch.Upgrade (upgradeAsWith)
+import LibP2P.Switch.Upgrade (upgradeAsWithConfig)
 import LibP2P.Transport (Transport (..))
 
 -- | Configuration for the NAT traversal handlers.
@@ -439,7 +439,7 @@ probeAddr sw pid addr = do
     Nothing -> pure (Left ("dial-back: no transport for " ++ show addr))
     Just transport -> do
       rawConn <- transportDial transport addr
-      conn <- upgradeAsWith (scYamuxConfig (swConfig sw)) Outbound (swIdentityKey sw) rawConn
+      conn <- upgradeAsWithConfig (scYamuxConfig (swConfig sw)) Outbound (swIdentityKey sw) rawConn
       let matches = connPeerId conn == pid
       muxClose (connSession conn) `catch` \(_ :: SomeException) -> pure ()
       pure $ if matches
