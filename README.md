@@ -1,3 +1,9 @@
+<p align="center">
+  <a href="https://libp2p.io/">
+    <img width="250" src="https://raw.githubusercontent.com/libp2p/libp2p/0a132b94943ef9eb187c16920dd0464da9524285/logo/black-bg-2.png" alt="libp2p logo">
+  </a>
+</p>
+
 # hs-libp2p
 
 A Haskell implementation of the [libp2p](https://libp2p.io/) modular peer-to-peer networking stack.
