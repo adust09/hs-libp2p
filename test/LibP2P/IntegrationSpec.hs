@@ -69,6 +69,7 @@ import LibP2P.Protocol.Ping
   , sendPing
   , withPingSession
   )
+import LibP2P.Switch.Connection (closeConnection)
 import LibP2P.Switch.ConnPool (lookupConn)
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen
@@ -146,6 +147,24 @@ waitForPeerInPool sw pid = do
     Just () -> pure ()
     Nothing -> fail "waitForPeerInPool: peer never appeared in the pool"
 
+-- | Verify that Identify data supports a later address-free dial.
+shouldRedialFromPeerstore :: Switch -> PeerId -> Multiaddr -> IO ()
+shouldRedialFromPeerstore sw peer listenAddr = do
+  first <- dial sw peer [listenAddr]
+  case first of
+    Left err -> expectationFailure $ "initial dial failed: " ++ show err
+    Right conn -> do
+      identified <- timeout 5000000 $ atomically $ do
+        store <- readTVar (swPeerStore sw)
+        maybe retry (const (pure ())) (Map.lookup peer store)
+      identified `shouldBe` Just ()
+      closeConnection sw conn
+      second <- timeout 5000000 (dial sw peer [])
+      case second of
+        Nothing -> expectationFailure "peerstore dial timed out"
+        Just (Left err) -> expectationFailure $ "peerstore dial failed: " ++ show err
+        Just (Right connected) -> connRemoteAddr connected `shouldBe` listenAddr
+
 -- | Create two connected test nodes: node B listens, node A dials.
 -- Returns both Switches, PeerIds, and the connection from A to B.
 -- Both Switches are torn down via bracket even when the action fails,
@@ -218,6 +237,11 @@ spec = do
           Just (Right info) -> do
             -- B is listening, so idListenAddrs should be non-empty
             idListenAddrs info `shouldSatisfy` (not . null)
+
+    it "redials with peerstore addresses after Identify succeeds" $ do
+      withListeningNode $ \(_swB, pidB, listenAddr) ->
+        withTestNode $ \swA _pidA ->
+          shouldRedialFromPeerstore swA pidB listenAddr
 
     it "observedAddr echoes the dialer's own address as seen by the listener" $ do
       -- Regression for #167: the responder must fill observedAddr with the
