@@ -159,6 +159,27 @@ spec = do
       ruMemory <$> usageOf stream `shouldReturn` 0
       ruMemory <$> usageOf conn `shouldReturn` 0
 
+    it "should defer closing a stream until its buffered memory is released" $ do
+      rm <- newResourceManager testDefaults
+      conn <- reserveConn rm peerA Inbound
+      stream <- reserveStr rm conn Inbound
+      let account = scopeMemoryAccount rm stream
+      atomically (maReserve account 300) `shouldReturn` Right ()
+
+      atomically $ maClose account
+
+      atomically (readTVar (rsClosed stream)) `shouldReturn` True
+      usageOf stream `shouldReturn` ResourceUsage 0 0 1 0 300
+      atomically (maReserve account 1)
+        `shouldReturn` Left (ResourceScopeClosed (rsName stream))
+
+      atomically $ maRelease account 300
+
+      usageOf stream `shouldReturn` emptyUsage
+      connUsage <- usageOf conn
+      ruStreamsInbound connUsage `shouldBe` 0
+      ruMemory connUsage `shouldBe` 0
+
     it "should reject non-positive memory reservations" $ do
       rm <- newResourceManager testDefaults
       conn <- reserveConn rm peerA Inbound

@@ -34,6 +34,7 @@ import LibP2P.Switch.ResourceManager
   , unlimitedMemoryAccount
   )
 import LibP2P.Yamux.Frame
+import LibP2P.Yamux.Stream (releaseReceiveBuffer)
 import LibP2P.Yamux.Types
 import Numeric.Natural (Natural)
 
@@ -251,6 +252,7 @@ recvLoop sess = go `finally` failSession sess
 failSession :: YamuxSession -> IO ()
 failSession sess = atomically $ do
   writeTVar (ysessShutdown sess) True
+  releaseQueuedPayloads sess
   streams <- readTVar (ysessStreams sess)
   mapM_ resetAccount (Map.elems streams)
   writeTVar (ysessStreams sess) Map.empty
@@ -260,7 +262,20 @@ failSession sess = atomically $ do
   where
     resetAccount stream = do
       writeTVar (ysState stream) StreamReset
+      releaseReceiveBuffer stream
       maClose (ysMemoryAccount stream)
+
+releaseQueuedPayloads :: YamuxSession -> STM ()
+releaseQueuedPayloads sess = drain []
+  where
+    drain controlFrames = do
+      queued <- tryReadTQueue (ysessSendCh sess)
+      case queued of
+        Nothing -> mapM_ (writeTQueue (ysessSendCh sess)) (reverse controlFrames)
+        Just frame@(_, _, Nothing) -> drain (frame : controlFrames)
+        Just (_, payload, Just owner) -> do
+          maRelease owner (BS.length payload)
+          drain controlFrames
 
 -- | Dispatch a decoded frame to the appropriate handler.
 -- Returns False when a fatal protocol error occurred and the receive
@@ -478,6 +493,7 @@ applyRemoteRst sess sid = do
     Just stream -> atomically $ do
       writeTVar (ysState stream) StreamReset
       modifyTVar' (ysessStreams sess) (Map.delete sid)
+      releaseReceiveBuffer stream
       maClose (ysMemoryAccount stream)
     Nothing -> pure ()
 

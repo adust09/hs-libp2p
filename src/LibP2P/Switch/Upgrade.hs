@@ -45,7 +45,7 @@ import LibP2P.Yamux.Session
   , sendLoop
   )
 import qualified LibP2P.Yamux.Session as Yamux
-import LibP2P.Yamux.Stream (streamRead)
+import LibP2P.Yamux.Stream (streamReadRetained)
 import qualified LibP2P.Yamux.Stream as YS
 import LibP2P.Yamux.Types
   ( SessionRole (..)
@@ -411,36 +411,37 @@ yamuxToMuxerSession yamuxSess closeTransport = do
 yamuxStreamToStreamIO :: MemoryAccount -> YamuxStream -> IO StreamIO
 yamuxStreamToStreamIO account yamuxStream = do
   readBuf <- newIORef BS.empty
-  let -- Buffered bytes if any, otherwise the next yamux chunk.
-      nextChunk = do
-        buf <- readIORef readBuf
-        if BS.null buf
-          then do
-            result <- streamRead yamuxStream
-            case result of
-              Left err -> fail $ "yamuxStreamRead: " <> show err
-              Right chunk
-                | BS.null chunk -> fail "yamuxStreamRead: empty chunk"
-                | otherwise -> mask_ $ do
-                    reserveMemory account (BS.length chunk)
-                    writeIORef readBuf chunk
-                    pure chunk
-          else pure buf
+  let readChunk n = mask_ $ do
+        buffered <- readIORef readBuf
+        chunk <- if BS.null buffered
+          then nextRetainedChunk
+          else pure buffered
+        let (front, rest) = BS.splitAt n chunk
+        writeIORef readBuf rest
+        releaseMemory account (BS.length front)
+        pure front
+      nextRetainedChunk = do
+        result <- streamReadRetained yamuxStream
+        case result of
+          Left err -> fail $ "yamuxStreamRead: " <> show err
+          Right chunk
+            | BS.null chunk -> fail "yamuxStreamRead: empty chunk"
+            | otherwise -> pure chunk
+      releaseBuffered = mask_ $ do
+        buffered <- readIORef readBuf
+        writeIORef readBuf BS.empty
+        releaseMemory account (BS.length buffered)
   pure StreamIO
     { streamWrite = \bs -> do
         result <- YS.streamWrite yamuxStream bs
         case result of
           Right () -> pure ()
           Left err -> fail $ "yamuxStreamWrite: " <> show err
-    , streamReadByte = do
-        chunk <- nextChunk
-        BS.head <$> consumeAccountedBuffer account readBuf 1 chunk
-    , streamReadChunk = \n -> do
-        chunk <- nextChunk
-        consumeAccountedBuffer account readBuf n chunk
+    , streamReadByte = BS.head <$> readChunk 1
+    , streamReadChunk = readChunk
     , streamClose = do
         _ <- YS.streamClose yamuxStream
-        pure ()
+        releaseBuffered
     }
 
 -- | Upgrade a raw connection, taking every role from the direction.

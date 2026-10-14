@@ -10,7 +10,7 @@ import LibP2P.Crypto.PeerId (PeerId (..))
 import LibP2P.Switch.ResourceManager
   ( DefaultLimits (..)
   , Direction (..)
-  , MemoryAccount
+  , MemoryAccount (..)
   , ResourceError
   , ResourceLimits (..)
   , ResourceManager
@@ -26,7 +26,13 @@ import LibP2P.Switch.ResourceManager
 import LibP2P.Yamux.Frame
 import LibP2P.Yamux.HostilePeer
 import LibP2P.Yamux.Session
-import LibP2P.Yamux.Stream (streamClose, streamRead, streamReset, streamWrite)
+import LibP2P.Yamux.Stream
+  ( streamClose
+  , streamRead
+  , streamReadRetained
+  , streamReset
+  , streamWrite
+  )
 import LibP2P.Yamux.Types
 import Test.Hspec
 
@@ -189,6 +195,43 @@ spec = do
               queued `shouldBe` Just ()
               streamRead serverStream `shouldReturn` Right payload
               ruMemory <$> atomically (readTVar (rsUsage serverConn))
+                `shouldReturn` 0
+
+    it "should retain payload accounting after both sides half-close" $ do
+      let limits = noLimits {rlMaxMemory = Just 4096}
+          defaults = DefaultLimits limits limits limits limits
+      rm <- newResourceManager defaults
+      clientConn <- reserveTestConnection rm (PeerId "closing-client") Outbound
+      serverConn <- reserveTestConnection rm (PeerId "closing-server") Inbound
+      ((writeA, readA), (writeB, readB)) <- mkMemoryTransportPair
+      client <- newManagedSession RoleClient
+        (scopeMemoryAccount rm clientConn)
+        (newAccount rm clientConn Inbound)
+        (newAccount rm clientConn Outbound)
+        writeA readA
+      server <- newManagedSession RoleServer
+        (scopeMemoryAccount rm serverConn)
+        (newAccount rm serverConn Inbound)
+        (newAccount rm serverConn Outbound)
+        writeB readB
+      withAsync (sendLoop client) $ \_ ->
+        withAsync (recvLoop client) $ \_ ->
+          withAsync (sendLoop server) $ \_ ->
+            withAsync (recvLoop server) $ \_ -> do
+              (Right clientStream, Right serverStream) <- concurrently
+                (openStream client) (acceptStream server)
+              streamClose clientStream `shouldReturn` Right ()
+              atomically $ readTVar (ysState serverStream) >>= check . (== StreamRemoteClose)
+              let payload = BS.replicate 128 0x5a
+              streamWrite serverStream payload `shouldReturn` Right ()
+              streamClose serverStream `shouldReturn` Right ()
+              atomically $ readTVar (ysState clientStream) >>= check . (== StreamClosed)
+
+              streamReadRetained clientStream `shouldReturn` Right payload
+              ruMemory <$> atomically (readTVar (rsUsage clientConn))
+                `shouldReturn` BS.length payload
+              atomically $ maRelease (ysMemoryAccount clientStream) (BS.length payload)
+              ruMemory <$> atomically (readTVar (rsUsage clientConn))
                 `shouldReturn` 0
 
     it "should terminate the session without buffering when a payload exceeds the memory limit" $ do

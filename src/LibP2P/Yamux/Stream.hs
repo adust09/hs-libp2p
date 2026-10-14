@@ -5,11 +5,14 @@
 module LibP2P.Yamux.Stream
   ( streamWrite
   , streamRead
+  , streamReadRetained
   , streamClose
   , streamReset
+  , releaseReceiveBuffer
   ) where
 
 import Control.Concurrent.STM
+import Control.Exception (mask_)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
@@ -78,47 +81,47 @@ writeChunked stream payload
         Right chunk ->
           writeChunked stream (BS.drop (BS.length chunk) payload)
 
--- | Read data from a stream. Blocks on empty buffer.
--- Readable states: SYNSent, SYNReceived, Established, LocalClose, RemoteClose (draining).
--- Returns YamuxStreamClosed on Closed/RemoteClose with empty buffer.
--- Returns YamuxStreamReset on Reset.
+-- | Read data and transfer ownership to the caller.
 streamRead :: YamuxStream -> IO (Either YamuxError ByteString)
-streamRead stream = do
+streamRead stream = mask_ $ do
+  result <- streamReadRetained stream
+  case result of
+    Right payload -> do
+      atomically $ maRelease (ysMemoryAccount stream) (BS.length payload)
+      pure (Right payload)
+    Left err -> pure (Left err)
+
+-- | Read data while retaining its memory charge. The StreamIO adapter uses
+-- this to keep partially-consumed chunks accounted until its buffer drains.
+streamReadRetained :: YamuxStream -> IO (Either YamuxError ByteString)
+streamReadRetained stream = mask_ $ do
   result <- atomically $ do
-    -- Try to read from buffer first (non-blocking check)
     mData <- tryReadTQueue (ysRecvBuf stream)
     case mData of
-      Just payload -> do
-        maRelease (ysMemoryAccount stream) (BS.length payload)
-        pure (Right payload)
+      Just payload -> pure (Right payload)
       Nothing -> do
-        -- Buffer empty, check state
-        st <- readTVar (ysState stream)
-        case st of
+        state <- readTVar (ysState stream)
+        case state of
           StreamClosed -> pure (Left YamuxStreamClosed)
           StreamReset -> pure (Left YamuxStreamReset)
           StreamRemoteClose -> pure (Left YamuxStreamClosed)
-          _ -> retry -- block until data arrives
+          _ -> retry
   case result of
-    Right payload -> do
-      -- Send WindowUpdate to replenish the recv window
-      let consumed = fromIntegral (BS.length payload)
-      let hdr =
-            YamuxHeader
-              { yhVersion = 0
-              , yhType = FrameWindowUpdate
-              , yhFlags = defaultFlags
-              , yhStreamId = ysStreamId stream
-              , yhLength = consumed
-              }
-      let sess = ysSession stream
-      atomically $ do
-        enqueueFrame sess hdr BS.empty
-        -- Increment recv window
-        w <- readTVar (ysRecvWindow stream)
-        writeTVar (ysRecvWindow stream) (w + consumed)
-      pure (Right payload)
+    Right payload -> replenishWindow stream payload >> pure (Right payload)
     Left err -> pure (Left err)
+
+replenishWindow :: YamuxStream -> ByteString -> IO ()
+replenishWindow stream payload = atomically $ do
+  let consumed = fromIntegral (BS.length payload)
+      hdr = YamuxHeader
+        { yhVersion = 0
+        , yhType = FrameWindowUpdate
+        , yhFlags = defaultFlags
+        , yhStreamId = ysStreamId stream
+        , yhLength = consumed
+        }
+  enqueueFrame (ysSession stream) hdr BS.empty
+  modifyTVar' (ysRecvWindow stream) (+ consumed)
 
 -- | Half-close the stream by sending FIN flag.
 -- Only valid in Established or RemoteClose states.
@@ -161,12 +164,22 @@ streamClose stream = do
       pure (Right ())
     Left err -> pure (Left err)
 
+releaseReceiveBuffer :: YamuxStream -> STM ()
+releaseReceiveBuffer stream = do
+  payload <- tryReadTQueue (ysRecvBuf stream)
+  case payload of
+    Nothing -> pure ()
+    Just bytes -> do
+      maRelease (ysMemoryAccount stream) (BS.length bytes)
+      releaseReceiveBuffer stream
+
 -- | Reset the stream by sending RST flag.
 streamReset :: YamuxStream -> IO ()
 streamReset stream = do
   atomically $ do
     writeTVar (ysState stream) StreamReset
     unregisterStream stream
+    releaseReceiveBuffer stream
     maClose (ysMemoryAccount stream)
   -- Send RST frame
   let hdr =

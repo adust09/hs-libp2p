@@ -247,18 +247,21 @@ reserveMemory scope bytes = reserveUsage scope $ \usage ->
 releaseMemory :: ResourceScope -> Int -> STM ()
 releaseMemory _ bytes | bytes <= 0 = pure ()
 releaseMemory scope bytes = do
-  closed <- readTVar (rsClosed scope)
-  unless closed $ do
-    usage <- readTVar (rsUsage scope)
-    let released = min bytes (ruMemory usage)
-    subtractMemoryFromChain scope released
+  usage <- readTVar (rsUsage scope)
+  let released = min bytes (ruMemory usage)
+  subtractMemoryFromChain scope released
 
 scopeMemoryAccount :: ResourceManager -> ResourceScope -> MemoryAccount
 scopeMemoryAccount rm scope = MemoryAccount
   { maReserve = reserveMemory scope
-  , maRelease = releaseMemory scope
+  , maRelease = releaseAccountMemory rm scope
   , maClose = closeOwnedScope rm scope
   }
+
+releaseAccountMemory :: ResourceManager -> ResourceScope -> Int -> STM ()
+releaseAccountMemory rm scope bytes = do
+  releaseMemory scope bytes
+  finalizeDrainedStream rm scope
 
 -- | An account for standalone protocol use where no manager is installed.
 unlimitedMemoryAccount :: MemoryAccount
@@ -366,14 +369,41 @@ totalStreams :: ResourceUsage -> Int
 totalStreams usage = ruStreamsInbound usage + ruStreamsOutbound usage
 
 closeOwnedScope :: ResourceManager -> ResourceScope -> STM ()
-closeOwnedScope rm scope = do
+closeOwnedScope rm scope = case rsName scope of
+  StreamScope _ -> closeStreamScope rm scope
+  _ -> closeScopeImmediately rm scope
+
+-- Keep a closing stream charged while queued payloads still own memory.
+-- Their final release completes the close without permitting new reserves.
+closeStreamScope :: ResourceManager -> ResourceScope -> STM ()
+closeStreamScope rm scope = do
+  writeTVar (rsClosed scope) True
+  finalizeDrainedStream rm scope
+
+finalizeDrainedStream :: ResourceManager -> ResourceScope -> STM ()
+finalizeDrainedStream rm scope = case rsName scope of
+  StreamScope _ -> do
+    closed <- readTVar (rsClosed scope)
+    usage <- readTVar (rsUsage scope)
+    if closed && ruMemory usage == 0 && usage /= emptyUsage
+      then finalizeScope rm scope usage
+      else pure ()
+  _ -> pure ()
+
+closeScopeImmediately :: ResourceManager -> ResourceScope -> STM ()
+closeScopeImmediately rm scope = do
   closed <- readTVar (rsClosed scope)
   unless closed $ do
     usage <- readTVar (rsUsage scope)
     markSubtreeClosed scope
-    subtractUsageFromParents (rsParent scope) usage
-    detachFromParent scope
-    maybeDropOwningPeer rm scope
+    finalizeScope rm scope usage
+
+finalizeScope :: ResourceManager -> ResourceScope -> ResourceUsage -> STM ()
+finalizeScope rm scope usage = do
+  writeTVar (rsUsage scope) emptyUsage
+  subtractUsageFromParents (rsParent scope) usage
+  detachFromParent scope
+  maybeDropOwningPeer rm scope
 
 markSubtreeClosed :: ResourceScope -> STM ()
 markSubtreeClosed scope = do

@@ -207,7 +207,8 @@ mkClosingMockTransport responderKP closeCount = pure Transport
             , rcClose = pure ()
             }
       _ <- async $ do
-        _ <- upgradeInbound responderKP rawConnB
+        rm <- newTestResourceManager
+        _ <- upgradeInbound rm responderKP rawConnB
         pure ()
       pure RawConnection
         { rcEndpoint = ByteStreamEndpoint streamA
