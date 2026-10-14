@@ -36,4 +36,7 @@ jobs:
         run: cabal build all
 
       - name: Test
+        env:
+          LANG: C
+          LC_ALL: C
         run: cabal test all --test-show-details=direct
