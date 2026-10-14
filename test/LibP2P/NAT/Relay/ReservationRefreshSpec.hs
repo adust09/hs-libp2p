@@ -229,7 +229,7 @@ spec = describe "circuit relay reservation refresh" $ do
     -- connection whose peer is the relay.
     transport <- newTCPTransport
     rawConn <- transportDial transport addrB
-    _second <- upgradeOutbound (swIdentityKey swR) rawConn
+    _second <- upgradeOutbound (swResourceMgr swR) (swIdentityKey swR) rawConn
     bConns <- waitForConns swB pidR 2
     case bConns of
       (first' : rest@(_ : _)) -> do

@@ -260,7 +260,8 @@ mkMockSwitch pid = do
     }
 
 mkMockResourceMgr :: IO ResourceManager
-mkMockResourceMgr = newResourceManager (DefaultLimits noLimits noLimits)
+mkMockResourceMgr = newResourceManager
+  (DefaultLimits noLimits noLimits noLimits noLimits)
 
 getDummyKeyPair :: IO KeyPair
 getDummyKeyPair = do

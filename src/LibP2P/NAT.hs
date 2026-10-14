@@ -438,7 +438,7 @@ probeAddr sw pid addr = do
     Nothing -> pure (Left ("dial-back: no transport for " ++ show addr))
     Just transport -> do
       rawConn <- transportDial transport addr
-      conn <- upgradeOutbound (swIdentityKey sw) rawConn
+      conn <- upgradeOutbound (swResourceMgr sw) (swIdentityKey sw) rawConn
       let matches = connPeerId conn == pid
       muxClose (connSession conn) `catch` \(_ :: SomeException) -> pure ()
       pure $ if matches

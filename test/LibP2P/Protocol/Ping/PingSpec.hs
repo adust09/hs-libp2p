@@ -14,7 +14,7 @@ import Control.Concurrent.STM
   , tryReadTMVar
   , writeTQueue
   )
-import Control.Exception (throwIO, try)
+import Control.Exception (finally, throwIO, try)
 import Data.Bits (xor)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
@@ -34,9 +34,11 @@ import LibP2P.MultistreamSelect.Negotiation
 import LibP2P.Protocol.Ping
 import LibP2P.Switch (newSwitch)
 import LibP2P.Switch.ResourceManager
-  ( ResourceScope (..)
+  ( MemoryAccount (..)
+  , ResourceScope (..)
   , ResourceUsage (..)
   , getOrCreatePeerScope
+  , reserveConnection
   )
 import LibP2P.Switch.Types
   ( ConnState (..)
@@ -96,9 +98,12 @@ mkTestSwitch = do
 
 -- | Build an outbound Connection whose muxer runs the given stream opener.
 -- This is what lets tests drive the real 'sendPing' initiator path.
-mkPingConnection :: IO StreamIO -> IO Connection
-mkPingConnection openStream = do
+mkPingConnection :: Switch -> IO StreamIO -> IO Connection
+mkPingConnection sw openStream = do
   stateVar <- newTVarIO ConnOpen
+  connScope <- atomically $
+    reserveConnection (swResourceMgr sw) (PeerId "ping-remote") Outbound
+  ownedScope <- either (fail . show) pure connScope
   pure Connection
     { connPeerId     = PeerId "ping-remote"
     , connDirection  = Outbound
@@ -107,11 +112,17 @@ mkPingConnection openStream = do
     , connSecurity   = "/noise"
     , connMuxer      = "/yamux/1.0.0"
     , connSession    = MuxerSession
-        { muxOpenStream   = openStream
+        { muxOpenStream = \account -> do
+            stream <- openStream
+            pure stream
+              { streamClose = streamClose stream
+                  `finally` atomically (maClose account)
+              }
         , muxAcceptStream = fail "test connection: no inbound streams"
         , muxClose        = pure ()
         }
     , connState      = stateVar
+    , connResourceScope = ownedScope
     }
 
 -- | Outbound ping streams currently reserved against a peer's resource
@@ -201,7 +212,7 @@ spec = do
     it "sendPing round-trips against handlePing and returns a non-negative RTT" $ do
       (streamA, _closeA, streamB) <- mkClosableStreamPair
       sw <- mkTestSwitch
-      conn <- mkPingConnection (pure streamA)
+      conn <- mkPingConnection sw (pure streamA)
       responder <- async $ pingResponder streamB
       result <- sendPing sw conn
       case result of
@@ -216,7 +227,7 @@ spec = do
       (streamA, _closeA, streamB) <- mkClosableStreamPair
       closedRef <- newIORef False
       sw <- mkTestSwitch
-      conn <- mkPingConnection (pure (recordClose closedRef streamA))
+      conn <- mkPingConnection sw (pure (recordClose closedRef streamA))
       responder <- async $ pingResponder streamB
       result <- sendPing sw conn
       case result of
@@ -235,7 +246,7 @@ spec = do
       opensRef <- newIORef (0 :: Int)
       closedRef <- newIORef False
       sw <- mkTestSwitch
-      conn <- mkPingConnection (countingOpen opensRef (recordClose closedRef streamA))
+      conn <- mkPingConnection sw (countingOpen opensRef (recordClose closedRef streamA))
       responder <- async $ pingResponder streamB
       result <- withPingSession sw conn $ \sess -> do
         r1 <- ping sess
@@ -266,7 +277,7 @@ spec = do
       (streamA, _closeA, streamB) <- mkClosableStreamPair
       opensRef <- newIORef (0 :: Int)
       sw <- mkTestSwitch
-      conn <- mkPingConnection (countingOpen opensRef streamA)
+      conn <- mkPingConnection sw (countingOpen opensRef streamA)
       responder <- async $ pingResponder streamB
       result <- withPingSession sw conn $ \sess ->
         forConcurrently [1 .. 10 :: Int] $ \_ -> ping sess
@@ -288,7 +299,7 @@ spec = do
     it "ping fails on a session that has been closed" $ do
       (streamA, _closeA, streamB) <- mkClosableStreamPair
       sw <- mkTestSwitch
-      conn <- mkPingConnection (pure streamA)
+      conn <- mkPingConnection sw (pure streamA)
       responder <- async $ pingResponder streamB
       opened <- openPingSession sw conn
       case opened of
@@ -313,7 +324,7 @@ spec = do
       let countingClose s =
             s { streamClose = modifyIORef' closeCountRef (+ 1) >> streamClose s }
       sw <- mkTestSwitch
-      conn <- mkPingConnection (pure (countingClose streamA))
+      conn <- mkPingConnection sw (pure (countingClose streamA))
       responder <- async $ pingResponder streamB
       opened <- openPingSession sw conn
       case opened of
@@ -334,7 +345,7 @@ spec = do
       (streamA, _closeA, streamB) <- mkClosableStreamPair
       closedRef <- newIORef False
       sw <- mkTestSwitch
-      conn <- mkPingConnection (pure (recordClose closedRef streamA))
+      conn <- mkPingConnection sw (pure (recordClose closedRef streamA))
       responder <- async $ pingResponder streamB
       outcome <- try $ withPingSession sw conn $ \_sess ->
         throwIO (userError "boom") :: IO ()
@@ -355,7 +366,7 @@ spec = do
       -- reject further pings instead of reusing the poisoned stream.
       (streamA, _closeA, streamB) <- mkClosableStreamPair
       sw <- mkTestSwitch
-      conn <- mkPingConnection (pure streamA)
+      conn <- mkPingConnection sw (pure streamA)
       responder <- async $ do
         negResult <- negotiateResponder streamB [pingProtocolId]
         negResult `shouldBe` Accepted pingProtocolId
@@ -379,7 +390,7 @@ spec = do
       (streamA, _closeA, streamB) <- mkClosableStreamPair
       closedRef <- newIORef False
       sw <- mkTestSwitch
-      conn <- mkPingConnection (pure (recordClose closedRef streamA))
+      conn <- mkPingConnection sw (pure (recordClose closedRef streamA))
       responder <- async $ do
         negResult <- negotiateResponder streamB [pingProtocolId]
         negResult `shouldBe` Accepted pingProtocolId
@@ -400,7 +411,7 @@ spec = do
       (streamA, _closeA, streamB) <- mkClosableStreamPair
       closedRef <- newIORef False
       sw <- mkTestSwitch
-      conn <- mkPingConnection (pure (recordClose closedRef streamA))
+      conn <- mkPingConnection sw (pure (recordClose closedRef streamA))
       responder <- async $ do
         negResult <- negotiateResponder streamB [pingProtocolId]
         negResult `shouldBe` Accepted pingProtocolId
@@ -418,7 +429,7 @@ spec = do
     it "sendPing returns Left PingStreamError on mid-payload EOF" $ do
       (streamA, _closeA, streamB) <- mkClosableStreamPair
       sw <- mkTestSwitch
-      conn <- mkPingConnection (pure streamA)
+      conn <- mkPingConnection sw (pure streamA)
       responder <- async $ do
         negResult <- negotiateResponder streamB [pingProtocolId]
         negResult `shouldBe` Accepted pingProtocolId
@@ -438,7 +449,7 @@ spec = do
       (streamA, _closeA, streamB) <- mkClosableStreamPair
       closedRef <- newIORef False
       sw <- mkTestSwitch
-      conn <- mkPingConnection (pure (recordClose closedRef streamA))
+      conn <- mkPingConnection sw (pure (recordClose closedRef streamA))
       -- Responder speaks multistream-select but supports no protocols, so
       -- it answers "na" to /ipfs/ping/1.0.0 and keeps waiting for further
       -- proposals (which never come) — hence cancel, not wait.
@@ -457,7 +468,7 @@ spec = do
             (streamA, _closeA, streamB) <- mkClosableStreamPair
             writesRef <- newIORef ([] :: [BS.ByteString])
             sw <- mkTestSwitch
-            conn <- mkPingConnection (pure (recordWrites writesRef streamA))
+            conn <- mkPingConnection sw (pure (recordWrites writesRef streamA))
             responder <- async $ pingResponder streamB
             result <- sendPing sw conn
             case result of
@@ -602,7 +613,7 @@ spec = do
       protos <- atomically $ readTVar (swProtocols sw)
       handler <- maybe (fail "ping handler not registered") pure
         (Map.lookup pingProtocolId protos)
-      conn <- mkPingConnection (fail "test connection: no outbound streams")
+      conn <- mkPingConnection sw (fail "test connection: no outbound streams")
       (dialer1, close1, listener1) <- mkClosableStreamPair
       (dialer2, close2, listener2) <- mkClosableStreamPair
       (dialer3, _close3, listener3) <- mkClosableStreamPair

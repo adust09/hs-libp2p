@@ -23,6 +23,7 @@ import LibP2P.Switch.Listen
   , streamAcceptLoop
   )
 import LibP2P.Switch (newSwitch, setConnectionGater, setStreamHandler)
+import LibP2P.Switch.ResourceManager (unlimitedMemoryAccount)
 import LibP2P.Switch.Types
   ( Connection (..)
   , MuxerSession (..)
@@ -68,7 +69,7 @@ spec = do
       -- handleInbound blocks on streamAcceptLoop, so spawn async
       _listenerThread <- async $ handleInbound sw rawConnB
       -- Dialer upgrades synchronously; both sides must handshake concurrently
-      upgradeResult <- timeout 3000000 $ upgradeOutbound kpA rawConnA
+      upgradeResult <- timeout 3000000 $ upgradeOutbound (swResourceMgr sw) kpA rawConnA
       case upgradeResult of
         Nothing -> expectationFailure "upgradeOutbound timed out (handleInbound stub may not handshake)"
         Just connA -> do
@@ -122,7 +123,7 @@ spec = do
       -- Both sides must run concurrently for the handshake to work.
       setConnectionGater sw denyAfterSecure
       result <- timeout 3000000 $ concurrently
-        (upgradeOutbound kpA rawConnA)
+        (upgradeOutbound (swResourceMgr sw) kpA rawConnA)
         (handleInbound sw rawConnB)
       case result of
         Nothing -> expectationFailure "timeout during handshake"
@@ -147,13 +148,13 @@ spec = do
       let rawConnA = mkMockRawConn streamA localAddr remoteAddr
           rawConnB = mkMockRawConn streamB remoteAddr localAddr
       (connDialer, connListener) <- concurrently
-        (upgradeOutbound kpA rawConnA)
-        (upgradeInbound kpB rawConnB)
+        (upgradeOutbound (swResourceMgr sw) kpA rawConnA)
+        (upgradeInbound (swResourceMgr sw) kpB rawConnB)
       -- Start stream accept loop on listener's connection
       _loopThread <- async $ streamAcceptLoop sw connListener
       -- From dialer, open a mux stream, negotiate protocol, wait for handler
       result <- timeout 5000000 $ do
-        dialerStream <- muxOpenStream (connSession connDialer)
+        dialerStream <- muxOpenStream (connSession connDialer) unlimitedMemoryAccount
         negResult <- negotiateInitiator dialerStream ["/test/1.0.0"]
         case negResult of
           Accepted _ -> takeMVar handlerDone
@@ -177,11 +178,11 @@ spec = do
       let rawConnA = mkMockRawConn streamA localAddr remoteAddr
           rawConnB = mkMockRawConn streamB remoteAddr localAddr
       (connDialer, connListener) <- concurrently
-        (upgradeOutbound kpA rawConnA)
-        (upgradeInbound kpB rawConnB)
+        (upgradeOutbound (swResourceMgr sw) kpA rawConnA)
+        (upgradeInbound (swResourceMgr sw) kpB rawConnB)
       _loopThread <- async $ streamAcceptLoop sw connListener
       result <- timeout 5000000 $ do
-        dialerStream <- muxOpenStream (connSession connDialer)
+        dialerStream <- muxOpenStream (connSession connDialer) unlimitedMemoryAccount
         negResult <- negotiateInitiator dialerStream ["/test/1.0.0"]
         case negResult of
           Accepted _ -> takeMVar handlerDone
@@ -202,11 +203,11 @@ spec = do
       let rawConnA = mkMockRawConn streamA localAddr remoteAddr
           rawConnB = mkMockRawConn streamB remoteAddr localAddr
       (connDialer, connListener) <- concurrently
-        (upgradeOutbound kpA rawConnA)
-        (upgradeInbound kpB rawConnB)
+        (upgradeOutbound (swResourceMgr sw) kpA rawConnA)
+        (upgradeInbound (swResourceMgr sw) kpB rawConnB)
       -- Open mux stream from dialer, accept on listener
       (dialerStream, listenerStream) <- concurrently
-        (muxOpenStream (connSession connDialer))
+        (muxOpenStream (connSession connDialer) unlimitedMemoryAccount)
         (muxAcceptStream (connSession connListener))
       -- Dispatch on listener side with no handlers
       _dispatchThread <- async $ dispatchStream sw connListener listenerStream

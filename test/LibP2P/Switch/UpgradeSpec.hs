@@ -11,8 +11,15 @@ import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkMemoryStreamPair)
 import LibP2P.Noise.Framing (maxNoisePlaintextSize)
 import LibP2P.Noise.Handshake (HandshakeResult (..))
+import LibP2P.Switch.ResourceManager
+  ( DefaultLimits (..)
+  , newResourceManager
+  , noLimits
+  , unlimitedMemoryAccount
+  )
 import LibP2P.Switch.Types (Connection (..), Direction (..), MuxerSession (..))
-import LibP2P.Switch.Upgrade
+import LibP2P.Switch.Upgrade hiding (upgradeInbound, upgradeOutbound)
+import qualified LibP2P.Switch.Upgrade as Upgrade
 import LibP2P.Transport (ConnectionEndpoint (..), RawConnection (..))
 import Test.Hspec
 
@@ -22,6 +29,19 @@ mkTestIdentity = do
   Right kp <- generateKeyPair
   let pid = fromPublicKey (publicKey kp)
   pure (pid, kp)
+
+upgradeOutbound :: KeyPair -> RawConnection -> IO Connection
+upgradeOutbound kp raw = do
+  rm <- newResourceManager (DefaultLimits noLimits noLimits noLimits noLimits)
+  Upgrade.upgradeOutbound rm kp raw
+
+upgradeInbound :: KeyPair -> RawConnection -> IO Connection
+upgradeInbound kp raw = do
+  rm <- newResourceManager (DefaultLimits noLimits noLimits noLimits noLimits)
+  Upgrade.upgradeInbound rm kp raw
+
+openMuxStream :: Connection -> IO StreamIO
+openMuxStream conn = muxOpenStream (connSession conn) unlimitedMemoryAccount
 
 -- | Create a mock RawConnection from a StreamIO and addresses.
 mkMockRawConn :: StreamIO -> Multiaddr -> Multiaddr -> IO RawConnection
@@ -207,7 +227,7 @@ spec = do
       -- Open stream from A (client), accept on B (server)
       (streamA, streamB) <-
         concurrently
-          (muxOpenStream (connSession connA))
+          (openMuxStream connA)
           (muxAcceptStream (connSession connB))
       -- Exchange data
       streamWrite streamA "ping"
@@ -217,6 +237,27 @@ spec = do
       received2 <- readExact streamA 4
       received2 `shouldBe` "pong"
       -- Cleanup
+      muxClose (connSession connA)
+      muxClose (connSession connB)
+
+    it "keeps accounting active for a response after the requester half-closes" $ do
+      (_pidA, kpA) <- mkTestIdentity
+      (_pidB, kpB) <- mkTestIdentity
+      (rawA, rawB) <- mkMemoryStreamPair
+      rawConnA <- mkMockRawConn rawA localAddr remoteAddr
+      rawConnB <- mkMockRawConn rawB remoteAddr localAddr
+      (connA, connB) <- concurrently
+        (upgradeOutbound kpA rawConnA)
+        (upgradeInbound kpB rawConnB)
+      (streamA, streamB) <- concurrently
+        (openMuxStream connA)
+        (muxAcceptStream (connSession connB))
+      streamWrite streamA "request"
+      streamClose streamA
+      readExact streamB 7 `shouldReturn` "request"
+      streamWrite streamB "response"
+      readExact streamA 8 `shouldReturn` "response"
+      streamClose streamB
       muxClose (connSession connA)
       muxClose (connSession connB)
 
@@ -251,11 +292,11 @@ spec = do
       -- Open two streams from A
       (stream1A, stream1B) <-
         concurrently
-          (muxOpenStream (connSession connA))
+          (openMuxStream connA)
           (muxAcceptStream (connSession connB))
       (stream2A, stream2B) <-
         concurrently
-          (muxOpenStream (connSession connA))
+          (openMuxStream connA)
           (muxAcceptStream (connSession connB))
       -- Exchange data on both streams independently
       streamWrite stream1A "stream-1"
@@ -279,7 +320,7 @@ spec = do
           (upgradeInbound kpB rawConnB)
       (streamA, streamB) <-
         concurrently
-          (muxOpenStream (connSession connA))
+          (openMuxStream connA)
           (muxAcceptStream (connSession connB))
       -- Larger than the yamux flow-control window, so the writer only
       -- makes progress while the reader drains — the perf download

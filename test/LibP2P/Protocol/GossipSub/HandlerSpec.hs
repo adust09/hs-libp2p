@@ -13,6 +13,7 @@ import Control.Concurrent.STM
   , readTVar
   , writeTVar
   )
+import Control.Exception (finally)
 import Control.Monad (unless)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -65,6 +66,10 @@ import LibP2P.Protocol.GossipSub.Types
   , maxRPCSize
   )
 import LibP2P.Switch (lookupStreamHandler, newSwitch, setStreamHandler)
+import LibP2P.Switch.ResourceManager
+  ( MemoryAccount (..)
+  , reserveConnection
+  )
 import LibP2P.Switch.Types
   ( ConnState (..)
   , Connection (..)
@@ -113,12 +118,14 @@ testParams = defaultGossipSubParams
   }
 
 -- | Connection whose muxer yields one stream that accepts GossipSub.
-mkGossipConn :: PeerId -> IO (Connection, Async NegotiationResult)
-mkGossipConn pid = do
+mkGossipConn :: Switch -> PeerId -> IO (Connection, Async NegotiationResult)
+mkGossipConn sw pid = do
   (localStream, remoteStream) <- mkMemoryStreamPair
   responder <- async $ negotiateResponder remoteStream
     [gossipSubProtocolId, gossipSubProtocolIdV10, floodSubProtocolId]
   stateVar <- newTVarIO ConnOpen
+  connScope <- atomically (reserveConnection (swResourceMgr sw) pid Inbound)
+    >>= either (fail . show) pure
   let conn = Connection
         { connPeerId     = pid
         , connDirection  = Inbound
@@ -127,11 +134,15 @@ mkGossipConn pid = do
         , connSecurity   = "/noise"
         , connMuxer      = "/yamux/1.0.0"
         , connSession    = MuxerSession
-            { muxOpenStream   = pure localStream
+            { muxOpenStream = \account -> pure localStream
+                { streamClose = streamClose localStream
+                    `finally` atomically (maClose account)
+                }
             , muxAcceptStream = fail "test: no accept"
             , muxClose        = pure ()
             }
         , connState      = stateVar
+        , connResourceScope = connScope
         }
   pure (conn, responder)
 
@@ -431,13 +442,13 @@ spec = do
       (latePid, _) <- mkTestIdentity
       node <- newGossipSubNode sw testParams
       startGossipSub node
-      (liveConn, liveResponder) <- mkGossipConn livePid
+      (liveConn, liveResponder) <- mkGossipConn sw livePid
       fireNotifiers sw liveConn
       opened <- waitForCachedStream node livePid 40
       opened `shouldBe` True
       cancel liveResponder
       stopGossipSub node
-      (lateConn, lateResponder) <- mkGossipConn latePid
+      (lateConn, lateResponder) <- mkGossipConn sw latePid
       fireNotifiers sw lateConn
       -- Give a stopped notifier time to misbehave if it is still live.
       threadDelay 300000
@@ -458,7 +469,7 @@ spec = do
       startGossipSub node
       notifiersAfter <- atomically $ length <$> readTVar (swNotifiers sw)
       (notifiersAfter - notifiersBefore) `shouldBe` 1
-      (conn, responder) <- mkGossipConn pid
+      (conn, responder) <- mkGossipConn sw pid
       fireNotifiers sw conn
       opened <- waitForCachedStream node pid 40
       opened `shouldBe` True
