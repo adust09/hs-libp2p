@@ -65,7 +65,7 @@ data Connection = Connection
   , connDirection  :: !Direction        -- ^ Inbound or outbound
   , connLocalAddr  :: !Multiaddr       -- ^ Local multiaddr
   , connRemoteAddr :: !Multiaddr       -- ^ Remote multiaddr
-  , connSecurity   :: !ProtocolId      -- ^ Negotiated security protocol (e.g. "/noise")
+  , connSecurity   :: !ProtocolId      -- ^ Negotiated security protocol (e.g. "/noise" or "/tls/1.0.0")
   , connMuxer      :: !ProtocolId      -- ^ Negotiated muxer protocol (e.g. "/yamux/1.0.0")
   , connSession    :: !MuxerSession    -- ^ Muxer session for opening/accepting streams
   , connState      :: !(TVar ConnState) -- ^ Mutable connection state

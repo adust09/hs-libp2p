@@ -37,9 +37,9 @@ import LibP2P.Transport
   , RawConnection (..)
   , Transport (..)
   )
-import LibP2P.Transport.QUIC.Certificate
-  ( newQUICCredential
-  , verifyQUICCertificate
+import LibP2P.Security.TLS.Certificate
+  ( newIdentityCredential
+  , verifyIdentityCertificate
   )
 import qualified Network.QUIC as QUIC
 import qualified Network.QUIC.Client as Client
@@ -69,7 +69,7 @@ libp2pALPN = "libp2p"
 -- | Construct a QUIC transport using the node's long-term identity key.
 newQUICTransport :: KeyPair -> IO Transport
 newQUICTransport identity = do
-  credential <- newQUICCredential identity
+  credential <- newIdentityCredential identity
   pure Transport
     { transportDial = dialQUIC credential
     , transportDialFrom = \local remote -> case local of
@@ -155,7 +155,7 @@ validateServerCertificate
   -> CertificateChain
   -> IO [FailedReason]
 validateServerCertificate authenticated _ _ _ chain = do
-  result <- verifyQUICCertificate chain
+  result <- verifyIdentityCertificate chain
   atomically $ void (tryPutTMVar authenticated result)
   pure $ case result of
     Right _ -> []
@@ -198,7 +198,7 @@ selectALPN _ protocols
 
 authenticateClientCertificate :: CertificateChain -> IO CertificateUsage
 authenticateClientCertificate chain = do
-  result <- verifyQUICCertificate chain
+  result <- verifyIdentityCertificate chain
   pure $ case result of
     Right _ -> CertificateUsageAccept
     Left _ -> CertificateUsageReject
@@ -208,7 +208,7 @@ acceptQUIC :: TQueue RawConnection -> QUIC.Connection -> IO ()
 acceptQUIC accepted connection = do
   maybeChain <- Server.clientCertificateChain connection
   chain <- maybe (fail "QUIC client did not provide a certificate") pure maybeChain
-  peerId <- verifyQUICCertificate chain >>= either fail pure
+  peerId <- verifyIdentityCertificate chain >>= either fail pure
   info <- QUIC.getConnectionInfo connection
   localAddress <- sockAddrToMultiaddr (QUIC.localSockAddr info)
   remoteAddress <- sockAddrToMultiaddr (QUIC.remoteSockAddr info)

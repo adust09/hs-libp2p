@@ -63,7 +63,7 @@ handleInbound sw rawConn = do
   if not allowed
     then rcClose rawConn
     else do
-      -- Upgrade: Noise XX handshake + Yamux session
+      -- Upgrade: negotiated secure channel + Yamux session
       conn <- upgradeInbound (swResourceMgr sw) (swIdentityKey sw) rawConn
       -- Gate 2: check remote PeerId after security handshake
       secured <- runGate (gateSecured gater (connPeerId conn))

@@ -6,6 +6,7 @@
 IMAGE_NAME := hs-libp2p-interop
 
 .PHONY: build image self-test cross-test-go-listener cross-test-hs-listener \
+        cross-test-tls-go-listener cross-test-tls-hs-listener \
         cross-gossipsub-rust-listener cross-gossipsub-hs-listener cross-gossipsub kad-dht \
         perf-self-test perf-cross-nim-listener perf-cross-hs-listener perf-cross nim-libp2p \
         hole-punch-self-test
@@ -33,6 +34,14 @@ cross-test-go-listener:
 # Cross-test: hs listener, go dialer (key-translation shim starts via depends_on)
 cross-test-hs-listener:
 	cd .. && docker compose -f docker-compose.cross.yml up --build --exit-code-from go-dialer redis hs-listener go-dialer
+
+# TLS cross-test: go listener, hs dialer
+cross-test-tls-go-listener:
+	cd .. && docker compose -f docker-compose.cross.yml -f docker-compose.tls-cross.yml up --build --exit-code-from hs-dialer redis go-listener hs-dialer
+
+# TLS cross-test: hs listener, go dialer
+cross-test-tls-hs-listener:
+	cd .. && docker compose -f docker-compose.cross.yml -f docker-compose.tls-cross.yml up --build --exit-code-from go-dialer redis hs-listener go-dialer
 
 # GossipSub cross-test: rust listener, hs dialer
 cross-gossipsub-rust-listener:
