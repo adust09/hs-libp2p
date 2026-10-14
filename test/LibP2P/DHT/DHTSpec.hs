@@ -41,6 +41,7 @@ import LibP2P.Switch.Types
   , Direction (..)
   , MuxerSession (..)
   , Switch (..)
+  , defaultConnectionGater
   )
 import LibP2P.Switch.ResourceManager (ResourceManager, newResourceManager, DefaultLimits (..), noLimits)
 import System.Timeout (timeout)
@@ -73,6 +74,7 @@ mkMockSwitch pid = do
   closed <- newTVarIO False
   backoffs <- newTVarIO Map.empty
   pendingDials <- newTVarIO Map.empty
+  connectionGater <- newTVarIO defaultConnectionGater
   resMgr <- mkMockResourceMgr
   peerStore <- newTVarIO Map.empty
   certifiedRecords <- newTVarIO Map.empty
@@ -89,6 +91,7 @@ mkMockSwitch pid = do
     , swClosed       = closed
     , swDialBackoffs = backoffs
     , swPendingDials = pendingDials
+    , swConnectionGater = connectionGater
     , swResourceMgr  = resMgr
     , swPeerStore    = peerStore
     , swCertifiedRecords = certifiedRecords

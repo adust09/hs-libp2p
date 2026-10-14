@@ -181,34 +181,63 @@ spec = do
       fromBase58 (toBase58 pid) `shouldBe` Right pid
 
   describe "parsePeerId" $ do
-    it "parses base58 peer ID (12D3KooW...)" $ do
-      let rawPubKey = BS.replicate 32 0x42
-      let pk = PublicKey Ed25519 rawPubKey
-      let pid = fromPublicKey pk
-      let b58Text = toBase58 pid
-      parsePeerId b58Text `shouldBe` Right pid
+    let rawPubKey = BS.replicate 32 0x42
+        pid = fromPublicKey (PublicKey Ed25519 rawPubKey)
+        base32Lower = "bafzaajaiaejcaqscijbeeqscijbeeqscijbeeqscijbeeqscijbeeqscijbeeqsc"
+        base32Upper = "BAFZAAJAIAEJCAQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSCIJBEEQSC"
+        base58Btc = "z5AanNVJCxnKJ2m4jo6GbZqcPwFSzj8LskNziWTdP4zC7AQTtgHbdDB"
+        identityMultihash = peerIdBytes pid
+        sha256Multihash = BS.pack [0x12, 0x20] <> BS.replicate 32 0x42
+        asBase58Cid bytes = "z" <> TE.decodeUtf8 (B58.encode bytes)
 
-    it "parses CIDv1 peer ID (bafz...)" $ do
-      let rawPubKey = BS.replicate 32 0x42
-      let pk = PublicKey Ed25519 rawPubKey
-      let pid = fromPublicKey pk
-      let cidText = toCIDv1 pid
-      -- CIDv1 starts with 'b' (multibase base32lower)
-      T.head cidText `shouldBe` 'b'
-      parsePeerId cidText `shouldBe` Right pid
+    it "parses legacy 1... and Qm... peer IDs" $ do
+      parsePeerId (toBase58 pid) `shouldBe` Right pid
+      parsePeerId (TE.decodeUtf8 (B58.encode sha256Multihash))
+        `shouldBe` Right (PeerId sha256Multihash)
+
+    it "parses the same CIDv1 from base32lower, base32upper, and base58btc" $ do
+      mapM_ (`shouldParseAs` pid) [base32Lower, base32Upper, base58Btc]
+
+    it "keeps base32lower as the default CIDv1 output" $
+      toCIDv1 pid `shouldBe` base32Lower
 
     it "round-trips: parsePeerId(toCIDv1(pid)) == pid" $ do
       Right kp <- generateKeyPair
-      let pid = fromPublicKey (kpPublic kp)
-      parsePeerId (toCIDv1 pid) `shouldBe` Right pid
+      let generatedPid = fromPublicKey (kpPublic kp)
+      parsePeerId (toCIDv1 generatedPid) `shouldBe` Right generatedPid
 
-    it "rejects invalid base58 string" $
-      parsePeerId "not-a-valid-peer-id-!@#$" `shouldSatisfy` isLeft
+    it "rejects arbitrary base58 text without a legacy prefix" $
+      parsePeerId "2NEpo7TZRRrLZSi2U" `shouldSatisfy` isLeft
 
-    it "rejects CIDv1 with wrong codec" $ do
-      -- Manually construct a CIDv1-like string with wrong codec
-      -- This test verifies parsePeerId validates the CID structure
-      parsePeerId "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi" `shouldSatisfy` isLeft
+    it "rejects an unknown multibase prefix" $
+      parsePeerId "f01720024080112204242424242424242424242424242424242424242424242424242424242424242"
+        `shouldSatisfy` isLeft
+
+    it "rejects CIDv0 wrapped in a multibase prefix" $
+      parsePeerId (asBase58Cid sha256Multihash) `shouldSatisfy` isLeft
+
+    it "rejects CIDv1 with the wrong version or codec" $ do
+      parsePeerId (asBase58Cid (BS.pack [0x02, 0x72] <> identityMultihash))
+        `shouldSatisfy` isLeft
+      parsePeerId (asBase58Cid (BS.pack [0x01, 0x71] <> identityMultihash))
+        `shouldSatisfy` isLeft
+
+    it "rejects CIDv1 with trailing bytes" $
+      parsePeerId (asBase58Cid (BS.pack [0x01, 0x72] <> identityMultihash <> BS.singleton 0x00))
+        `shouldSatisfy` isLeft
+
+    it "rejects CIDv1 with non-canonical varints" $ do
+      parsePeerId (asBase58Cid (BS.pack [0x81, 0x00, 0x72] <> identityMultihash))
+        `shouldSatisfy` isLeft
+      parsePeerId (asBase58Cid (BS.pack [0x01, 0xf2, 0x00] <> identityMultihash))
+        `shouldSatisfy` isLeft
+
+    it "rejects malformed multibase payloads" $ do
+      parsePeerId "bafza!" `shouldSatisfy` isLeft
+      parsePeerId "z0OIl" `shouldSatisfy` isLeft
+
+shouldParseAs :: Text -> PeerId -> Expectation
+shouldParseAs encoded pid = parsePeerId encoded `shouldBe` Right pid
 
 isLeft :: Either a b -> Bool
 isLeft (Left _) = True
