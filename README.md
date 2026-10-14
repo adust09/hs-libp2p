@@ -24,7 +24,7 @@ The project is part of the [libp2p/unified-testing](https://github.com/libp2p/un
 cross-implementation interop effort, joined at the invitation of a libp2p
 maintainer. The codebase receives code review from libp2p maintainers, and
 official integration into the unified testing suite is planned within 2027.
-CI exercises hs ↔ go interoperability over TCP+Noise+Yamux and native QUIC v1.
+CI exercises hs ↔ go interoperability over TCP+Noise/TLS+Yamux and native QUIC v1.
 Local interop evidence lives in `interop/RESULTS.md`.
 
 ## Quickstart

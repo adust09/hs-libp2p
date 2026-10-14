@@ -11,7 +11,7 @@
 --   REDIS_ADDR     - Redis host:port (default: "redis:6379")
 --   TEST_KEY       - hex key namespacing Redis coordination keys
 --   TRANSPORT      - "tcp" or "quic-v1"
---   SECURE_CHANNEL - "noise" for TCP; unset for QUIC
+--   SECURE_CHANNEL - "noise" or "tls" for TCP; unset for QUIC
 --   MUXER          - "yamux" for TCP; unset for QUIC
 --   LISTENER_IP    - bind address (default: "0.0.0.0")
 --   DEBUG          - accepted but ignored; all logging goes to stderr
@@ -462,7 +462,8 @@ validateProtocols :: String -> Maybe String -> Maybe String -> Either String ()
 validateProtocols "tcp" security muxer = do
   case security of
     Just "noise" -> pure ()
-    Just other -> Left $ "secure channel " ++ other ++ " not supported (only noise)"
+    Just "tls" -> pure ()
+    Just other -> Left $ "secure channel " ++ other ++ " not supported (expected noise or tls)"
     Nothing -> Left "SECURE_CHANNEL not set (required for tcp)"
   case muxer of
     Just "yamux" -> pure ()
