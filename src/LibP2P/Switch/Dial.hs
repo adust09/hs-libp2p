@@ -43,7 +43,7 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Exception (SomeException, bracketOnError, catch, finally, onException)
-import Control.Monad (forM, forM_, when)
+import Control.Monad (filterM, forM, forM_, when)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Data.Time.Clock (NominalDiffTime, addUTCTime, getCurrentTime)
@@ -57,6 +57,7 @@ import LibP2P.Switch.ResourceManager (Direction (..), releaseConnection, reserve
 import LibP2P.Switch.Types
   ( BackoffEntry (..)
   , Connection (..)
+  , ConnectionGater (..)
   , DialError (..)
   , MuxerSession (..)
   , Switch (..)
@@ -261,12 +262,7 @@ establishAndRegister sw opts remotePeerId addrs = do
     Right () -> do
       result <- dialNewInner sw opts dir addrs
         `onException` atomically (releaseConnection (swResourceMgr sw) remotePeerId dir)
-      -- Verify remote PeerId matches expected target
-      let verified = case result of
-            Right conn
-              | connPeerId conn /= remotePeerId ->
-                  Left (DialPeerIdMismatch remotePeerId (connPeerId conn))
-            _ -> result
+      verified <- verifyIdentityAndGate sw remotePeerId result
       case verified of
         Right conn -> do
           clearBackoff (swDialBackoffs sw) remotePeerId
@@ -283,28 +279,60 @@ establishAndRegister sw opts remotePeerId addrs = do
           mapM_ (\f -> async $ f conn) notifiers
           pure (Right conn)
         Left _ -> do
-          -- Close the muxer session on PeerId mismatch
+          -- Close any upgraded connection rejected by identity or policy checks
           case result of
             Right conn -> muxClose (connSession conn)
-            Left _     -> pure ()
+              `catch` \(_ :: SomeException) -> pure ()
+            Left _ -> pure ()
           -- Release the reserved connection since dial failed
           atomically $ releaseConnection (swResourceMgr sw) remotePeerId dir
-          recordBackoff (swDialBackoffs sw) remotePeerId
+          when (shouldRecordBackoff verified) $
+            recordBackoff (swDialBackoffs sw) remotePeerId
           pure verified
+
+-- | Verify the authenticated identity and apply the post-handshake gate.
+verifyIdentityAndGate
+  :: Switch -> PeerId -> Either DialError Connection
+  -> IO (Either DialError Connection)
+verifyIdentityAndGate _ _ result@(Left _) = pure result
+verifyIdentityAndGate sw expectedPeerId result@(Right conn)
+  | connPeerId conn /= expectedPeerId =
+      pure (Left (DialPeerIdMismatch expectedPeerId (connPeerId conn)))
+  | otherwise = do
+      gater <- atomically $ readTVar (swConnectionGater sw)
+      allowed <- runGate (gateSecured gater (connPeerId conn))
+      pure $ if allowed then result else Left (DialGatedPeer (connPeerId conn))
+
+-- | Policy rejection is not a connectivity failure and must not cause backoff.
+shouldRecordBackoff :: Either DialError Connection -> Bool
+shouldRecordBackoff (Left (DialGatedAddress _)) = False
+shouldRecordBackoff (Left (DialGatedPeer _)) = False
+shouldRecordBackoff _ = True
 
 -- | Inner dial logic: transport selection and staggered parallel dial.
 dialNewInner :: Switch -> DialOpts -> Direction -> [Multiaddr] -> IO (Either DialError Connection)
 dialNewInner _sw _opts _dir [] = pure (Left DialNoAddresses)
-dialNewInner sw opts dir addrs = do
-  transports <- atomically $ readTVar (swTransports sw)
-  -- Find a transport for each address
-  let dialable = filterMap (\addr ->
-        case find (\t -> transportCanDial t addr) transports of
-          Just t  -> Just (addr, t)
-          Nothing -> Nothing) addrs
-  case dialable of
-    []    -> pure (Left (DialNoTransport (Prelude.head addrs)))
-    pairs -> staggeredDial sw opts dir pairs
+dialNewInner sw opts dir addrs@(firstAddr : _) = do
+  gater <- atomically $ readTVar (swConnectionGater sw)
+  allowedAddrs <- filterM (runGate . gateDialAddr gater) addrs
+  case allowedAddrs of
+    [] -> pure (Left (DialGatedAddress firstAddr))
+    firstAllowed : _ -> do
+      transports <- atomically $ readTVar (swTransports sw)
+      let dialable = filterMap (matchingTransport transports) allowedAddrs
+      case dialable of
+        [] -> pure (Left (DialNoTransport firstAllowed))
+        pairs -> staggeredDial sw opts dir pairs
+  where
+    matchingTransport transports addr = case find canDial transports of
+      Nothing -> Nothing
+      Just transport -> Just (addr, transport)
+      where
+        canDial transport = transportCanDial transport addr
+
+-- | A faulty policy hook fails closed instead of leaking a connection.
+runGate :: IO Bool -> IO Bool
+runGate action = action `catch` \(_ :: SomeException) -> pure False
 
 -- | Filter and map a list, keeping only Just results.
 filterMap :: (a -> Maybe b) -> [a] -> [b]

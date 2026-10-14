@@ -10,6 +10,8 @@ module LibP2P.Switch.Types
   , Connection (..)
   , SwitchEvent (..)
   , StreamHandler
+  , ConnectionGater (..)
+  , defaultConnectionGater
   , Switch (..)
   , DialError (..)
   , BackoffEntry (..)
@@ -83,11 +85,28 @@ data SwitchEvent
   | Disconnected !PeerId !Direction !Multiaddr  -- ^ Connection closed
   deriving (Show, Eq)
 
+-- | Policy hooks applied to inbound and outbound connection establishment.
+data ConnectionGater = ConnectionGater
+  { gateAccept   :: !(Multiaddr -> IO Bool) -- ^ Check an inbound address before upgrade
+  , gateDialAddr :: !(Multiaddr -> IO Bool) -- ^ Check an outbound address before transport dial
+  , gateSecured  :: !(PeerId -> IO Bool)    -- ^ Check the authenticated remote peer
+  }
+
+-- | Default gater that allows all connections.
+defaultConnectionGater :: ConnectionGater
+defaultConnectionGater = ConnectionGater
+  { gateAccept = \_ -> pure True
+  , gateDialAddr = \_ -> pure True
+  , gateSecured = \_ -> pure True
+  }
+
 -- | Errors that can occur during a dial operation.
 data DialError
   = DialBackoff               -- ^ Peer is in backoff period (recently failed)
   | DialNoAddresses           -- ^ No addresses provided for dialing
   | DialNoTransport !Multiaddr -- ^ No registered transport can handle this address
+  | DialGatedAddress !Multiaddr -- ^ Outbound policy rejected this address
+  | DialGatedPeer !PeerId     -- ^ Outbound policy rejected the authenticated peer
   | DialAllFailed ![String]   -- ^ All dial attempts failed
   | DialUpgradeFailed !String -- ^ Connection upgrade pipeline failed
   | DialSwitchClosed          -- ^ Switch has been shut down
@@ -125,6 +144,7 @@ data Switch = Switch
   , swClosed       :: !(TVar Bool)                                       -- ^ Whether the switch is shut down
   , swDialBackoffs :: !(TVar (Map PeerId BackoffEntry))                  -- ^ Per-peer dial backoff state
   , swPendingDials :: !(TVar (Map PeerId (TMVar (Either DialError Connection)))) -- ^ In-flight dials for dedup
+  , swConnectionGater :: !(TVar ConnectionGater)                         -- ^ Connection admission policy
   , swResourceMgr  :: !ResourceManager                                   -- ^ Hierarchical resource manager
   , swPeerStore    :: !(TVar (Map PeerId IdentifyInfo))                  -- ^ Identify info per peer
   , swCertifiedRecords :: !(TVar (Map PeerId CertifiedRecord))           -- ^ Accepted RFC 0003 records per peer
