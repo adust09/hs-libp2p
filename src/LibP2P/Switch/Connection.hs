@@ -12,17 +12,17 @@ module LibP2P.Switch.Connection
   ) where
 
 import Control.Concurrent.STM (atomically, readTVar, writeTChan, writeTVar)
-import Control.Exception (SomeException, catch, finally, mask, onException)
-import Control.Monad (unless, when)
-import Data.IORef (atomicModifyIORef', newIORef)
+import Control.Exception (SomeException, catch, mask, onException)
+import Control.Monad (when)
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
 import LibP2P.Switch.ConnPool (allConns, removeConn)
 import LibP2P.Switch.ResourceManager
   ( Direction (..)
   , ResourceError
   , releaseConnection
-  , releasePeerStream
-  , reservePeerStream
+  , releaseStream
+  , reserveStream
+  , scopeMemoryAccount
   )
 import LibP2P.Switch.Types
   ( ConnState (..)
@@ -55,7 +55,7 @@ closeConnection sw conn = do
       else do
         writeTVar (connState conn) ConnClosed
         removeConn (swConnPool sw) conn
-        releaseConnection (swResourceMgr sw) (connPeerId conn) (connDirection conn)
+        releaseConnection (swResourceMgr sw) (connResourceScope conn)
         writeTChan (swEvents sw)
           (Disconnected (connPeerId conn) (connDirection conn) (connRemoteAddr conn))
         pure True
@@ -75,15 +75,13 @@ closeAllConnections sw = do
 -- returned stream is closed (exactly once, even on double close).
 newStream :: Switch -> Connection -> IO (Either ResourceError StreamIO)
 newStream sw conn = mask $ \restore -> do
-  let pid = connPeerId conn
-      release = atomically $ releasePeerStream (swResourceMgr sw) pid Outbound
-  reserved <- atomically $ reservePeerStream (swResourceMgr sw) pid Outbound
+  reserved <- atomically $
+    reserveStream (swResourceMgr sw) (connResourceScope conn) Outbound
   case reserved of
     Left err -> pure (Left err)
-    Right () -> do
-      stream <- restore (muxOpenStream (connSession conn)) `onException` release
-      releasedRef <- newIORef False
-      let releaseOnce = do
-            already <- atomicModifyIORef' releasedRef (\r -> (True, r))
-            unless already release
-      pure (Right stream { streamClose = streamClose stream `finally` releaseOnce })
+    Right streamScope -> do
+      let release = atomically $ releaseStream (swResourceMgr sw) streamScope
+          account = scopeMemoryAccount (swResourceMgr sw) streamScope
+      stream <- restore (muxOpenStream (connSession conn) account)
+        `onException` release
+      pure (Right stream)

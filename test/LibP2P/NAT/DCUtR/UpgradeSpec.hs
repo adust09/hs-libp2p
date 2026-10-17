@@ -45,7 +45,14 @@ import LibP2P.Switch.Types
   , MuxerSession (..)
   , Switch (..)
   )
-import LibP2P.Switch.Upgrade (readExact, upgradeAs)
+import LibP2P.Switch.ResourceManager
+  ( DefaultLimits (..)
+  , newResourceManager
+  , noLimits
+  , unlimitedMemoryAccount
+  )
+import LibP2P.Switch.Upgrade (readExact)
+import qualified LibP2P.Switch.Upgrade as Upgrade
 import LibP2P.Transport (ConnectionEndpoint (..), RawConnection (..))
 import LibP2P.Transport.TCP (newTCPTransport)
 import System.Timeout (timeout)
@@ -274,7 +281,7 @@ spec = do
       -- The muxer took opposite roles, so stream ids do not collide
       (streamA, streamB) <-
         concurrently
-          (muxOpenStream (connSession connA))
+          (muxOpenStream (connSession connA) unlimitedMemoryAccount)
           (muxAcceptStream (connSession connB))
       streamWrite streamA "punch"
       readExact streamB 5 `shouldReturn` "punch"
@@ -374,6 +381,11 @@ localAddr = Multiaddr [IP4 0x7f000001, TCP 1111]
 
 remoteAddr :: Multiaddr
 remoteAddr = Multiaddr [IP4 0x7f000001, TCP 2222]
+
+upgradeAs :: Direction -> KeyPair -> RawConnection -> IO Connection
+upgradeAs direction kp raw = do
+  rm <- newResourceManager (DefaultLimits noLimits noLimits noLimits noLimits)
+  Upgrade.upgradeAs rm direction kp raw
 
 -- | A mock RawConnection over a memory stream.
 mkMockRawConn :: StreamIO -> Multiaddr -> Multiaddr -> IO RawConnection

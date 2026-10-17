@@ -115,7 +115,7 @@ openSecondConnection :: Switch -> Multiaddr -> IO ()
 openSecondConnection sw addr = do
   transport <- newTCPTransport
   rawConn <- transportDial transport addr
-  _conn <- upgradeOutbound (swIdentityKey sw) rawConn
+  _conn <- upgradeOutbound (swResourceMgr sw) (swIdentityKey sw) rawConn
   pure ()
 
 reservedPeers :: RelayState -> IO [PeerId]

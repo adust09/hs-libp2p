@@ -2,32 +2,45 @@ module LibP2P.Switch.DialSpec (spec) where
 
 import Control.Concurrent.Async (async, concurrently)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar)
+import qualified Data.ByteString as BS
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Time.Clock (NominalDiffTime, UTCTime, addUTCTime, diffUTCTime, getCurrentTime)
+import Data.Word (Word16)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair, publicKey)
-import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
-import LibP2P.Multiaddr (Multiaddr (..))
+import LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes)
+import LibP2P.Multiaddr (Multiaddr (..), toBytes)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkMemoryStreamPair)
+import LibP2P.Protocol.Identify.Message (IdentifyInfo (..))
+import LibP2P.Switch.CertifiedRecords (CertifiedRecord (..))
 import LibP2P.Switch.ConnPool (addConn, lookupConn)
 import LibP2P.Switch.Dial
-  ( checkBackoff
+  ( DialOpts (..)
+  , checkBackoff
   , clearBackoff
+  , defaultDialOpts
   , dial
+  , dialWith
   , initialBackoffSeconds
   , maxBackoffSeconds
   , recordBackoff
   )
-import LibP2P.Switch (addTransport, newSwitch, switchClose)
+import LibP2P.Switch (addTransport, newSwitch, setConnectionGater, switchClose)
+import LibP2P.Switch.Listen (defaultConnectionGater, gateDialAddr, gateSecured)
 import LibP2P.Switch.ResourceManager
-  ( ResourceManager (..)
+  ( DefaultLimits (..)
+  , ResourceManager (..)
   , ResourceScope (..)
   , emptyUsage
+  , newResourceManager
+  , noLimits
+  , reserveConnection
   )
 import LibP2P.Switch.Types
-  ( BackoffEntry (..)
+  ( ActiveListener (..)
+  , BackoffEntry (..)
   , ConnState (..)
   , Connection (..)
   , DialError (..)
@@ -36,7 +49,7 @@ import LibP2P.Switch.Types
   , Switch (..)
   )
 import LibP2P.Switch.Upgrade (upgradeInbound)
-import LibP2P.Transport (ConnectionEndpoint (..), RawConnection (..), Transport (..))
+import LibP2P.Transport (ConnectionEndpoint (..), Listener (..), RawConnection (..), Transport (..))
 import Test.Hspec
 
 -- | Generate a test identity (PeerId, KeyPair).
@@ -48,12 +61,48 @@ mkTestIdentity = do
 
 -- | A test multiaddr: /ip4/127.0.0.1/tcp/4001
 testAddr :: Multiaddr
-testAddr = Multiaddr [IP4 0x7f000001, TCP 4001]
+testAddr = addrAt 4001
+
+addrAt :: Word16 -> Multiaddr
+addrAt port = Multiaddr [IP4 0x7f000001, TCP port]
+
+relayAddr :: PeerId -> PeerId -> Multiaddr
+relayAddr relayPeer remotePeer = Multiaddr
+  [ IP4 0x7f000001
+  , TCP 4003
+  , P2P (peerIdBytes relayPeer)
+  , P2PCircuit
+  , P2P (peerIdBytes remotePeer)
+  ]
+
+storeIdentifyAddrs :: Switch -> PeerId -> [Multiaddr] -> IO ()
+storeIdentifyAddrs sw peer addrs = atomically $ do
+  store <- readTVar (swPeerStore sw)
+  let info = IdentifyInfo Nothing Nothing Nothing (map toBytes addrs) Nothing [] Nothing
+  writeTVar (swPeerStore sw) (Map.insert peer info store)
+
+storeCertifiedAddrs :: Switch -> PeerId -> [Multiaddr] -> IO ()
+storeCertifiedAddrs sw peer addrs = atomically $ do
+  records <- readTVar (swCertifiedRecords sw)
+  let record = CertifiedRecord 1 BS.empty (map toBytes addrs)
+  writeTVar (swCertifiedRecords sw) (Map.insert peer record records)
+
+installTestListener :: Switch -> Multiaddr -> IO ()
+installTestListener sw addr = do
+  worker <- async (pure ())
+  let listener = Listener
+        { listenerAccept = fail "test listener does not accept"
+        , listenerClose = pure ()
+        , listenerAddr = addr
+        }
+  atomically $ writeTVar (swListeners sw) [ActiveListener listener worker addr]
 
 -- | A dummy connection for pool tests.
-mkDummyConnection :: PeerId -> IO Connection
-mkDummyConnection pid = do
+mkDummyConnection :: Switch -> PeerId -> IO Connection
+mkDummyConnection sw pid = do
   stateVar <- newTVarIO ConnOpen
+  connScope <- atomically (reserveConnection (swResourceMgr sw) pid Outbound)
+    >>= either (fail . show) pure
   pure Connection
     { connPeerId     = pid
     , connDirection  = Outbound
@@ -62,12 +111,17 @@ mkDummyConnection pid = do
     , connSecurity   = "/noise"
     , connMuxer      = "/yamux/1.0.0"
     , connSession    = MuxerSession
-        { muxOpenStream   = fail "dummy: not connected"
+        { muxOpenStream   = \_ -> fail "dummy: not connected"
         , muxAcceptStream = fail "dummy: not connected"
         , muxClose        = pure ()
         }
     , connState      = stateVar
+    , connResourceScope = connScope
     }
+
+newTestResourceManager :: IO ResourceManager
+newTestResourceManager =
+  newResourceManager (DefaultLimits noLimits noLimits noLimits noLimits)
 
 -- | Create a mock transport where dial connects to a concurrent responder.
 -- The responder runs upgradeInbound concurrently on the other end of
@@ -91,7 +145,8 @@ mkMockDialTransport responderKP = pure Transport
             , rcClose      = pure ()
             }
       _ <- async $ do
-        _ <- upgradeInbound responderKP rawConnB
+        rm <- newTestResourceManager
+        _ <- upgradeInbound rm responderKP rawConnB
         pure ()
       pure RawConnection
         { rcEndpoint   = ByteStreamEndpoint streamA
@@ -122,13 +177,44 @@ mkCountingMockTransport responderKP counterRef = pure Transport
             , rcClose      = pure ()
             }
       _ <- async $ do
-        _ <- upgradeInbound responderKP rawConnB
+        rm <- newTestResourceManager
+        _ <- upgradeInbound rm responderKP rawConnB
         pure ()
       pure RawConnection
         { rcEndpoint   = ByteStreamEndpoint streamA
         , rcLocalAddr  = Multiaddr [IP4 0x7f000001, TCP 0]
         , rcRemoteAddr = addr
         , rcClose      = pure ()
+        }
+
+-- | Create a mock transport that records when the upgraded connection closes.
+mkClosingMockTransport :: KeyPair -> IORef Int -> IO Transport
+mkClosingMockTransport responderKP closeCount = pure Transport
+  { transportDial = dialFn
+  , transportDialFrom = \_ -> dialFn
+  , transportListen = \_ -> error "mock: listen not supported"
+  , transportCanDial = \(Multiaddr ps) -> case ps of
+      (IP4 _ : TCP _ : _) -> True
+      _ -> False
+  }
+  where
+    dialFn addr = do
+      (streamA, streamB) <- mkMemoryStreamPair
+      let rawConnB = RawConnection
+            { rcEndpoint = ByteStreamEndpoint streamB
+            , rcLocalAddr = addr
+            , rcRemoteAddr = Multiaddr [IP4 0x7f000001, TCP 0]
+            , rcClose = pure ()
+            }
+      _ <- async $ do
+        rm <- newTestResourceManager
+        _ <- upgradeInbound rm responderKP rawConnB
+        pure ()
+      pure RawConnection
+        { rcEndpoint = ByteStreamEndpoint streamA
+        , rcLocalAddr = Multiaddr [IP4 0x7f000001, TCP 0]
+        , rcRemoteAddr = addr
+        , rcClose = atomicModifyIORef' closeCount (\n -> (n + 1, ()))
         }
 
 -- | Create a mock transport that always fails to dial.
@@ -199,7 +285,6 @@ spec = do
       (pid, _kp) <- mkTestIdentity
       beforeRecord <- getCurrentTime
       recordBackoff backoffs pid
-      afterRecord <- getCurrentTime
       entry <- atomically $ do
         boffs <- readTVar backoffs
         pure $ Map.lookup pid boffs
@@ -254,7 +339,7 @@ spec = do
       (remotePid, _remoteKP) <- mkTestIdentity
       sw <- newSwitch localPid localKP
       -- Pre-populate pool with an Open connection
-      conn <- mkDummyConnection remotePid
+      conn <- mkDummyConnection sw remotePid
       atomically $ addConn (swConnPool sw) conn
       -- Dial should return the existing connection
       result <- dial sw remotePid [testAddr]
@@ -283,6 +368,129 @@ spec = do
         Left err -> expectationFailure $ "expected DialNoAddresses, got: " <> show err
         Right _ -> expectationFailure "expected DialNoAddresses, got Right"
 
+    it "should dial Identify addresses from peerstore when explicit addresses are empty" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      let storedAddr = addrAt 4002
+      storeIdentifyAddrs sw remotePid [storedAddr]
+      transport <- mkMockDialTransport remoteKP
+      addTransport sw transport
+
+      result <- dial sw remotePid []
+
+      case result of
+        Left err -> expectationFailure $ "expected peerstore dial to succeed, got: " <> show err
+        Right conn -> connRemoteAddr conn `shouldBe` storedAddr
+
+    it "should prefer explicit addresses over peerstore addresses" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      storeIdentifyAddrs sw remotePid [addrAt 4002]
+      transport <- mkMockDialTransport remoteKP
+      addTransport sw transport
+
+      result <- dial sw remotePid [testAddr]
+
+      case result of
+        Left err -> expectationFailure $ "expected explicit dial to succeed, got: " <> show err
+        Right conn -> connRemoteAddr conn `shouldBe` testAddr
+
+    it "should prefer certified addresses over Identify addresses" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      let certifiedAddr = addrAt 4003
+      storeIdentifyAddrs sw remotePid [addrAt 4002]
+      storeCertifiedAddrs sw remotePid [certifiedAddr]
+      transport <- mkMockDialTransport remoteKP
+      addTransport sw transport
+
+      result <- dial sw remotePid []
+
+      case result of
+        Left err -> expectationFailure $ "expected certified-address dial to succeed, got: " <> show err
+        Right conn -> connRemoteAddr conn `shouldBe` certifiedAddr
+
+    it "should return DialNoAddresses when stored addresses are malformed" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, _remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      let malformed = IdentifyInfo Nothing Nothing Nothing [BS.pack [0xff]] Nothing [] Nothing
+      atomically $ writeTVar (swPeerStore sw) (Map.singleton remotePid malformed)
+
+      result <- dial sw remotePid []
+
+      case result of
+        Left DialNoAddresses -> pure ()
+        Left err -> expectationFailure $ "expected DialNoAddresses, got: " <> show err
+        Right _ -> expectationFailure "expected DialNoAddresses, got Right"
+
+    it "should deduplicate stored addresses before dialing" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      storeIdentifyAddrs sw remotePid [testAddr, testAddr]
+      counter <- newIORef (0 :: Int)
+      transport <- mkCountingMockTransport remoteKP counter
+      addTransport sw transport
+
+      result <- dial sw remotePid []
+
+      case result of
+        Left err -> expectationFailure $ "expected deduplicated dial to succeed, got: " <> show err
+        Right _ -> readIORef counter `shouldReturn` 1
+
+    it "should skip stored addresses matching a local listener" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      let remoteAddr = addrAt 4002
+      installTestListener sw testAddr
+      storeIdentifyAddrs sw remotePid [testAddr, remoteAddr]
+      transport <- mkMockDialTransport remoteKP
+      addTransport sw transport
+
+      result <- dial sw remotePid []
+
+      case result of
+        Left err -> expectationFailure $ "expected non-self dial to succeed, got: " <> show err
+        Right conn -> connRemoteAddr conn `shouldBe` remoteAddr
+      switchClose sw
+
+    it "should prefer direct stored addresses over relay addresses" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, remoteKP) <- mkTestIdentity
+      (relayPid, _relayKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      let directAddr = addrAt 4002
+      storeIdentifyAddrs sw remotePid [relayAddr relayPid remotePid, directAddr]
+      transport <- mkMockDialTransport remoteKP
+      addTransport sw transport
+
+      result <- dial sw remotePid []
+
+      case result of
+        Left err -> expectationFailure $ "expected direct dial to succeed, got: " <> show err
+        Right conn -> connRemoteAddr conn `shouldBe` directAddr
+
+    it "should use relay stored addresses when no direct address exists" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, remoteKP) <- mkTestIdentity
+      (relayPid, _relayKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      let onlyRelayAddr = relayAddr relayPid remotePid
+      storeIdentifyAddrs sw remotePid [onlyRelayAddr]
+      transport <- mkMockDialTransport remoteKP
+      addTransport sw transport
+
+      result <- dial sw remotePid []
+
+      case result of
+        Left err -> expectationFailure $ "expected relay dial to succeed, got: " <> show err
+        Right conn -> connRemoteAddr conn `shouldBe` onlyRelayAddr
+
     it "returns DialNoTransport when no transport matches any address" $ do
       (localPid, localKP) <- mkTestIdentity
       (remotePid, _remoteKP) <- mkTestIdentity
@@ -309,6 +517,72 @@ spec = do
           case poolConn of
             Nothing -> expectationFailure "connection not found in pool"
             Just _  -> pure ()
+
+    it "should not call transportDial when the outbound address is gated" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      counter <- newIORef (0 :: Int)
+      addTransport sw =<< mkCountingMockTransport remoteKP counter
+      setConnectionGater sw defaultConnectionGater
+        { gateDialAddr = \_ -> pure False }
+
+      result <- dial sw remotePid [testAddr]
+
+      result `shouldBeLeft` DialGatedAddress testAddr
+      readIORef counter `shouldReturn` 0
+      checkBackoff (swDialBackoffs sw) remotePid `shouldReturn` Right ()
+
+    it "should skip a gated address and dial an allowed address" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      counter <- newIORef (0 :: Int)
+      addTransport sw =<< mkCountingMockTransport remoteKP counter
+      let allowedAddr = Multiaddr [IP4 0x7f000001, TCP 4002]
+      setConnectionGater sw defaultConnectionGater
+        { gateDialAddr = \addr -> pure (addr /= testAddr) }
+
+      result <- dial sw remotePid [testAddr, allowedAddr]
+
+      case result of
+        Left err -> expectationFailure $ "expected allowed address to connect: " <> show err
+        Right conn -> connRemoteAddr conn `shouldBe` allowedAddr
+      readIORef counter `shouldReturn` 1
+
+    it "should close an upgraded connection when the authenticated peer is gated" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      closeCount <- newIORef (0 :: Int)
+      addTransport sw =<< mkClosingMockTransport remoteKP closeCount
+      setConnectionGater sw defaultConnectionGater
+        { gateSecured = \_ -> pure False }
+
+      result <- dial sw remotePid [testAddr]
+
+      result `shouldBeLeft` DialGatedPeer remotePid
+      readIORef closeCount `shouldReturn` 1
+      poolConn <- atomically $ lookupConn (swConnPool sw) remotePid
+      case poolConn of
+        Nothing -> pure ()
+        Just _ -> expectationFailure "gated connection should not enter the pool"
+      checkBackoff (swDialBackoffs sw) remotePid `shouldReturn` Right ()
+
+    it "should apply address gating to force-direct DCUtR dials" $ do
+      (localPid, localKP) <- mkTestIdentity
+      (remotePid, remoteKP) <- mkTestIdentity
+      sw <- newSwitch localPid localKP
+      counter <- newIORef (0 :: Int)
+      addTransport sw =<< mkCountingMockTransport remoteKP counter
+      setConnectionGater sw defaultConnectionGater
+        { gateDialAddr = \_ -> pure False }
+      let opts = defaultDialOpts { doForceDirect = True }
+
+      result <- dialWith sw opts remotePid [testAddr]
+
+      result `shouldBeLeft` DialGatedAddress testAddr
+      readIORef counter `shouldReturn` 0
 
     it "failed dial records backoff" $ do
       (localPid, localKP) <- mkTestIdentity
@@ -380,3 +654,8 @@ spec = do
       -- Only one actual transport dial should have occurred
       count <- readIORef counter
       count `shouldBe` 1
+
+shouldBeLeft :: (Eq a, Show a) => Either a b -> a -> Expectation
+shouldBeLeft result expected = case result of
+  Left actual -> actual `shouldBe` expected
+  Right _ -> expectationFailure "expected Left, got Right"

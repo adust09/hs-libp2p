@@ -14,7 +14,7 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (SomeException, bracket, try)
+import Control.Exception (bracket)
 import Control.Monad (replicateM)
 import qualified Data.ByteString as BS
 import Data.IORef (modifyIORef', newIORef, readIORef)
@@ -69,7 +69,9 @@ import LibP2P.Protocol.Ping
   , sendPing
   , withPingSession
   )
+import LibP2P.Switch.Connection (closeConnection)
 import LibP2P.Switch.ConnPool (lookupConn)
+import LibP2P.Switch.ResourceManager (unlimitedMemoryAccount)
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen
   ( ConnectionGater (..)
@@ -146,6 +148,24 @@ waitForPeerInPool sw pid = do
     Just () -> pure ()
     Nothing -> fail "waitForPeerInPool: peer never appeared in the pool"
 
+-- | Verify that Identify data supports a later address-free dial.
+shouldRedialFromPeerstore :: Switch -> PeerId -> Multiaddr -> IO ()
+shouldRedialFromPeerstore sw peer listenAddr = do
+  first <- dial sw peer [listenAddr]
+  case first of
+    Left err -> expectationFailure $ "initial dial failed: " ++ show err
+    Right conn -> do
+      identified <- timeout 5000000 $ atomically $ do
+        store <- readTVar (swPeerStore sw)
+        maybe retry (const (pure ())) (Map.lookup peer store)
+      identified `shouldBe` Just ()
+      closeConnection sw conn
+      second <- timeout 5000000 (dial sw peer [])
+      case second of
+        Nothing -> expectationFailure "peerstore dial timed out"
+        Just (Left err) -> expectationFailure $ "peerstore dial failed: " ++ show err
+        Just (Right connected) -> connRemoteAddr connected `shouldBe` listenAddr
+
 -- | Create two connected test nodes: node B listens, node A dials.
 -- Returns both Switches, PeerIds, and the connection from A to B.
 -- Both Switches are torn down via bracket even when the action fails,
@@ -219,6 +239,11 @@ spec = do
             -- B is listening, so idListenAddrs should be non-empty
             idListenAddrs info `shouldSatisfy` (not . null)
 
+    it "redials with peerstore addresses after Identify succeeds" $ do
+      withListeningNode $ \(_swB, pidB, listenAddr) ->
+        withTestNode $ \swA _pidA ->
+          shouldRedialFromPeerstore swA pidB listenAddr
+
     it "observedAddr echoes the dialer's own address as seen by the listener" $ do
       -- Regression for #167: the responder must fill observedAddr with the
       -- initiator's source address. On loopback that address is exactly the
@@ -258,9 +283,9 @@ spec = do
         opensRef <- newIORef (0 :: Int)
         let realSession = connSession conn
             countingSession = realSession
-              { muxOpenStream = do
+              { muxOpenStream = \account -> do
                   modifyIORef' opensRef (+ 1)
-                  muxOpenStream realSession
+                  muxOpenStream realSession account
               }
             countingConn = conn { connSession = countingSession }
         result <- timeout 10000000 $ withPingSession swA countingConn $ \sess -> do
@@ -290,9 +315,9 @@ spec = do
         opensRef <- newIORef (0 :: Int)
         let realSession = connSession conn
             countingSession = realSession
-              { muxOpenStream = do
+              { muxOpenStream = \account -> do
                   modifyIORef' opensRef (+ 1)
-                  muxOpenStream realSession
+                  muxOpenStream realSession account
               }
             countingConn = conn { connSession = countingSession }
         result <- timeout 30000000 $ withPingSession swA countingConn $ \sess ->
@@ -313,7 +338,7 @@ spec = do
 
     it "unknown protocol gets na over real TCP and the connection stays usable" $ do
       withConnectedPair $ \(swA, _pidA) _nodeB conn -> do
-        stream <- muxOpenStream (connSession conn)
+        stream <- muxOpenStream (connSession conn) unlimitedMemoryAccount
         result <- timeout 5000000 $
           negotiateInitiator stream ["/test/does-not-exist/1.0.0"]
         result `shouldBe` Just NoProtocol
@@ -407,7 +432,7 @@ spec = do
           streamWrite stream payload
         result <- timeout 60000000 $
           forConcurrently [0 .. 3 :: Int] $ \i -> do
-            stream <- muxOpenStream (connSession conn)
+            stream <- muxOpenStream (connSession conn) unlimitedMemoryAccount
             negotiated <- negotiateInitiator stream [echoProto]
             negotiated `shouldBe` Accepted echoProto
             let payload = BS.replicate payloadSize (fromIntegral (0x41 + i))
@@ -482,7 +507,8 @@ spec = do
       tcpB <- newTCPTransport
       addTransport swB tcpB
       let securedRejectGater = ConnectionGater
-            { gateAccept  = \_ -> pure True
+            { gateAccept = \_ -> pure True
+            , gateDialAddr = \_ -> pure True
             , gateSecured = \_ -> pure False
             }
       addrs <- switchListen swB securedRejectGater [loopbackAddr]

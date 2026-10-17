@@ -9,6 +9,7 @@ module LibP2P.Switch
   , subscribeSwitchEvents
   , addTransport
   , selectTransport
+  , setConnectionGater
   , setStreamHandler
   , removeStreamHandler
   , lookupStreamHandler
@@ -27,8 +28,24 @@ import LibP2P.Multiaddr (Multiaddr)
 import LibP2P.MultistreamSelect.Negotiation (ProtocolId)
 import LibP2P.Protocol.Identify (pushIdentify)
 import LibP2P.Switch.Connection (closeAllConnections)
-import LibP2P.Switch.ResourceManager (DefaultLimits (..), defaultPeerLimits, defaultSystemLimits, newResourceManager)
-import LibP2P.Switch.Types (ActiveListener (..), StreamHandler, Switch (..), SwitchConfig, SwitchEvent, defaultSwitchConfig)
+import LibP2P.Switch.ResourceManager
+  ( DefaultLimits (..)
+  , defaultConnectionLimits
+  , defaultPeerLimits
+  , defaultStreamLimits
+  , defaultSystemLimits
+  , newResourceManager
+  )
+import LibP2P.Switch.Types
+  ( ActiveListener (..)
+  , ConnectionGater
+  , StreamHandler
+  , Switch (..)
+  , SwitchConfig
+  , SwitchEvent
+  , defaultConnectionGater
+  , defaultSwitchConfig
+  )
 import LibP2P.Transport (Listener (..), Transport (..))
 
 -- | Create a new Switch with the given local identity.
@@ -46,9 +63,12 @@ newSwitchWithConfig config pid kp = do
   closedVar       <- newTVarIO False
   backoffsVar     <- newTVarIO Map.empty
   pendingDialsVar <- newTVarIO Map.empty
+  connectionGaterVar <- newTVarIO defaultConnectionGater
   resMgr <- newResourceManager DefaultLimits
     { dlSystemLimits = defaultSystemLimits
-    , dlPeerLimits   = defaultPeerLimits
+    , dlPeerLimits = defaultPeerLimits
+    , dlConnectionLimits = defaultConnectionLimits
+    , dlStreamLimits = defaultStreamLimits
     }
   peerStoreVar <- newTVarIO Map.empty
   certifiedRecordsVar <- newTVarIO Map.empty
@@ -65,6 +85,7 @@ newSwitchWithConfig config pid kp = do
     , swClosed       = closedVar
     , swDialBackoffs = backoffsVar
     , swPendingDials = pendingDialsVar
+    , swConnectionGater = connectionGaterVar
     , swResourceMgr  = resMgr
     , swPeerStore    = peerStoreVar
     , swCertifiedRecords = certifiedRecordsVar
@@ -92,6 +113,12 @@ selectTransport :: Switch -> Multiaddr -> IO (Maybe Transport)
 selectTransport sw addr = atomically $ do
   ts <- readTVar (swTransports sw)
   pure $ find (\t -> transportCanDial t addr) ts
+
+-- | Set the admission policy used by future inbound and outbound connections.
+-- Configure this before starting listeners or dialing peers.
+setConnectionGater :: Switch -> ConnectionGater -> IO ()
+setConnectionGater sw gater = atomically $
+  writeTVar (swConnectionGater sw) gater
 
 -- | Register a protocol stream handler.
 -- Overwrites any existing handler for the same protocol ID.

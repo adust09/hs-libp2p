@@ -13,6 +13,7 @@ module LibP2P.Switch.Upgrade
     performStreamHandshake
     -- * Encrypted StreamIO
   , noiseSessionToStreamIO
+  , noiseSessionToManagedStreamIO
     -- * Yamux → MuxerSession adapter
   , yamuxToMuxerSession
     -- * Full upgrade pipeline
@@ -27,8 +28,8 @@ module LibP2P.Switch.Upgrade
   ) where
 
 import Control.Concurrent.Async (async, cancel, race, waitCatch)
-import Control.Concurrent.STM (atomically, isEmptyTQueue, newTVarIO, retry)
-import Control.Exception (SomeException, catch)
+import Control.Concurrent.STM (STM, atomically, isEmptyTQueue, newTVarIO, retry)
+import Control.Exception (SomeException, catch, finally, mask, mask_, onException, throwIO)
 import Control.Monad (unless)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -36,13 +37,25 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Word (Word8)
 import LibP2P.Core.Binary (readWord16BE)
 import LibP2P.Crypto.Key (KeyPair (..))
-import LibP2P.Crypto.PeerId (fromPublicKey)
+import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
 import LibP2P.Yamux.Frame (maxStreamWindowSize)
-import LibP2P.Yamux.Session (closeSession, keepaliveLoop, newSessionWithConfig, recvLoop, sendLoop)
+import LibP2P.Yamux.Session
+  ( closeSession
+  , keepaliveLoop
+  , newManagedSessionWithConfig
+  , recvLoop
+  , sendLoop
+  )
 import qualified LibP2P.Yamux.Session as Yamux
-import LibP2P.Yamux.Stream (streamRead)
+import LibP2P.Yamux.Stream (streamReadRetained)
 import qualified LibP2P.Yamux.Stream as YS
-import LibP2P.Yamux.Types (SessionRole (..), YamuxConfig, YamuxSession (ysessSendCh), YamuxStream, defaultYamuxConfig)
+import LibP2P.Yamux.Types
+  ( SessionRole (..)
+  , YamuxConfig
+  , YamuxSession (ysessSendCh)
+  , YamuxStream (ysMemoryAccount)
+  , defaultYamuxConfig
+  )
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
   , StreamIO (..)
@@ -68,6 +81,17 @@ import LibP2P.Noise.Session
   , decryptMessage
   , encryptMessage
   , mkNoiseSession
+  )
+import LibP2P.Switch.ResourceManager
+  ( MemoryAccount (..)
+  , ResourceError
+  , ResourceManager
+  , ResourceScope
+  , releaseConnection
+  , reserveConnection
+  , reserveStream
+  , scopeMemoryAccount
+  , unlimitedMemoryAccount
   )
 import LibP2P.Switch.Types
   ( ConnState (..)
@@ -216,22 +240,39 @@ noiseSessionToStreamIO
   -> IORef ByteString      -- ^ Read buffer (decrypted but unconsumed bytes)
   -> StreamIO              -- ^ Raw (unencrypted) StreamIO
   -> StreamIO
-noiseSessionToStreamIO sendRef recvRef bufRef rawIO = StreamIO
-  { streamWrite = encryptAndWrite sendRef rawIO
-  , streamReadByte = decryptAndReadByte recvRef bufRef rawIO
-  , streamReadChunk = decryptAndReadChunk recvRef bufRef rawIO
-  , streamClose = pure ()  -- Encryption layer does not own the connection
+noiseSessionToStreamIO sendRef recvRef bufRef =
+  noiseSessionToManagedStreamIO unlimitedMemoryAccount sendRef recvRef bufRef
+
+-- | Account decrypted bytes while they remain in the Noise read buffer.
+noiseSessionToManagedStreamIO
+  :: MemoryAccount
+  -> IORef NoiseSession
+  -> IORef NoiseSession
+  -> IORef ByteString
+  -> StreamIO
+  -> StreamIO
+noiseSessionToManagedStreamIO account sendRef recvRef bufRef rawIO = StreamIO
+  { streamWrite = encryptAndWrite account sendRef rawIO
+  , streamReadByte = decryptAndReadByte account recvRef bufRef rawIO
+  , streamReadChunk = decryptAndReadChunk account recvRef bufRef rawIO
+  , streamClose = pure ()
   }
 
 -- | Encrypt plaintext and write as framed Noise messages.
 -- A Noise message is capped at 65535 bytes, so plaintext is split into
 -- chunks of at most 65519 bytes (65535 minus the 16-byte AEAD tag) and
 -- each chunk is encrypted and framed as its own Noise transport message.
-encryptAndWrite :: IORef NoiseSession -> StreamIO -> ByteString -> IO ()
-encryptAndWrite sendRef rawIO plaintext =
+encryptAndWrite
+  :: MemoryAccount -> IORef NoiseSession -> StreamIO -> ByteString -> IO ()
+encryptAndWrite account sendRef rawIO plaintext =
   mapM_ encryptChunk (chunkPlaintext plaintext)
   where
-    encryptChunk chunk = do
+    encryptChunk chunk = mask $ \restore -> do
+      let cipherBytes = BS.length chunk + 16
+      reserveMemory account cipherBytes
+      restore (encryptAndSend chunk) `finally` releaseMemory account cipherBytes
+
+    encryptAndSend chunk = do
       sess <- readIORef sendRef
       case encryptMessage sess chunk of
         Left err -> fail $ "encryptAndWrite: " <> err
@@ -245,40 +286,80 @@ encryptAndWrite sendRef rawIO plaintext =
 -- legal — some implementations send it as a keepalive — and a
 -- zero-length frame carries no Noise message at all; both yield zero
 -- application bytes, so reading continues at the next frame.
-nextPlaintext :: IORef NoiseSession -> StreamIO -> IO ByteString
-nextPlaintext recvRef rawIO = do
-  ct <- readFramedMessage rawIO
-  if BS.null ct
-    then nextPlaintext recvRef rawIO -- zero-length frame: no message to decrypt
-    else do
+nextPlaintext
+  :: MemoryAccount
+  -> IORef NoiseSession
+  -> IORef ByteString
+  -> StreamIO
+  -> IO ByteString
+nextPlaintext account recvRef bufRef rawIO = do
+  lenBytes <- readExact rawIO 2
+  let cipherBytes = fromIntegral (readWord16BE lenBytes)
+  if cipherBytes == 0
+    then nextPlaintext account recvRef bufRef rawIO
+    else readAndDecrypt cipherBytes
+  where
+    readAndDecrypt cipherBytes = mask $ \restore -> do
+      reserveMemory account cipherBytes
+      ct <- restore (readExact rawIO cipherBytes)
+        `onException` releaseMemory account cipherBytes
+      result <- decryptPayload ct
+        `onException` releaseMemory account cipherBytes
+      releaseMemory account cipherBytes
+      case result of
+        Nothing -> nextPlaintext account recvRef bufRef rawIO
+        Just pt -> writeIORef bufRef pt >> pure pt
+
+    decryptPayload ct = do
       sess <- readIORef recvRef
       case decryptMessage sess ct of
         Left err -> fail $ "nextPlaintext: decrypt failed: " <> err
         Right (pt, sess') -> do
           writeIORef recvRef sess'
           if BS.null pt
-            then nextPlaintext recvRef rawIO -- empty transport message (keepalive)
-            else pure pt
+            then pure Nothing
+            else reserveMemory account (BS.length pt) >> pure (Just pt)
+
+reserveMemory :: MemoryAccount -> Int -> IO ()
+reserveMemory account bytes = do
+  reserved <- atomically $ maReserve account bytes
+  either throwIO pure reserved
+
+releaseMemory :: MemoryAccount -> Int -> IO ()
+releaseMemory account bytes = atomically $ maRelease account bytes
 
 -- | Read and decrypt a byte from the Noise channel: pop the buffer if
 -- it has bytes, otherwise decrypt the next frame and buffer the rest.
-decryptAndReadByte :: IORef NoiseSession -> IORef ByteString -> StreamIO -> IO Word8
-decryptAndReadByte recvRef bufRef rawIO = do
+decryptAndReadByte
+  :: MemoryAccount -> IORef NoiseSession -> IORef ByteString -> StreamIO
+  -> IO Word8
+decryptAndReadByte account recvRef bufRef rawIO = do
   buf <- readIORef bufRef
-  bs <- if BS.null buf then nextPlaintext recvRef rawIO else pure buf
-  writeIORef bufRef (BS.tail bs)
-  pure (BS.head bs)
+  bs <- if BS.null buf
+    then nextPlaintext account recvRef bufRef rawIO
+    else pure buf
+  BS.head <$> consumeAccountedBuffer account bufRef 1 bs
 
 -- | Chunk-level read from the Noise channel: hand back up to @n@ bytes
 -- of the buffered plaintext (a decrypted frame is already a chunk),
 -- decrypting the next frame only when the buffer is empty. Bytes
 -- beyond @n@ stay buffered for the next read.
-decryptAndReadChunk :: IORef NoiseSession -> IORef ByteString -> StreamIO -> Int -> IO ByteString
-decryptAndReadChunk recvRef bufRef rawIO n = do
+decryptAndReadChunk
+  :: MemoryAccount -> IORef NoiseSession -> IORef ByteString -> StreamIO
+  -> Int -> IO ByteString
+decryptAndReadChunk account recvRef bufRef rawIO n = do
   buf <- readIORef bufRef
-  bs <- if BS.null buf then nextPlaintext recvRef rawIO else pure buf
+  bs <- if BS.null buf
+    then nextPlaintext account recvRef bufRef rawIO
+    else pure buf
+  consumeAccountedBuffer account bufRef n bs
+
+consumeAccountedBuffer
+  :: MemoryAccount -> IORef ByteString -> Int -> ByteString -> IO ByteString
+consumeAccountedBuffer account bufRef n bs = mask_ $ do
   let (front, rest) = BS.splitAt n bs
   writeIORef bufRef rest
+  releaseMemory account (BS.length front)
   pure front
 
 -- | Bounded window given to the send loop to flush the GoAway frame
@@ -309,10 +390,10 @@ yamuxToMuxerSession yamuxSess closeTransport = do
       Left _ -> cancel recvLoopA
       Right () -> pure ()
   pure MuxerSession
-    { muxOpenStream = do
-        result <- Yamux.openStream yamuxSess
+    { muxOpenStream = \account -> do
+        result <- Yamux.openStreamWithAccount yamuxSess account
         case result of
-          Right stream -> yamuxStreamToStreamIO stream
+          Right stream -> yamuxStreamToStreamIO account stream
           Left err -> fail $ "muxOpenStream: " <> show err
     , muxAcceptStream = do
         -- Fail the accept as soon as the receive loop dies (remote
@@ -322,7 +403,8 @@ yamuxToMuxerSession yamuxSess closeTransport = do
         result <- race (waitCatch recvLoopA) (Yamux.acceptStream yamuxSess)
         case result of
           Left _ -> fail "muxAcceptStream: session terminated"
-          Right (Right stream) -> yamuxStreamToStreamIO stream
+          Right (Right stream) ->
+            yamuxStreamToStreamIO (ysMemoryAccount stream) stream
           Right (Left err) -> fail $ "muxAcceptStream: " <> show err
     , muxClose = do
         -- Queue GoAway, give the send loop a bounded window to flush
@@ -340,39 +422,40 @@ yamuxToMuxerSession yamuxSess closeTransport = do
 -- | Convert a YamuxStream to StreamIO with a read buffer.
 -- Yamux delivers data in chunks via streamRead; an IORef buffer holds
 -- the bytes a byte- or chunk-level read did not consume.
-yamuxStreamToStreamIO :: YamuxStream -> IO StreamIO
-yamuxStreamToStreamIO yamuxStream = do
+yamuxStreamToStreamIO :: MemoryAccount -> YamuxStream -> IO StreamIO
+yamuxStreamToStreamIO account yamuxStream = do
   readBuf <- newIORef BS.empty
-  let -- Buffered bytes if any, otherwise the next yamux chunk.
-      nextChunk = do
-        buf <- readIORef readBuf
-        if BS.null buf
-          then do
-            result <- streamRead yamuxStream
-            case result of
-              Left err -> fail $ "yamuxStreamRead: " <> show err
-              Right chunk
-                | BS.null chunk -> fail "yamuxStreamRead: empty chunk"
-                | otherwise -> pure chunk
-          else pure buf
+  let readChunk n = mask_ $ do
+        buffered <- readIORef readBuf
+        chunk <- if BS.null buffered
+          then nextRetainedChunk
+          else pure buffered
+        let (front, rest) = BS.splitAt n chunk
+        writeIORef readBuf rest
+        releaseMemory account (BS.length front)
+        pure front
+      nextRetainedChunk = do
+        result <- streamReadRetained yamuxStream
+        case result of
+          Left err -> fail $ "yamuxStreamRead: " <> show err
+          Right chunk
+            | BS.null chunk -> fail "yamuxStreamRead: empty chunk"
+            | otherwise -> pure chunk
+      releaseBuffered = mask_ $ do
+        buffered <- readIORef readBuf
+        writeIORef readBuf BS.empty
+        releaseMemory account (BS.length buffered)
   pure StreamIO
     { streamWrite = \bs -> do
         result <- YS.streamWrite yamuxStream bs
         case result of
           Right () -> pure ()
           Left err -> fail $ "yamuxStreamWrite: " <> show err
-    , streamReadByte = do
-        chunk <- nextChunk
-        writeIORef readBuf (BS.tail chunk)
-        pure (BS.head chunk)
-    , streamReadChunk = \n -> do
-        chunk <- nextChunk
-        let (front, rest) = BS.splitAt n chunk
-        writeIORef readBuf rest
-        pure front
+    , streamReadByte = BS.head <$> readChunk 1
+    , streamReadChunk = readChunk
     , streamClose = do
-        _ <- YS.streamClose yamuxStream  -- Sends FIN flag
-        pure ()
+        _ <- YS.streamClose yamuxStream
+        releaseBuffered
     }
 
 -- | Upgrade a raw connection, taking every role from the direction.
@@ -383,18 +466,20 @@ yamuxStreamToStreamIO yamuxStream = do
 -- (@isServer := dir == network.DirInbound@ in its upgrader), which is
 -- what lets a TCP simultaneous connect flip roles: the peer that must
 -- act as the server passes 'Inbound' even though it called connect().
-upgradeAs :: Direction -> KeyPair -> RawConnection -> IO Connection
+upgradeAs :: ResourceManager -> Direction -> KeyPair -> RawConnection -> IO Connection
 upgradeAs = upgradeAsWithConfig defaultYamuxConfig
 
 -- | Like 'upgradeAs', with an explicit Yamux configuration. A native
 -- multiplexer (QUIC) does not run Yamux, so the configuration is unused there.
-upgradeAsWithConfig :: YamuxConfig -> Direction -> KeyPair -> RawConnection -> IO Connection
-upgradeAsWithConfig yamuxConfig dir identityKP rawConn = case rcEndpoint rawConn of
-  ByteStreamEndpoint rawIO -> upgradeByteStream yamuxConfig dir identityKP rawConn rawIO
-  NativeMuxerEndpoint native -> nativeToConnection dir rawConn native
+upgradeAsWithConfig :: YamuxConfig -> ResourceManager -> Direction -> KeyPair -> RawConnection -> IO Connection
+upgradeAsWithConfig yamuxConfig rm dir identityKP rawConn = case rcEndpoint rawConn of
+  ByteStreamEndpoint rawIO -> upgradeByteStream yamuxConfig rm dir identityKP rawConn rawIO
+  NativeMuxerEndpoint native -> nativeToConnection rm dir rawConn native
 
-upgradeByteStream :: YamuxConfig -> Direction -> KeyPair -> RawConnection -> StreamIO -> IO Connection
-upgradeByteStream yamuxConfig dir identityKP rawConn rawIO = do
+upgradeByteStream
+  :: YamuxConfig -> ResourceManager -> Direction -> KeyPair -> RawConnection -> StreamIO
+  -> IO Connection
+upgradeByteStream yamuxConfig rm dir identityKP rawConn rawIO = do
   let isServer = dir == Inbound
       negotiate = if isServer then negotiateResponder else negotiateInitiator
       role = if isServer then "upgradeInbound" else "upgradeOutbound"
@@ -409,43 +494,60 @@ upgradeByteStream yamuxConfig dir identityKP rawConn rawIO = do
   (noiseSess, HandshakeResult remotePeerId _remotePK) <-
     performStreamHandshake identityKP dir rawIO
 
-  -- Step 3: Create encrypted StreamIO
-  sendRef <- newIORef noiseSess
-  recvRef <- newIORef noiseSess
-  bufRef  <- newIORef BS.empty
-  let encryptedIO = noiseSessionToStreamIO sendRef recvRef bufRef rawIO
+  connScope <- acquireConnectionScope rm remotePeerId dir
+  finishByteStreamUpgrade connScope noiseSess remotePeerId isServer negotiate role
+    `onException` atomically (releaseConnection rm connScope)
+  where
+    finishByteStreamUpgrade connScope noiseSess remotePeerId isServer negotiate role = do
+      sendRef <- newIORef noiseSess
+      recvRef <- newIORef noiseSess
+      bufRef <- newIORef BS.empty
+      let connectionMemory = scopeMemoryAccount rm connScope
+          encryptedIO = noiseSessionToManagedStreamIO
+            connectionMemory sendRef recvRef bufRef rawIO
+      muxResult <- negotiate encryptedIO ["/yamux/1.0.0"]
+      case muxResult of
+        Accepted _ -> pure ()
+        NoProtocol -> fail (role <> ": /yamux/1.0.0 negotiation failed")
+      let yamuxWrite = streamWrite encryptedIO
+          yamuxRead n = readExact encryptedIO n
+          closeOwnedTransport = rcClose rawConn
+            `finally` atomically (releaseConnection rm connScope)
+      yamuxSess <- newManagedSessionWithConfig yamuxConfig
+        (if isServer then RoleServer else RoleClient)
+        connectionMemory
+        (newStreamMemoryAccount rm connScope Inbound)
+        (newStreamMemoryAccount rm connScope Outbound)
+        yamuxWrite
+        yamuxRead
+      muxer <- yamuxToMuxerSession yamuxSess closeOwnedTransport
+      stateVar <- newTVarIO ConnOpen
+      pure Connection
+        { connPeerId = remotePeerId
+        , connDirection = dir
+        , connLocalAddr = rcLocalAddr rawConn
+        , connRemoteAddr = rcRemoteAddr rawConn
+        , connSecurity = "/noise"
+        , connMuxer = "/yamux/1.0.0"
+        , connSession = muxer
+        , connState = stateVar
+        , connResourceScope = connScope
+        }
 
-  -- Step 4: multistream-select -> "/yamux/1.0.0" (over encrypted channel)
-  muxResult <- negotiate encryptedIO ["/yamux/1.0.0"]
-  case muxResult of
-    Accepted _ -> pure ()
-    NoProtocol -> fail (role <> ": /yamux/1.0.0 negotiation failed")
-
-  -- Step 5: Initialize Yamux session (client = odd IDs, server = even)
-  let yamuxWrite = streamWrite encryptedIO
-      yamuxRead  = \n -> readExact encryptedIO n
-  yamuxSess <- newSessionWithConfig yamuxConfig (if isServer then RoleServer else RoleClient) yamuxWrite yamuxRead
-  muxer <- yamuxToMuxerSession yamuxSess (rcClose rawConn)
-
+nativeToConnection
+  :: ResourceManager -> Direction -> RawConnection -> NativeMuxer
+  -> IO Connection
+nativeToConnection rm dir rawConn native = do
+  connScope <- acquireConnectionScope rm (nativePeerId native) dir
   stateVar <- newTVarIO ConnOpen
-  pure Connection
-    { connPeerId     = remotePeerId
-    , connDirection  = dir
-    , connLocalAddr  = rcLocalAddr rawConn
-    , connRemoteAddr = rcRemoteAddr rawConn
-    , connSecurity   = "/noise"
-    , connMuxer      = "/yamux/1.0.0"
-    , connSession    = muxer
-    , connState      = stateVar
-    }
-
-nativeToConnection :: Direction -> RawConnection -> NativeMuxer -> IO Connection
-nativeToConnection dir rawConn native = do
-  stateVar <- newTVarIO ConnOpen
-  let muxer = MuxerSession
-        { muxOpenStream = nativeOpenStream native
-        , muxAcceptStream = nativeAcceptStream native
-        , muxClose = nativeClose native
+  let closeOwnedMuxer = nativeClose native
+        `finally` atomically (releaseConnection rm connScope)
+      muxer = MuxerSession
+        { muxOpenStream = \account ->
+            openNativeStream account (nativeOpenStream native)
+        , muxAcceptStream = reserveAndOpenNativeStream
+            rm connScope Inbound (nativeAcceptStream native)
+        , muxClose = closeOwnedMuxer
         }
   pure Connection
     { connPeerId = nativePeerId native
@@ -456,12 +558,40 @@ nativeToConnection dir rawConn native = do
     , connMuxer = nativeMuxerProtocol native
     , connSession = muxer
     , connState = stateVar
+    , connResourceScope = connScope
     }
 
+openNativeStream :: MemoryAccount -> IO StreamIO -> IO StreamIO
+openNativeStream account open = do
+  stream <- open `onException` atomically (maClose account)
+  pure stream
+    { streamClose = streamClose stream `finally` atomically (maClose account)
+    }
+
+reserveAndOpenNativeStream
+  :: ResourceManager -> ResourceScope -> Direction -> IO StreamIO
+  -> IO StreamIO
+reserveAndOpenNativeStream rm connection direction open = do
+  streamScope <- atomically (reserveStream rm connection direction)
+    >>= either throwIO pure
+  openNativeStream (scopeMemoryAccount rm streamScope) open
+
+newStreamMemoryAccount
+  :: ResourceManager -> ResourceScope -> Direction
+  -> STM (Either ResourceError MemoryAccount)
+newStreamMemoryAccount rm connection direction = do
+  reserved <- reserveStream rm connection direction
+  pure $ scopeMemoryAccount rm <$> reserved
+
+acquireConnectionScope
+  :: ResourceManager -> PeerId -> Direction -> IO ResourceScope
+acquireConnectionScope rm pid direction =
+  atomically (reserveConnection rm pid direction) >>= either throwIO pure
+
 -- | Upgrade an outbound (dialer) raw connection.
-upgradeOutbound :: KeyPair -> RawConnection -> IO Connection
-upgradeOutbound = upgradeAs Outbound
+upgradeOutbound :: ResourceManager -> KeyPair -> RawConnection -> IO Connection
+upgradeOutbound rm = upgradeAs rm Outbound
 
 -- | Upgrade an inbound (listener) raw connection.
-upgradeInbound :: KeyPair -> RawConnection -> IO Connection
-upgradeInbound = upgradeAs Inbound
+upgradeInbound :: ResourceManager -> KeyPair -> RawConnection -> IO Connection
+upgradeInbound rm = upgradeAs rm Inbound

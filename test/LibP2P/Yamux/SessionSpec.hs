@@ -8,10 +8,33 @@ import qualified Data.ByteString as BS
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Word (Word32)
 import System.Timeout (timeout)
+import LibP2P.Crypto.PeerId (PeerId (..))
+import LibP2P.Switch.ResourceManager
+  ( DefaultLimits (..)
+  , Direction (..)
+  , MemoryAccount (..)
+  , ResourceError
+  , ResourceLimits (..)
+  , ResourceManager
+  , ResourceScope
+  , ResourceUsage (..)
+  , newResourceManager
+  , noLimits
+  , reserveConnection
+  , reserveStream
+  , rsUsage
+  , scopeMemoryAccount
+  )
 import LibP2P.Yamux.Frame
 import LibP2P.Yamux.HostilePeer
 import LibP2P.Yamux.Session
-import LibP2P.Yamux.Stream (streamClose, streamRead, streamReset, streamWrite)
+import LibP2P.Yamux.Stream
+  ( streamClose
+  , streamRead
+  , streamReadRetained
+  , streamReset
+  , streamWrite
+  )
 import LibP2P.Yamux.Types
 import Test.Hspec
 
@@ -27,6 +50,18 @@ mkMemoryTransportPair = do
   let writeTo q bs = mapM_ (atomically . writeTQueue q) (BS.unpack bs)
       readFrom q n = BS.pack <$> mapM (const (atomically (readTQueue q))) [1 .. n]
   pure ((writeTo qAtoB, readFrom qBtoA), (writeTo qBtoA, readFrom qAtoB))
+
+reserveTestConnection
+  :: ResourceManager -> PeerId -> Direction -> IO ResourceScope
+reserveTestConnection rm pid direction =
+  atomically (reserveConnection rm pid direction) >>= either (fail . show) pure
+
+newAccount
+  :: ResourceManager -> ResourceScope -> Direction
+  -> STM (Either ResourceError MemoryAccount)
+newAccount rm connection direction = do
+  reserved <- reserveStream rm connection direction
+  pure $ scopeMemoryAccount rm <$> reserved
 
 -- | Create a session pair and run action with all background loops running.
 withSessionPair :: ((YamuxSession, YamuxSession) -> IO a) -> IO a
@@ -122,6 +157,119 @@ spec = do
         Right serverStream <- acceptStream server
         Right received <- streamRead serverStream
         received `shouldBe` "early"
+
+  describe "Resource memory accounting" $ do
+    it "should account queued payload bytes until the application reads them" $ do
+      let memoryLimits = noLimits {rlMaxMemory = Just 4096}
+          defaults = DefaultLimits
+            { dlSystemLimits = memoryLimits
+            , dlPeerLimits = memoryLimits
+            , dlConnectionLimits = memoryLimits
+            , dlStreamLimits = memoryLimits
+            }
+      rm <- newResourceManager defaults
+      clientConn <- reserveTestConnection rm (PeerId "yamux-client") Outbound
+      serverConn <- reserveTestConnection rm (PeerId "yamux-server") Inbound
+      ((writeA, readA), (writeB, readB)) <- mkMemoryTransportPair
+      client <- newManagedSession RoleClient
+        (scopeMemoryAccount rm clientConn)
+        (newAccount rm clientConn Inbound)
+        (newAccount rm clientConn Outbound)
+        writeA readA
+      server <- newManagedSession RoleServer
+        (scopeMemoryAccount rm serverConn)
+        (newAccount rm serverConn Inbound)
+        (newAccount rm serverConn Outbound)
+        writeB readB
+      withAsync (sendLoop client) $ \_ ->
+        withAsync (recvLoop client) $ \_ ->
+          withAsync (sendLoop server) $ \_ ->
+            withAsync (recvLoop server) $ \_ -> do
+              (clientResult, serverResult) <- concurrently
+                (openStream client) (acceptStream server)
+              clientStream <- either (fail . show) pure clientResult
+              serverStream <- either (fail . show) pure serverResult
+              let payload = BS.replicate 128 0x5a
+              streamWrite clientStream payload `shouldReturn` Right ()
+              queued <- timeout 1000000 $ atomically $ do
+                usage <- readTVar (rsUsage serverConn)
+                check (ruMemory usage == BS.length payload)
+              queued `shouldBe` Just ()
+              streamRead serverStream `shouldReturn` Right payload
+              ruMemory <$> atomically (readTVar (rsUsage serverConn))
+                `shouldReturn` 0
+
+    it "should retain payload accounting after both sides half-close" $ do
+      let limits = noLimits {rlMaxMemory = Just 4096}
+          defaults = DefaultLimits limits limits limits limits
+      rm <- newResourceManager defaults
+      clientConn <- reserveTestConnection rm (PeerId "closing-client") Outbound
+      serverConn <- reserveTestConnection rm (PeerId "closing-server") Inbound
+      ((writeA, readA), (writeB, readB)) <- mkMemoryTransportPair
+      client <- newManagedSession RoleClient
+        (scopeMemoryAccount rm clientConn)
+        (newAccount rm clientConn Inbound)
+        (newAccount rm clientConn Outbound)
+        writeA readA
+      server <- newManagedSession RoleServer
+        (scopeMemoryAccount rm serverConn)
+        (newAccount rm serverConn Inbound)
+        (newAccount rm serverConn Outbound)
+        writeB readB
+      withAsync (sendLoop client) $ \_ ->
+        withAsync (recvLoop client) $ \_ ->
+          withAsync (sendLoop server) $ \_ ->
+            withAsync (recvLoop server) $ \_ -> do
+              (Right clientStream, Right serverStream) <- concurrently
+                (openStream client) (acceptStream server)
+              streamClose clientStream `shouldReturn` Right ()
+              atomically $ readTVar (ysState serverStream) >>= check . (== StreamRemoteClose)
+              let payload = BS.replicate 128 0x5a
+              streamWrite serverStream payload `shouldReturn` Right ()
+              streamClose serverStream `shouldReturn` Right ()
+              atomically $ readTVar (ysState clientStream) >>= check . (== StreamClosed)
+
+              streamReadRetained clientStream `shouldReturn` Right payload
+              ruMemory <$> atomically (readTVar (rsUsage clientConn))
+                `shouldReturn` BS.length payload
+              atomically $ maRelease (ysMemoryAccount clientStream) (BS.length payload)
+              ruMemory <$> atomically (readTVar (rsUsage clientConn))
+                `shouldReturn` 0
+
+    it "should terminate the session without buffering when a payload exceeds the memory limit" $ do
+      let parentLimits = noLimits {rlMaxMemory = Just 4096}
+          defaults = DefaultLimits
+            { dlSystemLimits = parentLimits
+            , dlPeerLimits = parentLimits
+            , dlConnectionLimits = parentLimits
+            , dlStreamLimits = noLimits {rlMaxMemory = Just 64}
+            }
+      rm <- newResourceManager defaults
+      serverConn <- reserveTestConnection rm (PeerId "limited-server") Inbound
+      ((writeA, readA), (writeB, readB)) <- mkMemoryTransportPair
+      client <- newSession RoleClient writeA readA
+      server <- newManagedSession RoleServer
+        (scopeMemoryAccount rm serverConn)
+        (newAccount rm serverConn Inbound)
+        (newAccount rm serverConn Outbound)
+        writeB readB
+      withAsync (sendLoop client) $ \_ ->
+        withAsync (recvLoop client) $ \_ ->
+          withAsync (sendLoop server) $ \_ ->
+            withAsync (recvLoop server) $ \_ -> do
+              (clientResult, serverResult) <- concurrently
+                (openStream client) (acceptStream server)
+              clientStream <- either (fail . show) pure clientResult
+              serverStream <- either (fail . show) pure serverResult
+              streamWrite clientStream (BS.replicate 128 0x5a)
+                `shouldReturn` Right ()
+              stopped <- timeout 1000000 $ atomically $ do
+                shutdown <- readTVar (ysessShutdown server)
+                check shutdown
+              stopped `shouldBe` Just ()
+              streamRead serverStream `shouldReturn` Left YamuxStreamReset
+              ruMemory <$> atomically (readTVar (rsUsage serverConn))
+                `shouldReturn` 0
 
   describe "Stream rejection" $ do
     it "RST response to SYN -> streamWrite returns Reset" $ do

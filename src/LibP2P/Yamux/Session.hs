@@ -10,8 +10,11 @@
 module LibP2P.Yamux.Session
   ( newSession
   , newSessionWithConfig
+  , newManagedSession
+  , newManagedSessionWithConfig
   , closeSession
   , openStream
+  , openStreamWithAccount
   , acceptStream
   , ping
   , sendGoAway
@@ -23,13 +26,20 @@ module LibP2P.Yamux.Session
 
 import Control.Concurrent.Async (race)
 import Control.Concurrent.STM
-import Control.Exception (bracket, finally)
+import Control.Exception (bracket, finally, onException)
+import Control.Monad (unless)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe, isJust)
 import Data.Word (Word32)
+import LibP2P.Switch.ResourceManager
+  ( MemoryAccount (..)
+  , ResourceError
+  , unlimitedMemoryAccount
+  )
 import LibP2P.Yamux.Frame
+import LibP2P.Yamux.Stream (releaseReceiveBuffer)
 import LibP2P.Yamux.Types
 import Numeric.Natural (Natural)
 import System.Timeout (timeout)
@@ -47,7 +57,33 @@ newSession = newSessionWithConfig defaultYamuxConfig
 
 -- | Like 'newSession', with an explicit configuration.
 newSessionWithConfig :: YamuxConfig -> SessionRole -> (ByteString -> IO ()) -> (Int -> IO ByteString) -> IO YamuxSession
-newSessionWithConfig config role writeFn readFn = do
+newSessionWithConfig config role =
+  newManagedSessionWithConfig config role unlimitedMemoryAccount
+    (pure (Right unlimitedMemoryAccount))
+    (pure (Right unlimitedMemoryAccount))
+
+-- | Create a session whose connection and inbound streams own memory accounts.
+newManagedSession
+  :: SessionRole
+  -> MemoryAccount
+  -> STM (Either ResourceError MemoryAccount)
+  -> STM (Either ResourceError MemoryAccount)
+  -> (ByteString -> IO ())
+  -> (Int -> IO ByteString)
+  -> IO YamuxSession
+newManagedSession = newManagedSessionWithConfig defaultYamuxConfig
+
+-- | Like 'newManagedSession', with an explicit configuration.
+newManagedSessionWithConfig
+  :: YamuxConfig
+  -> SessionRole
+  -> MemoryAccount
+  -> STM (Either ResourceError MemoryAccount)
+  -> STM (Either ResourceError MemoryAccount)
+  -> (ByteString -> IO ())
+  -> (Int -> IO ByteString)
+  -> IO YamuxSession
+newManagedSessionWithConfig config role connectionMemory inboundMemory outboundMemory writeFn readFn = do
   let startId = case role of
         RoleClient -> 1
         RoleServer -> 2
@@ -70,6 +106,9 @@ newSessionWithConfig config role writeFn readFn = do
       , ysessStreams = streams
       , ysessAcceptCh = acceptCh
       , ysessSendCh = sendCh
+      , ysessConnectionMemory = connectionMemory
+      , ysessInboundMemory = inboundMemory
+      , ysessOutboundMemory = outboundMemory
       , ysessShutdown = shutdown
       , ysessRemoteGoAway = remoteGoAway
       , ysessPings = pings
@@ -90,6 +129,18 @@ closeSession sess = sendGoAway sess GoAwayNormal
 -- the received code after a remote GoAway.
 openStream :: YamuxSession -> IO (Either YamuxError YamuxStream)
 openStream sess = do
+  account <- atomically $ ysessOutboundMemory sess
+  case account of
+    Left err -> pure (Left (YamuxResourceLimit err))
+    Right value -> do
+      result <- openStreamWithAccount sess value
+      case result of
+        Left err -> atomically (maClose value) >> pure (Left err)
+        Right stream -> pure (Right stream)
+
+openStreamWithAccount
+  :: YamuxSession -> MemoryAccount -> IO (Either YamuxError YamuxStream)
+openStreamWithAccount sess account = do
   -- Check shutdown state
   status <- atomically $ do
     shut <- readTVar (ysessShutdown sess)
@@ -107,7 +158,7 @@ openStream sess = do
         writeTVar (ysessNextStreamId sess) (nextId + 2)
         pure nextId
       -- Create stream in SYNSent state
-      stream <- newStream sess sid StreamSYNSent
+      stream <- newStream sess sid StreamSYNSent account
       -- Register stream
       atomically $ modifyTVar' (ysessStreams sess) (Map.insert sid stream)
       -- Send SYN frame (Data frame with SYN flag, no payload)
@@ -290,12 +341,30 @@ recvLoop sess = go `finally` failSession sess
 failSession :: YamuxSession -> IO ()
 failSession sess = atomically $ do
   writeTVar (ysessShutdown sess) True
+  releaseQueuedPayloads sess
   streams <- readTVar (ysessStreams sess)
-  mapM_ (\s -> writeTVar (ysState s) StreamReset) (Map.elems streams)
+  mapM_ resetAccount (Map.elems streams)
   writeTVar (ysessStreams sess) Map.empty
   pings <- readTVar (ysessPings sess)
   mapM_ (\w -> tryPutTMVar w (Left YamuxSessionShutdown)) (Map.elems pings)
   writeTVar (ysessPings sess) Map.empty
+  where
+    resetAccount stream = do
+      writeTVar (ysState stream) StreamReset
+      releaseReceiveBuffer stream
+      maClose (ysMemoryAccount stream)
+
+releaseQueuedPayloads :: YamuxSession -> STM ()
+releaseQueuedPayloads sess = drain []
+  where
+    drain controlFrames = do
+      queued <- tryReadTQueue (ysessSendCh sess)
+      case queued of
+        Nothing -> mapM_ (writeTQueue (ysessSendCh sess)) (reverse controlFrames)
+        Just frame@(_, _, Nothing) -> drain (frame : controlFrames)
+        Just (_, payload, Just owner) -> do
+          maRelease owner (BS.length payload)
+          drain controlFrames
 
 -- | Dispatch a decoded frame to the appropriate handler.
 -- Returns False when a fatal protocol error occurred and the receive
@@ -328,29 +397,22 @@ handleDataFrame sess hdr = do
       -- window BEFORE reading the payload off the transport. A frame that
       -- overruns the window is a protocol error and must not cause the
       -- session to buffer attacker-controlled amounts of memory.
-      reserved <- reserveRecvWindow sess sid declaredLen
-      if not reserved
-        then do
-          sendGoAway sess GoAwayProtocol
-          pure False
-        else do
-          payload <-
-            if declaredLen > 0
-              then ysessRead sess (fromIntegral declaredLen)
-              else pure BS.empty
-          -- Handle ACK flag: transition SYNSent -> Established
+      reservation <- reserveIncomingPayload sess sid declaredLen
+      case reservation of
+        PayloadFlowViolation -> sendGoAway sess GoAwayProtocol >> pure False
+        PayloadMemoryLimit -> sendGoAway sess GoAwayInternal >> pure False
+        PayloadReserved account -> do
+          payload <- readPayload account declaredLen
           when (flagACK flags) $ handleAckFlag sess sid
-          -- Deliver payload to stream buffer (window already reserved)
-          when (BS.length payload > 0) $ do
-            mStream <- lookupStream sess sid
-            case mStream of
-              Just stream -> atomically $ writeTQueue (ysRecvBuf stream) payload
-              Nothing -> pure () -- unknown stream: discard
-          -- Handle FIN flag
+          deliverPayload sess sid account payload
           when (flagFIN flags) $ applyRemoteFin sess sid
-          -- Handle RST flag
           when (flagRST flags) $ applyRemoteRst sess sid
           pure True
+  where
+    readPayload account len
+      | len == 0 = pure BS.empty
+      | otherwise = ysessRead sess (fromIntegral len)
+          `onException` atomically (maRelease account (fromIntegral len))
 
 -- | Handle a WindowUpdate frame: update send window, manage stream
 -- lifecycle. Returns False on fatal protocol error.
@@ -396,19 +458,34 @@ lookupStream sess sid = Map.lookup sid <$> readTVarIO (ysessStreams sess)
 -- that is not a protocol error, so the session stays alive.
 acceptInboundSYN :: YamuxSession -> Word32 -> IO Bool
 acceptInboundSYN sess sid = do
-  valid <- atomically $ validateInboundSYN sess sid
-  if not valid
-    then pure False
-    else do
-      stream <- newStream sess sid StreamSYNReceived
+  prepared <- atomically $ prepareInboundAccount sess sid
+  case prepared of
+    Left () -> pure False
+    Right Nothing -> pure True
+    Right (Just account) -> do
+      stream <- newStream sess sid StreamSYNReceived account
       atomically $ do
-        full <- isFullTBQueue (ysessAcceptCh sess)
-        if full
-          then enqueueFrame sess (rstHeader sid) BS.empty
-          else do
-            modifyTVar' (ysessStreams sess) (Map.insert sid stream)
-            writeTBQueue (ysessAcceptCh sess) stream
+        modifyTVar' (ysessStreams sess) (Map.insert sid stream)
+        writeTBQueue (ysessAcceptCh sess) stream
       pure True
+
+prepareInboundAccount
+  :: YamuxSession -> Word32 -> STM (Either () (Maybe MemoryAccount))
+prepareInboundAccount sess sid = do
+  valid <- validateInboundSYN sess sid
+  if not valid
+    then pure (Left ())
+    else do
+      full <- isFullTBQueue (ysessAcceptCh sess)
+      if full
+        then reject
+        else do
+          account <- ysessInboundMemory sess
+          case account of
+            Left _ -> reject
+            Right value -> pure (Right (Just value))
+  where
+    reject = enqueueFrame sess (rstHeader sid) BS.empty >> pure (Right Nothing)
 
 -- | Data frame carrying only the RST flag for the given stream.
 rstHeader :: Word32 -> YamuxHeader
@@ -421,27 +498,45 @@ rstHeader sid =
     , yhLength = 0
     }
 
--- | Reserve receive window for a declared Data-frame length before the
--- payload is read off the transport. Returns False on a flow-control
--- violation (declared length exceeds the stream's receive window or the
--- absolute maxStreamWindowSize bound); the session must then terminate.
-reserveRecvWindow :: YamuxSession -> Word32 -> Word32 -> IO Bool
-reserveRecvWindow sess sid len
-  | len == 0 = pure True
-  | len > maxStreamWindowSize = pure False
+data PayloadReservation
+  = PayloadReserved !MemoryAccount
+  | PayloadFlowViolation
+  | PayloadMemoryLimit
+
+reserveIncomingPayload
+  :: YamuxSession -> Word32 -> Word32 -> IO PayloadReservation
+reserveIncomingPayload sess sid len
+  | len == 0 = pure (PayloadReserved (ysessConnectionMemory sess))
+  | len > maxStreamWindowSize = pure PayloadFlowViolation
   | otherwise = atomically $ do
       streams <- readTVar (ysessStreams sess)
       case Map.lookup sid streams of
-        -- Unknown stream: payload is read and discarded, bounded by the
-        -- maxStreamWindowSize check above (defence in depth)
-        Nothing -> pure True
-        Just stream -> do
-          w <- readTVar (ysRecvWindow stream)
-          if len > w
-            then pure False
-            else do
-              writeTVar (ysRecvWindow stream) (w - len)
-              pure True
+        Nothing -> reserveFor (ysessConnectionMemory sess) Nothing
+        Just stream -> reserveKnownStream stream
+  where
+    reserveKnownStream stream = do
+      window <- readTVar (ysRecvWindow stream)
+      if len > window
+        then pure PayloadFlowViolation
+        else reserveFor (ysMemoryAccount stream) (Just (ysRecvWindow stream, window))
+    reserveFor account window = do
+      result <- maReserve account (fromIntegral len)
+      case result of
+        Left _ -> pure PayloadMemoryLimit
+        Right () -> do
+          mapM_ (\(var, current) -> writeTVar var (current - len)) window
+          pure (PayloadReserved account)
+
+deliverPayload
+  :: YamuxSession -> Word32 -> MemoryAccount -> ByteString -> IO ()
+deliverPayload _ _ _ payload | BS.null payload = pure ()
+deliverPayload sess sid account payload = do
+  delivered <- atomically $ do
+    streams <- readTVar (ysessStreams sess)
+    case Map.lookup sid streams of
+      Just stream -> writeTQueue (ysRecvBuf stream) payload >> pure True
+      Nothing -> pure False
+  unless delivered $ atomically $ maRelease account (BS.length payload)
 
 -- | ACK flag: transition SYNSent -> Established.
 handleAckFlag :: YamuxSession -> Word32 -> IO ()
@@ -473,6 +568,7 @@ applyRemoteFin sess sid = do
           -- Both sides FIN'd: the stream is dead, reclaim its map slot
           writeTVar (ysState stream) StreamClosed
           modifyTVar' (ysessStreams sess) (Map.delete sid)
+          maClose (ysMemoryAccount stream)
         _ -> pure ()
     Nothing -> pure ()
 
@@ -486,6 +582,8 @@ applyRemoteRst sess sid = do
     Just stream -> atomically $ do
       writeTVar (ysState stream) StreamReset
       modifyTVar' (ysessStreams sess) (Map.delete sid)
+      releaseReceiveBuffer stream
+      maClose (ysMemoryAccount stream)
     Nothing -> pure ()
 
 -- | Handle a Ping frame (StreamID must be 0).
@@ -531,15 +629,21 @@ sendLoop :: YamuxSession -> IO ()
 sendLoop sess = go
   where
     go = do
-      (hdr, payload) <- atomically $ readTQueue (ysessSendCh sess)
-      ysessWrite sess (encodeHeader hdr)
-      when (BS.length payload > 0) $ ysessWrite sess payload
+      (hdr, payload, account) <- atomically $ readTQueue (ysessSendCh sess)
+      writeFrame hdr payload `finally` releasePayload account payload
       atomically $ modifyTVar' (ysessSentCount sess) (+ 1)
       go
+    writeFrame hdr payload = do
+      ysessWrite sess (encodeHeader hdr)
+      unless (BS.null payload) $ ysessWrite sess payload
+    releasePayload Nothing _ = pure ()
+    releasePayload (Just account) payload =
+      atomically $ maRelease account (BS.length payload)
 
 -- | Create a new YamuxStream with the given initial state.
-newStream :: YamuxSession -> Word32 -> StreamState -> IO YamuxStream
-newStream sess sid initState = do
+newStream
+  :: YamuxSession -> Word32 -> StreamState -> MemoryAccount -> IO YamuxStream
+newStream sess sid initState account = do
   stateVar <- newTVarIO initState
   sendWin <- newTVarIO initialWindowSize
   recvWin <- newTVarIO initialWindowSize
@@ -553,6 +657,7 @@ newStream sess sid initState = do
       , ysRecvWindow = recvWin
       , ysRecvBuf = recvBuf
       , ysSendNotify = sendNotify
+      , ysMemoryAccount = account
       , ysSession = sess
       }
 
