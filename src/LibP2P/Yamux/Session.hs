@@ -9,24 +9,29 @@
 --   sendLoop: dequeues from ysessSendCh, writes to transport
 module LibP2P.Yamux.Session
   ( newSession
+  , newSessionWithConfig
   , newManagedSession
+  , newManagedSessionWithConfig
   , closeSession
   , openStream
   , openStreamWithAccount
   , acceptStream
   , ping
   , sendGoAway
+  , keepaliveLoop
   , recvLoop
   , sendLoop
   , acceptBacklog
   ) where
 
+import Control.Concurrent.Async (race)
 import Control.Concurrent.STM
-import Control.Exception (finally, onException)
+import Control.Exception (bracket, finally, onException)
 import Control.Monad (unless)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
+import Data.Maybe (fromMaybe, isJust)
 import Data.Word (Word32)
 import LibP2P.Switch.ResourceManager
   ( MemoryAccount (..)
@@ -37,6 +42,7 @@ import LibP2P.Yamux.Frame
 import LibP2P.Yamux.Stream (releaseReceiveBuffer)
 import LibP2P.Yamux.Types
 import Numeric.Natural (Natural)
+import System.Timeout (timeout)
 
 -- | Maximum number of inbound streams buffered while the application
 -- is not accepting (go-yamux AcceptBacklog). The spec requires this
@@ -47,9 +53,14 @@ acceptBacklog = 256
 -- | Create a new Yamux session over a transport connection.
 -- Client uses odd stream IDs starting at 1, server uses even starting at 2.
 newSession :: SessionRole -> (ByteString -> IO ()) -> (Int -> IO ByteString) -> IO YamuxSession
-newSession role = newManagedSession role unlimitedMemoryAccount
-  (pure (Right unlimitedMemoryAccount))
-  (pure (Right unlimitedMemoryAccount))
+newSession = newSessionWithConfig defaultYamuxConfig
+
+-- | Like 'newSession', with an explicit configuration.
+newSessionWithConfig :: YamuxConfig -> SessionRole -> (ByteString -> IO ()) -> (Int -> IO ByteString) -> IO YamuxSession
+newSessionWithConfig config role =
+  newManagedSessionWithConfig config role unlimitedMemoryAccount
+    (pure (Right unlimitedMemoryAccount))
+    (pure (Right unlimitedMemoryAccount))
 
 -- | Create a session whose connection and inbound streams own memory accounts.
 newManagedSession
@@ -60,7 +71,19 @@ newManagedSession
   -> (ByteString -> IO ())
   -> (Int -> IO ByteString)
   -> IO YamuxSession
-newManagedSession role connectionMemory inboundMemory outboundMemory writeFn readFn = do
+newManagedSession = newManagedSessionWithConfig defaultYamuxConfig
+
+-- | Like 'newManagedSession', with an explicit configuration.
+newManagedSessionWithConfig
+  :: YamuxConfig
+  -> SessionRole
+  -> MemoryAccount
+  -> STM (Either ResourceError MemoryAccount)
+  -> STM (Either ResourceError MemoryAccount)
+  -> (ByteString -> IO ())
+  -> (Int -> IO ByteString)
+  -> IO YamuxSession
+newManagedSessionWithConfig config role connectionMemory inboundMemory outboundMemory writeFn readFn = do
   let startId = case role of
         RoleClient -> 1
         RoleServer -> 2
@@ -77,7 +100,8 @@ newManagedSession role connectionMemory inboundMemory outboundMemory writeFn rea
   recvCount <- newTVarIO 0
   pure
     YamuxSession
-      { ysessRole = role
+      { ysessConfig = config
+      , ysessRole = role
       , ysessNextStreamId = nextId
       , ysessStreams = streams
       , ysessAcceptCh = acceptCh
@@ -175,15 +199,13 @@ acceptStream sess = do
 
 -- | Send a Ping and wait for the ACK response.
 -- Ping uses StreamID 0 and the Length field carries an opaque value.
+--
+-- Fails with YamuxPingTimeout when the SYN is not written within
+-- 'ycPingTimeout', or when its ACK does not arrive within another
+-- 'ycPingTimeout' after the write. The former is just a fallback 
+-- to ensure that the operation doesn't hang indefinitely.
 ping :: YamuxSession -> IO (Either YamuxError ())
-ping sess = do
-  (pingId, waiter) <- atomically $ do
-    pid <- readTVar (ysessNextPingId sess)
-    writeTVar (ysessNextPingId sess) (pid + 1)
-    w <- newEmptyTMVar
-    modifyTVar' (ysessPings sess) (Map.insert pid w)
-    pure (pid, w)
-  -- Send Ping SYN frame
+ping sess = bracket register unregister $ \(pingId, waiter) -> do
   let hdr =
         YamuxHeader
           { yhVersion = 0
@@ -192,12 +214,79 @@ ping sess = do
           , yhStreamId = 0
           , yhLength = pingId
           }
-  atomically $ enqueueFrame sess hdr BS.empty
-  -- Wait for ACK (or a session-failure notification)
-  result <- atomically $ takeTMVar waiter
-  -- Cleanup
-  atomically $ modifyTVar' (ysessPings sess) (Map.delete pingId)
-  pure result
+  frame <- atomically $ enqueueFrameNumbered sess hdr BS.empty
+  -- Wait for the SYN to be written.
+  written <- timeout timeoutUs $ atomically $
+    (Just <$> takeTMVar waiter) `orElse` (Nothing <$ awaitFrameWritten sess frame)
+  case written of
+    Nothing -> pure (Left YamuxPingTimeout)
+    Just (Just result) -> pure result
+    Just Nothing ->
+      -- Written: wait for the ACK (or a session-failure notification)
+      fromMaybe (Left YamuxPingTimeout)
+        <$> timeout timeoutUs (atomically (takeTMVar waiter))
+  where
+    timeoutUs = microsToInt (ycPingTimeout (ysessConfig sess))
+    register = atomically $ do
+      pid <- readTVar (ysessNextPingId sess)
+      writeTVar (ysessNextPingId sess) (pid + 1)
+      w <- newEmptyTMVar
+      modifyTVar' (ysessPings sess) (Map.insert pid w)
+      pure (pid, w)
+    unregister (pingId, _) =
+      atomically $ modifyTVar' (ysessPings sess) (Map.delete pingId)
+
+-- | Keepalive loop: once the 'ycKeepAlive' interval passes without a
+-- frame from the peer, send a Ping (spec.md, Type Field: a Ping "can
+-- also be used to heart-beat and do keep-alives over TCP").
+--
+-- Returns @Right ()@ without pinging when keepalive is disabled, and as
+-- soon as a local or remote GoAway is in effect (closeSession,
+-- sendGoAway, failSession, or a GoAway from the peer), including while
+-- a Ping is waiting for its ACK.
+--
+-- Returns @Left@ when a Ping fails. The session is left as it is: the
+-- caller must stop recvLoop, which tears the session down.
+keepaliveLoop :: YamuxSession -> IO (Either YamuxError ())
+keepaliveLoop sess = case ycKeepAlive (ysessConfig sess) of
+  Nothing -> pure (Right ())
+  Just interval -> go (microsToInt interval)
+  where
+    goingAway = do
+      shut <- readTVar (ysessShutdown sess)
+      remote <- readTVar (ysessRemoteGoAway sess)
+      pure (shut || isJust remote)
+
+    go intervalUs = do
+      seen <- readTVarIO (ysessRecvCount sess)
+      -- Wake on the interval, on a received frame, or on GoAway,
+      -- whichever comes first.
+      woke <- timeout intervalUs $ atomically $ do
+        stopping <- goingAway
+        count <- readTVar (ysessRecvCount sess)
+        check (stopping || count /= seen)
+        pure stopping
+      case woke of
+        Just True -> pure (Right ())
+        -- A frame arrived: the peer is alive, restart the timer
+        Just False -> go intervalUs
+        Nothing -> do
+          -- A GoAway may have landed just as the interval ran out
+          stopping <- atomically goingAway
+          if stopping
+            then pure (Right ())
+            else do
+              -- Ping, but give up on it as soon as a GoAway is in effect
+              result <- race (atomically (goingAway >>= check)) (ping sess)
+              case result of
+                -- A GoAway during the Ping
+                Left () -> pure (Right ()) 
+                -- ACK received: the peer is alive, restart the timer
+                Right (Right ()) -> go intervalUs
+                -- The session was torn down while pinging: nothing to keep alive
+                Right (Left YamuxSessionShutdown) -> pure (Right ())
+                -- No ACK (or SYN not written) in time: the peer is unresponsive
+                Right (Left err) -> pure (Left err)
 
 -- | Send a GoAway frame with the specified error code.
 -- Sets ysessShutdown to True so no new streams can be opened.
