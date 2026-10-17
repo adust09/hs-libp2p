@@ -21,6 +21,7 @@ module LibP2P.Yamux.Session
   , acceptBacklog
   ) where
 
+import Control.Concurrent.Async (race)
 import Control.Concurrent.STM
 import Control.Exception (bracket, finally)
 import Data.ByteString (ByteString)
@@ -190,7 +191,8 @@ ping sess = bracket register unregister $ \(pingId, waiter) -> do
 --
 -- Returns @Right ()@ without pinging when keepalive is disabled, and as
 -- soon as a local or remote GoAway is in effect (closeSession,
--- sendGoAway, failSession, or a GoAway from the peer).
+-- sendGoAway, failSession, or a GoAway from the peer), including while
+-- a Ping is waiting for its ACK.
 --
 -- Returns @Left@ when a Ping fails. The session is left as it is: the
 -- caller must stop recvLoop, which tears the session down.
@@ -225,11 +227,17 @@ keepaliveLoop sess
           if stopping
             then pure (Right ())
             else do
-              result <- ping sess
+              -- Ping, but give up on it as soon as a GoAway is in effect
+              result <- race (atomically (goingAway >>= check)) (ping sess)
               case result of
-                Right () -> go
-                Left YamuxSessionShutdown -> pure (Right ())
-                Left err -> pure (Left err)
+                -- A GoAway during the Ping
+                Left () -> pure (Right ()) 
+                -- ACK received: the peer is alive, restart the timer
+                Right (Right ()) -> go
+                -- The session was torn down while pinging: nothing to keep alive
+                Right (Left YamuxSessionShutdown) -> pure (Right ())
+                -- No ACK (or SYN not written) in time: the peer is unresponsive
+                Right (Left err) -> pure (Left err)
 
 -- | Send a GoAway frame with the specified error code.
 -- Sets ysessShutdown to True so no new streams can be opened.

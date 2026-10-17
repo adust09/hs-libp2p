@@ -278,6 +278,38 @@ spec = do
           keepaliveRes `shouldBe` Just (Right ())
           expectNoFrame hp
 
+    -- A GoAway landing while a Ping is in flight must stop the loop
+    -- cleanly: the peer may never ACK, and a YamuxPingTimeout would
+    -- make the caller tear down streams that should be left to drain.
+    -- The wait is shorter than ycPingTimeoutMicros, so the loop has to
+    -- stop on the GoAway itself rather than on the ping timing out.
+    it "stops cleanly when the peer sends a GoAway after the Ping SYN" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp ->
+        withAsync (keepaliveLoop (hpSession hp)) $ \keepaliveA -> do
+          (syn, _) <- expectFrame hp
+          yhType syn `shouldBe` FramePing
+          flagSYN (yhFlags syn) `shouldBe` True
+          -- Never ACK the Ping
+          injectFrame hp (YamuxHeader 0 FrameGoAway defaultFlags 0 0) BS.empty
+          awaitRemoteGoAway (hpSession hp) GoAwayNormal
+          keepaliveRes <- timeout 200000 (wait keepaliveA)
+          keepaliveRes `shouldBe` Just (Right ())
+          expectNoFrame hp
+
+    it "stops cleanly when closeSession sends a GoAway after the Ping SYN" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp ->
+        withAsync (keepaliveLoop (hpSession hp)) $ \keepaliveA -> do
+          (syn, _) <- expectFrame hp
+          yhType syn `shouldBe` FramePing
+          flagSYN (yhFlags syn) `shouldBe` True
+          -- Never ACK the Ping
+          closeSession (hpSession hp)
+          keepaliveRes <- timeout 200000 (wait keepaliveA)
+          keepaliveRes `shouldBe` Just (Right ())
+          (goAway, _) <- expectFrame hp
+          yhType goAway `shouldBe` FrameGoAway
+          expectNoFrame hp
+
     it "does nothing when keepalive is disabled" $
       withHostilePeerWithConfig keepaliveConfig {ycEnableKeepAlive = False} RoleClient $ \hp -> do
         keepaliveRes <- timeout 1000000 (keepaliveLoop (hpSession hp))
