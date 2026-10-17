@@ -150,8 +150,8 @@ acceptStream sess = do
 -- Ping uses StreamID 0 and the Length field carries an opaque value.
 --
 -- Fails with YamuxPingTimeout when the SYN is not written within
--- 'ycPingTimeoutMicros', or when its ACK does not arrive within another
--- 'ycPingTimeoutMicros' after the write. The former is just a fallback 
+-- 'ycPingTimeout', or when its ACK does not arrive within another
+-- 'ycPingTimeout' after the write. The former is just a fallback 
 -- to ensure that the operation doesn't hang indefinitely.
 ping :: YamuxSession -> IO (Either YamuxError ())
 ping sess = bracket register unregister $ \(pingId, waiter) -> do
@@ -175,7 +175,7 @@ ping sess = bracket register unregister $ \(pingId, waiter) -> do
       fromMaybe (Left YamuxPingTimeout)
         <$> timeout timeoutUs (atomically (takeTMVar waiter))
   where
-    timeoutUs = ycPingTimeoutMicros (ysessConfig sess)
+    timeoutUs = microsToInt (ycPingTimeout (ysessConfig sess))
     register = atomically $ do
       pid <- readTVar (ysessNextPingId sess)
       writeTVar (ysessNextPingId sess) (pid + 1)
@@ -185,7 +185,7 @@ ping sess = bracket register unregister $ \(pingId, waiter) -> do
     unregister (pingId, _) =
       atomically $ modifyTVar' (ysessPings sess) (Map.delete pingId)
 
--- | Keepalive loop: once 'ycKeepAliveIntervalMicros' passes without a
+-- | Keepalive loop: once the 'ycKeepAlive' interval passes without a
 -- frame from the peer, send a Ping (spec.md, Type Field: a Ping "can
 -- also be used to heart-beat and do keep-alives over TCP").
 --
@@ -197,22 +197,20 @@ ping sess = bracket register unregister $ \(pingId, waiter) -> do
 -- Returns @Left@ when a Ping fails. The session is left as it is: the
 -- caller must stop recvLoop, which tears the session down.
 keepaliveLoop :: YamuxSession -> IO (Either YamuxError ())
-keepaliveLoop sess
-  | ycEnableKeepAlive config = go
-  | otherwise = pure (Right ())
+keepaliveLoop sess = case ycKeepAlive (ysessConfig sess) of
+  Nothing -> pure (Right ())
+  Just interval -> go (microsToInt interval)
   where
-    config = ysessConfig sess
-
     goingAway = do
       shut <- readTVar (ysessShutdown sess)
       remote <- readTVar (ysessRemoteGoAway sess)
       pure (shut || isJust remote)
 
-    go = do
+    go intervalUs = do
       seen <- readTVarIO (ysessRecvCount sess)
       -- Wake on the interval, on a received frame, or on GoAway,
       -- whichever comes first.
-      woke <- timeout (ycKeepAliveIntervalMicros config) $ atomically $ do
+      woke <- timeout intervalUs $ atomically $ do
         stopping <- goingAway
         count <- readTVar (ysessRecvCount sess)
         check (stopping || count /= seen)
@@ -220,7 +218,7 @@ keepaliveLoop sess
       case woke of
         Just True -> pure (Right ())
         -- A frame arrived: the peer is alive, restart the timer
-        Just False -> go
+        Just False -> go intervalUs
         Nothing -> do
           -- A GoAway may have landed just as the interval ran out
           stopping <- atomically goingAway
@@ -233,7 +231,7 @@ keepaliveLoop sess
                 -- A GoAway during the Ping
                 Left () -> pure (Right ()) 
                 -- ACK received: the peer is alive, restart the timer
-                Right (Right ()) -> go
+                Right (Right ()) -> go intervalUs
                 -- The session was torn down while pinging: nothing to keep alive
                 Right (Left YamuxSessionShutdown) -> pure (Right ())
                 -- No ACK (or SYN not written) in time: the peer is unresponsive

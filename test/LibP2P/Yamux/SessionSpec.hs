@@ -5,7 +5,7 @@ import Control.Concurrent.Async (async, concurrently, concurrently_, poll, wait,
 import Control.Concurrent.STM
 import Control.Monad (replicateM_)
 import qualified Data.ByteString as BS
-import Data.Maybe (isNothing)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Word (Word32)
 import System.Timeout (timeout)
 import LibP2P.Yamux.Frame
@@ -281,7 +281,7 @@ spec = do
     -- A GoAway landing while a Ping is in flight must stop the loop
     -- cleanly: the peer may never ACK, and a YamuxPingTimeout would
     -- make the caller tear down streams that should be left to drain.
-    -- The wait is shorter than ycPingTimeoutMicros, so the loop has to
+    -- The wait is shorter than ycPingTimeout, so the loop has to
     -- stop on the GoAway itself rather than on the ping timing out.
     it "stops cleanly when the peer sends a GoAway after the Ping SYN" $
       withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp ->
@@ -311,7 +311,7 @@ spec = do
           expectNoFrame hp
 
     it "does nothing when keepalive is disabled" $
-      withHostilePeerWithConfig keepaliveConfig {ycEnableKeepAlive = False} RoleClient $ \hp -> do
+      withHostilePeerWithConfig keepaliveConfig {ycKeepAlive = Nothing} RoleClient $ \hp -> do
         keepaliveRes <- timeout 1000000 (keepaliveLoop (hpSession hp))
         keepaliveRes `shouldBe` Just (Right ())
         expectNoFrame hp
@@ -729,14 +729,18 @@ pingAck = YamuxHeader 0 FramePing (defaultFlags {flagACK = True}) 0
 
 -- | The default configuration with a different ping timeout.
 pingTimeoutConfig :: Int -> YamuxConfig
-pingTimeoutConfig us = defaultYamuxConfig {ycPingTimeoutMicros = us}
+pingTimeoutConfig us = defaultYamuxConfig {ycPingTimeout = micros us}
+
+-- | A test duration; the literals used here are all positive.
+micros :: Int -> Micros
+micros us = fromMaybe (error ("micros: not positive: " <> show us)) (mkMicros us)
 
 -- | Short keepalive timings so the tests finish well within a second.
 keepaliveConfig :: YamuxConfig
 keepaliveConfig =
   defaultYamuxConfig
-    { ycKeepAliveIntervalMicros = 100000 -- 100ms
-    , ycPingTimeoutMicros = 350000 -- 350ms
+    { ycKeepAlive = Just (micros 100000) -- 100ms
+    , ycPingTimeout = micros 350000 -- 350ms
     }
 
 -- | Assert the session writes nothing for three keepalive intervals.

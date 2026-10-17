@@ -12,7 +12,7 @@ import Control.Concurrent.STM (TChan, TVar, atomically, newTVarIO, readTChan, re
 import Control.Exception (SomeException, bracket, finally, try)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
-import Data.Maybe (isJust, isNothing)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import qualified LibP2P as Public
@@ -230,8 +230,8 @@ mkFreezableTransport frozen inner = inner
 fastKeepAliveConfig :: Public.SwitchConfig
 fastKeepAliveConfig = Public.defaultSwitchConfig
   { Public.scYamuxConfig = Public.defaultYamuxConfig
-      { Public.ycKeepAliveIntervalMicros = 100000
-      , Public.ycPingTimeoutMicros = 350000
+      { Public.ycKeepAlive = Public.mkMicros 100000
+      , Public.ycPingTimeout = fromMaybe (error "positive literal") (Public.mkMicros 350000)
       }
   }
 

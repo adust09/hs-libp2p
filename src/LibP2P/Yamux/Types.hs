@@ -11,6 +11,9 @@ module LibP2P.Yamux.Types
   , YamuxStream (..)
   , YamuxSession (..)
   , PingWaiter
+  , Micros
+  , mkMicros
+  , microsToInt
   , YamuxConfig (..)
   , defaultYamuxConfig
   , enqueueFrame
@@ -29,20 +32,32 @@ import LibP2P.Yamux.Frame (GoAwayCode, YamuxHeader)
 -- Left when the session dies before the ACK arrives.
 type PingWaiter = TMVar (Either YamuxError ())
 
+-- | A strictly positive duration in microseconds.
+newtype Micros = Micros Int
+  deriving (Show, Eq, Ord)
+
+-- | Accept a positive number of microseconds, reject anything else.
+mkMicros :: Int -> Maybe Micros
+mkMicros n
+  | n > 0 = Just (Micros n)
+  | otherwise = Nothing
+
+-- | The duration in microseconds, as System.Timeout.timeout takes it.
+microsToInt :: Micros -> Int
+microsToInt (Micros n) = n
+
 -- | Session tunables that spec.md leaves to the implementation.
 data YamuxConfig = YamuxConfig
-  { ycEnableKeepAlive :: !Bool -- ^ Run keepaliveLoop
-  , ycKeepAliveIntervalMicros :: !Int -- ^ Time without a received frame before a keepalive Ping
-  , ycPingTimeoutMicros :: !Int -- ^ Limit for writing a Ping SYN, and again for its ACK
+  { ycKeepAlive :: !(Maybe Micros) -- ^ Time without a received frame before a keepalive Ping; Nothing disables keepalive
+  , ycPingTimeout :: !Micros -- ^ Limit for writing a Ping SYN, and again for its ACK
   }
   deriving (Show, Eq)
 
 defaultYamuxConfig :: YamuxConfig
 defaultYamuxConfig =
   YamuxConfig
-    { ycEnableKeepAlive = True
-    , ycKeepAliveIntervalMicros = 30000000
-    , ycPingTimeoutMicros = 10000000
+    { ycKeepAlive = Just (Micros 30000000) -- 30s
+    , ycPingTimeout = Micros 10000000 -- 10s
     }
 
 -- | SessionRole determines stream ID parity (spec.md §Stream Identification).

@@ -47,6 +47,9 @@ module LibP2P
   , defaultSwitchConfig
   , YamuxConfig (..)
   , defaultYamuxConfig
+  , Micros
+  , mkMicros
+  , microsToInt
   , subscribeSwitchEvents
   , SwitchEvent (..)
   , addTransport
@@ -242,4 +245,4 @@ import LibP2P.Switch.Types (Connection (..), DialError (..), Direction (..), Res
 import LibP2P.Transport.TCP (newTCPTransport)
 import LibP2P.Transport.QUIC (newQUICTransport)
 import LibP2P.Transport (Transport (..))
-import LibP2P.Yamux.Types (YamuxConfig (..), defaultYamuxConfig)
+import LibP2P.Yamux.Types (Micros, YamuxConfig (..), defaultYamuxConfig, microsToInt, mkMicros)
