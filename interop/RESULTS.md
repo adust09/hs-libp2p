@@ -1,6 +1,6 @@
 ---
 title: Transport-Interop Results
-last_updated: 2026-10-14
+last_updated: 2026-10-21
 tags:
   - interop
   - transport
@@ -37,6 +37,16 @@ docker compose -f docker-compose.cross.yml \
 Both dialer containers completed one libp2p Ping and exited 0. The Haskell
 client measured an 11.043 ms handshake-plus-ping and 0.670 ms ping RTT; the Go
 client measured 8.333 ms and 0.212 ms respectively. CI runs both directions.
+
+Ping carries only 32 bytes, so it does not split a TLS record across TCP reads.
+CI also runs a 10 MiB upload and download between two hs-libp2p peers over
+TCP + TLS + Yamux:
+
+```bash
+docker compose -f docker-compose.perf.yml \
+  -f docker-compose.perf-tls.yml up --build \
+  --exit-code-from hs-perf-dialer redis hs-perf-listener hs-perf-dialer
+```
 
 ## QUIC v1 interoperability (2026-09-14)
 

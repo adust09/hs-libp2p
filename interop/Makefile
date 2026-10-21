@@ -8,7 +8,7 @@ IMAGE_NAME := hs-libp2p-interop
 .PHONY: build image self-test cross-test-go-listener cross-test-hs-listener \
         cross-test-tls-go-listener cross-test-tls-hs-listener \
         cross-gossipsub-rust-listener cross-gossipsub-hs-listener cross-gossipsub kad-dht \
-        perf-self-test perf-cross-nim-listener perf-cross-hs-listener perf-cross nim-libp2p \
+        perf-self-test perf-tls-self-test perf-cross-nim-listener perf-cross-hs-listener perf-cross nim-libp2p \
         hole-punch-self-test
 
 # nim-libp2p commit pinned by unified-testing perf/images.yaml (nim-v1.15).
@@ -57,6 +57,10 @@ cross-gossipsub: cross-gossipsub-rust-listener cross-gossipsub-hs-listener
 # Perf self-test: hs listener + hs dialer
 perf-self-test:
 	cd .. && docker compose -f docker-compose.perf.yml up --build --exit-code-from hs-perf-dialer redis hs-perf-listener hs-perf-dialer
+
+# Large-payload self-test over TCP + TLS 1.3
+perf-tls-self-test:
+	cd .. && docker compose -f docker-compose.perf.yml -f docker-compose.perf-tls.yml up --build --exit-code-from hs-perf-dialer redis hs-perf-listener hs-perf-dialer
 
 # Clone nim-libp2p at the commit unified-testing pins for perf (nim-v1.15)
 nim-libp2p:

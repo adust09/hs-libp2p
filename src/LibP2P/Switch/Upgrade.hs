@@ -19,6 +19,7 @@ module LibP2P.Switch.Upgrade
     -- * Full upgrade pipeline
   , upgradeAs
   , upgradeAsWithConfig
+  , upgradeWithSwitchConfig
   , upgradeAsWithSecurityProtocols
   , upgradeOutbound
   , upgradeInbound
@@ -108,6 +109,8 @@ import LibP2P.Switch.Types
   , Connection (..)
   , Direction (..)
   , MuxerSession (..)
+  , SwitchConfig (..)
+  , defaultSwitchConfig
   )
 import LibP2P.Transport
   ( ConnectionEndpoint (..)
@@ -486,7 +489,21 @@ upgradeAsWithConfig
   -> RawConnection
   -> IO Connection
 upgradeAsWithConfig yamuxConfig rm =
-  upgradeAsWithOptions yamuxConfig rm ["/noise", tlsProtocolId]
+  upgradeAsWithOptions yamuxConfig rm (scSecurityProtocols defaultSwitchConfig)
+
+-- | Upgrade with both settings carried by a 'SwitchConfig'.
+upgradeWithSwitchConfig
+  :: SwitchConfig
+  -> ResourceManager
+  -> Direction
+  -> KeyPair
+  -> RawConnection
+  -> IO Connection
+upgradeWithSwitchConfig config rm =
+  upgradeAsWithOptions
+    (scYamuxConfig config)
+    rm
+    (scSecurityProtocols config)
 
 -- | Upgrade with an explicit security preference list. Exported for conformance
 -- tests and embedders that need to require one secure transport.

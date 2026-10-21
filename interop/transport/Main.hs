@@ -50,7 +50,9 @@ import LibP2P
   , gossipJoin
   , gossipPublish
   , newGossipSubNode
-  , newSwitch
+  , newSwitchWithConfig
+  , defaultSwitchConfig
+  , SwitchConfig (..)
   , newTCPTransport
   , newQUICTransport
   , peerIdBytes
@@ -117,8 +119,9 @@ main = do
       let pid = fromPublicKey (publicKey kp)
       logInfo $ "PeerId: " ++ T.unpack (toBase58 pid)
 
-      -- Create Switch
-      sw <- newSwitch pid kp
+      -- Create Switch. SECURE_CHANNEL selects the only offered handshake so a
+      -- TLS run cannot silently fall back to Noise.
+      sw <- newSwitchWithConfig (switchConfigFor security) pid kp
       selectedTransport <- case transport of
         "tcp" -> newTCPTransport
         "quic-v1" -> newQUICTransport kp
@@ -474,6 +477,14 @@ validateProtocols "quic-v1" _ _ =
   Left "SECURE_CHANNEL and MUXER must be unset for quic-v1"
 validateProtocols other _ _ =
   Left $ "transport " ++ other ++ " not supported (expected tcp or quic-v1)"
+
+-- | Restrict byte-stream upgrades to the secure channel requested by the test.
+switchConfigFor :: Maybe String -> SwitchConfig
+switchConfigFor (Just "noise") =
+  defaultSwitchConfig {scSecurityProtocols = ["/noise"]}
+switchConfigFor (Just "tls") =
+  defaultSwitchConfig {scSecurityProtocols = ["/tls/1.0.0"]}
+switchConfigFor _ = defaultSwitchConfig
 
 -- | Parse "host:port" string.
 parseHostPort :: String -> (String, Int)

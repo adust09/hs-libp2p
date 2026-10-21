@@ -144,12 +144,16 @@ data ActiveListener = ActiveListener
 -- | Switch-wide settings, fixed when the Switch is created.
 data SwitchConfig = SwitchConfig
   { scYamuxConfig :: !YamuxConfig -- ^ Applied to every Yamux session the Switch upgrades (dial, listen, NAT probes)
+  , scSecurityProtocols :: ![ProtocolId]
+  -- ^ Secure channels offered, in preference order. The default is Noise,
+  -- then TLS 1.3 ("/tls/1.0.0").
   }
   deriving (Show, Eq)
 
 defaultSwitchConfig :: SwitchConfig
 defaultSwitchConfig = SwitchConfig
   { scYamuxConfig = defaultYamuxConfig
+  , scSecurityProtocols = ["/noise", "/tls/1.0.0"]
   }
 
 -- | The Switch: central coordinator of the libp2p networking stack.

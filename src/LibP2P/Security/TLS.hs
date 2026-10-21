@@ -9,7 +9,7 @@ module LibP2P.Security.TLS (
   libp2pALPN,
 ) where
 
-import Control.Exception (SomeException, catch)
+import Control.Exception (IOException, SomeException, catch)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LBS
@@ -115,8 +115,29 @@ streamBackend stream =
     { backendFlush = pure ()
     , backendClose = pure ()
     , backendSend = streamWrite stream
-    , backendRecv = streamReadChunk stream
+    , backendRecv = recvExact stream
     }
+
+-- | Return exactly @n@ bytes. 'streamReadChunk' may deliver a short TCP
+-- segment, but 'Network.TLS.backendRecv' treats a short read as a truncated
+-- record. A short result is returned only at EOF.
+recvExact :: StreamIO -> Int -> IO ByteString
+recvExact stream requested
+  | requested <= 0 = pure BS.empty
+  | otherwise = collect [] requested
+ where
+  collect chunks remaining = do
+    got <- nextChunk remaining
+    if BS.null got
+      then pure (BS.concat (reverse chunks))
+      else
+        let unread = remaining - BS.length got
+         in if unread <= 0
+              then pure (BS.concat (reverse (got : chunks)))
+              else collect (got : chunks) unread
+  nextChunk remaining =
+    streamReadChunk stream remaining
+      `catch` \(_ :: IOException) -> pure BS.empty
 
 clientParams ::
   [ByteString] -> Credential -> IORef (Maybe PeerId) -> ClientParams

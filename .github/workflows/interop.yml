@@ -137,6 +137,18 @@ jobs:
       - name: Reset after self-test
         run: docker compose -f docker-compose.perf.yml down -v
 
+      - name: TCP TLS large payload — hs listener, hs dialer
+        run: >
+          docker compose -f docker-compose.perf.yml
+          -f docker-compose.perf-tls.yml up
+          --exit-code-from hs-perf-dialer
+          redis hs-perf-listener hs-perf-dialer
+
+      - name: Reset after TCP TLS payload
+        run: >
+          docker compose -f docker-compose.perf.yml
+          -f docker-compose.perf-tls.yml down -v
+
       - name: Direction 1 — nim listener, hs dialer
         run: >
           docker compose -f docker-compose.perf-cross.yml up
