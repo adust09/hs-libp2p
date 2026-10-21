@@ -45,11 +45,10 @@ import LibP2P.Switch.Types
   , ConnectionGater (..)
   , MuxerSession (..)
   , Switch (..)
-  , SwitchConfig (..)
   , SwitchEvent (..)
   , defaultConnectionGater
   )
-import LibP2P.Switch.Upgrade (upgradeAsWithConfig)
+import LibP2P.Switch.Upgrade (upgradeWithSwitchConfig)
 import LibP2P.Transport (Listener (..), RawConnection (..), Transport (..))
 
 -- | Handle a single inbound connection: gate → upgrade → pool → stream accept loop.
@@ -64,8 +63,8 @@ handleInbound sw rawConn = do
   if not allowed
     then rcClose rawConn
     else do
-      -- Upgrade: Noise XX handshake + Yamux session
-      conn <- upgradeAsWithConfig (scYamuxConfig (swConfig sw)) (swResourceMgr sw) Inbound (swIdentityKey sw) rawConn
+      -- Upgrade: negotiated secure channel + configured Yamux session
+      conn <- upgradeWithSwitchConfig (swConfig sw) (swResourceMgr sw) Inbound (swIdentityKey sw) rawConn
       -- Gate 2: check remote PeerId after security handshake
       secured <- runGate (gateSecured gater (connPeerId conn))
       if not secured

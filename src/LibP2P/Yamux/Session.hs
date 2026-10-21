@@ -202,7 +202,7 @@ acceptStream sess = do
 --
 -- Fails with YamuxPingTimeout when the SYN is not written within
 -- 'ycPingTimeout', or when its ACK does not arrive within another
--- 'ycPingTimeout' after the write. The former is just a fallback 
+-- 'ycPingTimeout' after the write. The former is just a fallback
 -- to ensure that the operation doesn't hang indefinitely.
 ping :: YamuxSession -> IO (Either YamuxError ())
 ping sess = bracket register unregister $ \(pingId, waiter) -> do
@@ -280,7 +280,7 @@ keepaliveLoop sess = case ycKeepAlive (ysessConfig sess) of
               result <- race (atomically (goingAway >>= check)) (ping sess)
               case result of
                 -- A GoAway during the Ping
-                Left () -> pure (Right ()) 
+                Left () -> pure (Right ())
                 -- ACK received: the peer is alive, restart the timer
                 Right (Right ()) -> go intervalUs
                 -- The session was torn down while pinging: nothing to keep alive

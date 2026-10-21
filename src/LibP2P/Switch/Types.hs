@@ -68,7 +68,7 @@ data Connection = Connection
   , connDirection  :: !Direction        -- ^ Inbound or outbound
   , connLocalAddr  :: !Multiaddr       -- ^ Local multiaddr
   , connRemoteAddr :: !Multiaddr       -- ^ Remote multiaddr
-  , connSecurity   :: !ProtocolId      -- ^ Negotiated security protocol (e.g. "/noise")
+  , connSecurity   :: !ProtocolId      -- ^ Negotiated security protocol (e.g. "/noise" or "/tls/1.0.0")
   , connMuxer      :: !ProtocolId      -- ^ Negotiated muxer protocol (e.g. "/yamux/1.0.0")
   , connSession    :: !MuxerSession    -- ^ Muxer session for opening/accepting streams
   , connState      :: !(TVar ConnState) -- ^ Mutable connection state
@@ -144,12 +144,16 @@ data ActiveListener = ActiveListener
 -- | Switch-wide settings, fixed when the Switch is created.
 data SwitchConfig = SwitchConfig
   { scYamuxConfig :: !YamuxConfig -- ^ Applied to every Yamux session the Switch upgrades (dial, listen, NAT probes)
+  , scSecurityProtocols :: ![ProtocolId]
+  -- ^ Secure channels offered, in preference order. The default is Noise,
+  -- then TLS 1.3 ("/tls/1.0.0").
   }
   deriving (Show, Eq)
 
 defaultSwitchConfig :: SwitchConfig
 defaultSwitchConfig = SwitchConfig
   { scYamuxConfig = defaultYamuxConfig
+  , scSecurityProtocols = ["/noise", "/tls/1.0.0"]
   }
 
 -- | The Switch: central coordinator of the libp2p networking stack.

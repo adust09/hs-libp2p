@@ -58,7 +58,8 @@ library
     LibP2P.Transport
     LibP2P.Transport.TCP
     LibP2P.Transport.QUIC
-    LibP2P.Transport.QUIC.Certificate
+    LibP2P.Security.TLS
+    LibP2P.Security.TLS.Certificate
     LibP2P.Switch.Types
     LibP2P.Switch.ConnPool
     LibP2P.Switch.Connection
@@ -224,7 +225,8 @@ test-suite hs-libp2p-test
     LibP2P.Yamux.TransportEofSpec
     LibP2P.Transport.TCPSpec
     LibP2P.Transport.QUICSpec
-    LibP2P.Transport.QUIC.CertificateSpec
+    LibP2P.Security.TLSSpec
+    LibP2P.Security.TLS.CertificateSpec
     LibP2P.Switch.ConnPoolSpec
     LibP2P.Switch.ConnectionLifecycleSpec
     LibP2P.Switch.SwitchSpec

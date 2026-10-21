@@ -1,13 +1,13 @@
--- | libp2p identity certificates for QUIC's mutual TLS handshake.
-module LibP2P.Transport.QUIC.Certificate
-  ( newQUICCredential
-  , verifyQUICCertificate
-  , verifyQUICCertificateAt
-  , libp2pExtensionOID
-  ) where
+-- | libp2p identity certificates shared by TLS and QUIC transports.
+module LibP2P.Security.TLS.Certificate (
+  newIdentityCredential,
+  verifyIdentityCertificate,
+  verifyIdentityCertificateAt,
+  libp2pExtensionOID,
+) where
 
-import qualified Crypto.Error as CE
-import qualified Crypto.PubKey.Ed25519 as Ed25519
+import Crypto.Error qualified as CE
+import Crypto.PubKey.Ed25519 qualified as Ed25519
 import Crypto.Random (getRandomBytes)
 import Data.ASN1.BinaryEncoding (DER (..))
 import Data.ASN1.Encoding (decodeASN1', encodeASN1')
@@ -15,28 +15,28 @@ import Data.ASN1.Types (ASN1 (..), ASN1ConstructionType (..), OID, toASN1)
 import Data.ByteArray (convert)
 import Data.ByteString (ByteString)
 import Data.Hourglass (Date (..), DateTime (..), Month (..), TimeOfDay (..), timeConvert)
-import Data.X509
-  ( Certificate (..)
-  , CertificateChain (..)
-  , DistinguishedName (..)
-  , ExtensionRaw (..)
-  , Extensions (..)
-  , PrivKey (..)
-  , PubKey (..)
-  , PubKeyALG (..)
-  , SignatureALG (..)
-  , SignedCertificate
-  , getSigned
-  , objectToSignedExact
-  , signedObject
-  )
-import Data.X509.Validation
-  ( SignatureVerification (..)
-  , verifySignedSignature
-  )
+import Data.X509 (
+  Certificate (..),
+  CertificateChain (..),
+  DistinguishedName (..),
+  ExtensionRaw (..),
+  Extensions (..),
+  PrivKey (..),
+  PubKey (..),
+  PubKeyALG (..),
+  SignatureALG (..),
+  SignedCertificate,
+  getSigned,
+  objectToSignedExact,
+  signedObject,
+ )
+import Data.X509.Validation (
+  SignatureVerification (..),
+  verifySignedSignature,
+ )
 import LibP2P.Crypto.Key (KeyPair (..), sign, verify)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
-import qualified LibP2P.Crypto.Protobuf as Protobuf
+import LibP2P.Crypto.Protobuf qualified as Protobuf
 import Network.TLS (Credential)
 import Time.System (timeCurrent)
 
@@ -51,22 +51,27 @@ certificateSignatureAlgorithm :: SignatureALG
 certificateSignatureAlgorithm = SignatureALG_IntrinsicHash PubKeyALG_Ed25519
 
 -- | Generate an ephemeral self-signed Ed25519 certificate bound to a host key.
-newQUICCredential :: KeyPair -> IO Credential
-newQUICCredential identity = do
+newIdentityCredential :: KeyPair -> IO Credential
+newIdentityCredential identity = do
   seed <- getRandomBytes 32 :: IO ByteString
   tlsSecret <- case CE.eitherCryptoError (Ed25519.secretKey seed) of
-    Left err -> fail $ "newQUICCredential: " <> show err
+    Left err -> fail $ "newIdentityCredential: " <> show err
     Right key -> pure key
   let tlsPublic = Ed25519.toPublic tlsSecret
       certificatePublic = PubKeyEd25519 tlsPublic
       spki = encodeASN1' DER (toASN1 certificatePublic [])
-  identitySignature <- either fail pure $
-    sign (kpPrivate identity) (identitySignaturePrefix <> spki)
-  let extension = ExtensionRaw
-        { extRawOID = libp2pExtensionOID
-        , extRawCritical = True
-        , extRawContent = encodeSignedKey (Protobuf.encodePublicKey (kpPublic identity)) identitySignature
-        }
+  identitySignature <-
+    either fail pure $
+      sign (kpPrivate identity) (identitySignaturePrefix <> spki)
+  let extension =
+        ExtensionRaw
+          { extRawOID = libp2pExtensionOID
+          , extRawCritical = True
+          , extRawContent =
+              encodeSignedKey
+                (Protobuf.encodePublicKey (kpPublic identity))
+                identitySignature
+          }
       certificate = makeCertificate certificatePublic extension
       signCertificate bytes =
         ( convert (Ed25519.sign tlsSecret tlsPublic bytes)
@@ -76,39 +81,38 @@ newQUICCredential identity = do
       (signedCertificate, ()) = objectToSignedExact signCertificate certificate
   pure (CertificateChain [signedCertificate], PrivKeyEd25519 tlsSecret)
 
--- | Verify a peer's one-certificate chain against the current time and
--- recover its authenticated Peer ID.
-verifyQUICCertificate :: CertificateChain -> IO (Either String PeerId)
-verifyQUICCertificate chain = do
+-- | Verify a peer's one-certificate chain and recover its authenticated Peer ID.
+verifyIdentityCertificate :: CertificateChain -> IO (Either String PeerId)
+verifyIdentityCertificate chain = do
   now <- timeCurrent
-  pure $ verifyQUICCertificateAt (timeConvert now) chain
+  pure $ verifyIdentityCertificateAt (timeConvert now) chain
 
 -- | Verify a peer's one-certificate chain as of the given UTC time.
-verifyQUICCertificateAt :: DateTime -> CertificateChain -> Either String PeerId
-verifyQUICCertificateAt now (CertificateChain [signedCertificate]) =
+verifyIdentityCertificateAt :: DateTime -> CertificateChain -> Either String PeerId
+verifyIdentityCertificateAt now (CertificateChain [signedCertificate]) =
   verifyCertificate now signedCertificate
-verifyQUICCertificateAt _ _ =
-  Left "QUIC certificate chain must contain exactly one certificate"
+verifyIdentityCertificateAt _ _ =
+  Left "libp2p identity certificate chain must contain exactly one certificate"
 
 verifyCertificate :: DateTime -> SignedCertificate -> Either String PeerId
 verifyCertificate now signedCertificate = do
   let certificate = signedObject (getSigned signedCertificate)
-  require (certIssuerDN certificate == certSubjectDN certificate)
-    "QUIC certificate is not self-signed"
+  require
+    (certIssuerDN certificate == certSubjectDN certificate)
+    "libp2p identity certificate is not self-signed"
   case verifySignedSignature signedCertificate (certPubKey certificate) of
     SignaturePass -> pure ()
-    SignatureFailed _ -> Left "QUIC certificate self-signature verification failed"
-  -- The TLS spec requires the certificate to be valid when it is received.
+    SignatureFailed _ -> Left "libp2p identity certificate self-signature verification failed"
   let (notBefore, notAfter) = certValidity certificate
-  require (now >= notBefore) "QUIC certificate is not yet valid"
-  require (now <= notAfter) "QUIC certificate has expired"
-  -- The TLS spec permits this extension to be critical or non-critical.
+  require (now >= notBefore) "libp2p identity certificate is not yet valid"
+  require (now <= notAfter) "libp2p identity certificate has expired"
   extension <- findIdentityExtension (certExtensions certificate)
   (encodedHostKey, identitySignature) <- decodeSignedKey (extRawContent extension)
   hostKey <- Protobuf.decodePublicKey encodedHostKey
   let spki = encodeASN1' DER (toASN1 (certPubKey certificate) [])
-  require (verify hostKey (identitySignaturePrefix <> spki) identitySignature)
-    "QUIC certificate host-key signature verification failed"
+  require
+    (verify hostKey (identitySignaturePrefix <> spki) identitySignature)
+    "libp2p identity certificate host-key signature verification failed"
   pure (fromPublicKey hostKey)
 
 findIdentityExtension :: Extensions -> Either String ExtensionRaw
@@ -116,11 +120,13 @@ findIdentityExtension (Extensions maybeExtensions) = do
   let extensions = maybe [] id maybeExtensions
       unknownCritical = filter isUnknownCritical extensions
       identities = filter ((== libp2pExtensionOID) . extRawOID) extensions
-  require (null unknownCritical) "QUIC certificate contains an unknown critical extension"
+  require
+    (null unknownCritical)
+    "libp2p identity certificate contains an unknown critical extension"
   case identities of
     [extension] -> Right extension
-    [] -> Left "QUIC certificate is missing the libp2p identity extension"
-    _ -> Left "QUIC certificate contains multiple libp2p identity extensions"
+    [] -> Left "libp2p identity certificate is missing the libp2p identity extension"
+    _ -> Left "libp2p identity certificate contains multiple libp2p identity extensions"
 
 isUnknownCritical :: ExtensionRaw -> Bool
 isUnknownCritical extension =
@@ -139,7 +145,8 @@ recognizedCriticalOIDs =
 
 encodeSignedKey :: ByteString -> ByteString -> ByteString
 encodeSignedKey publicKey signature =
-  encodeASN1' DER
+  encodeASN1'
+    DER
     [ Start Sequence
     , OctetString publicKey
     , OctetString signature
@@ -154,19 +161,20 @@ decodeSignedKey bytes = case decodeASN1' DER bytes of
   Right _ -> Left "invalid libp2p certificate extension structure"
 
 makeCertificate :: PubKey -> ExtensionRaw -> Certificate
-makeCertificate publicKey extension = Certificate
-  { certVersion = 2
-  , certSerial = 1
-  , certSignatureAlg = certificateSignatureAlgorithm
-  , certIssuerDN = DistinguishedName []
-  , certValidity = (notBefore, notAfter)
-  , certSubjectDN = DistinguishedName []
-  , certPubKey = publicKey
-  , certExtensions = Extensions (Just [extension])
-  }
-  where
-    notBefore = DateTime (Date 1970 January 1) (TimeOfDay 0 0 0 0)
-    notAfter = DateTime (Date 4096 January 1) (TimeOfDay 0 0 0 0)
+makeCertificate publicKey extension =
+  Certificate
+    { certVersion = 2
+    , certSerial = 1
+    , certSignatureAlg = certificateSignatureAlgorithm
+    , certIssuerDN = DistinguishedName []
+    , certValidity = (notBefore, notAfter)
+    , certSubjectDN = DistinguishedName []
+    , certPubKey = publicKey
+    , certExtensions = Extensions (Just [extension])
+    }
+ where
+  notBefore = DateTime (Date 1970 January 1) (TimeOfDay 0 0 0 0)
+  notAfter = DateTime (Date 4096 January 1) (TimeOfDay 0 0 0 0)
 
 require :: Bool -> String -> Either String ()
 require True _ = Right ()

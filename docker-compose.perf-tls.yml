@@ -1,0 +1,21 @@
+# TCP + TLS large-payload self-test.
+#
+# Overrides the perf self-test to negotiate only /tls/1.0.0 and exchange
+# 10 MiB in each direction. A ping is too small to split a TLS record across
+# TCP reads; this transfer crosses many 16 KiB records.
+#
+#   docker compose -f docker-compose.perf.yml -f docker-compose.perf-tls.yml up \
+#     --build --exit-code-from hs-perf-dialer redis hs-perf-listener hs-perf-dialer
+services:
+  hs-perf-listener:
+    environment:
+      SECURE_CHANNEL: tls
+
+  hs-perf-dialer:
+    environment:
+      SECURE_CHANNEL: tls
+      UPLOAD_BYTES: "10485760"
+      DOWNLOAD_BYTES: "10485760"
+      UPLOAD_ITERATIONS: "1"
+      DOWNLOAD_ITERATIONS: "1"
+      LATENCY_ITERATIONS: "1"

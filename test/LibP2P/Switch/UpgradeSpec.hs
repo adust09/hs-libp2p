@@ -11,6 +11,7 @@ import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkMemoryStreamPair)
 import LibP2P.Noise.Framing (maxNoisePlaintextSize)
 import LibP2P.Noise.Handshake (HandshakeResult (..))
+import LibP2P.Security.TLS (tlsProtocolId)
 import LibP2P.Switch.ResourceManager
   ( DefaultLimits (..)
   , newResourceManager
@@ -39,6 +40,11 @@ upgradeInbound :: KeyPair -> RawConnection -> IO Connection
 upgradeInbound kp raw = do
   rm <- newResourceManager (DefaultLimits noLimits noLimits noLimits noLimits)
   Upgrade.upgradeInbound rm kp raw
+
+upgradeWithTLS :: Direction -> KeyPair -> RawConnection -> IO Connection
+upgradeWithTLS direction kp raw = do
+  rm <- newResourceManager (DefaultLimits noLimits noLimits noLimits noLimits)
+  Upgrade.upgradeAsWithSecurityProtocols rm [tlsProtocolId] direction kp raw
 
 openMuxStream :: Connection -> IO StreamIO
 openMuxStream conn = muxOpenStream (connSession conn) unlimitedMemoryAccount
@@ -237,6 +243,29 @@ spec = do
       received2 <- readExact streamA 4
       received2 `shouldBe` "pong"
       -- Cleanup
+      muxClose (connSession connA)
+      muxClose (connSession connB)
+
+    it "falls back from Noise to TLS 1.3 with ALPN-inlined Yamux" $ do
+      (pidA, kpA) <- mkTestIdentity
+      (pidB, kpB) <- mkTestIdentity
+      (rawA, rawB) <- mkMemoryStreamPair
+      rawConnA <- mkMockRawConn rawA localAddr remoteAddr
+      rawConnB <- mkMockRawConn rawB remoteAddr localAddr
+      (connA, connB) <- concurrently
+        (upgradeOutbound kpA rawConnA)
+        (upgradeWithTLS Inbound kpB rawConnB)
+      connPeerId connA `shouldBe` pidB
+      connPeerId connB `shouldBe` pidA
+      connSecurity connA `shouldBe` tlsProtocolId
+      connSecurity connB `shouldBe` tlsProtocolId
+      connMuxer connA `shouldBe` "/yamux/1.0.0"
+      connMuxer connB `shouldBe` "/yamux/1.0.0"
+      (streamA, streamB) <- concurrently
+        (openMuxStream connA)
+        (muxAcceptStream (connSession connB))
+      streamWrite streamA "tls ping"
+      readExact streamB 8 `shouldReturn` "tls ping"
       muxClose (connSession connA)
       muxClose (connSession connB)
 

@@ -1,6 +1,6 @@
 ---
 title: Transport-Interop Results
-last_updated: 2026-09-14
+last_updated: 2026-10-21
 tags:
   - interop
   - transport
@@ -11,10 +11,42 @@ tags:
 # Transport-Interop Results
 
 This document records reproducible evidence that the `libp2p-interop` binary
-(`interop/Main.hs`) passes the upstream
+(`interop/transport/Main.hs`) passes the upstream
 [libp2p/test-plans](https://github.com/libp2p/test-plans/tree/master/transport-interop)
 **ping** contract against go-libp2p, in both dialer and listener roles, over
-**TCP + Noise + Yamux** and native **QUIC v1**.
+**TCP + Noise/TLS + Yamux** and native **QUIC v1**.
+
+## TLS 1.3 interoperability (2026-10-14)
+
+The TCP transport passed the ping contract in both directions against
+`go-libp2p v0.48.0` using the `/tls/1.0.0` secure channel and Yamux negotiated
+inline through ALPN.
+
+```bash
+# go-libp2p listener, hs-libp2p dialer
+docker compose -f docker-compose.cross.yml \
+  -f docker-compose.tls-cross.yml up --build \
+  --exit-code-from hs-dialer redis go-listener hs-dialer
+
+# hs-libp2p listener, go-libp2p dialer
+docker compose -f docker-compose.cross.yml \
+  -f docker-compose.tls-cross.yml up --build \
+  --exit-code-from go-dialer redis hs-listener go-dialer
+```
+
+Both dialer containers completed one libp2p Ping and exited 0. The Haskell
+client measured an 11.043 ms handshake-plus-ping and 0.670 ms ping RTT; the Go
+client measured 8.333 ms and 0.212 ms respectively. CI runs both directions.
+
+Ping carries only 32 bytes, so it does not split a TLS record across TCP reads.
+CI also runs a 10 MiB upload and download between two hs-libp2p peers over
+TCP + TLS + Yamux:
+
+```bash
+docker compose -f docker-compose.perf.yml \
+  -f docker-compose.perf-tls.yml up --build \
+  --exit-code-from hs-perf-dialer redis hs-perf-listener hs-perf-dialer
+```
 
 ## QUIC v1 interoperability (2026-09-14)
 

@@ -2,9 +2,9 @@
 --
 -- Transforms a raw transport connection into a fully upgraded
 -- (secure + multiplexed) Connection by executing a 4-step pipeline:
---   1. multistream-select: negotiate security protocol ("/noise")
---   2. Noise XX handshake: encrypted channel + remote PeerId
---   3. multistream-select: negotiate muxer ("/yamux/1.0.0")
+--   1. multistream-select: negotiate security protocol (Noise or TLS 1.3)
+--   2. secure handshake: encrypted channel + remote PeerId
+--   3. negotiate Yamux via multistream-select or TLS ALPN
 --   4. Yamux session init: multiplexed streams
 --
 -- Implements the connection upgrading pipeline.
@@ -19,6 +19,8 @@ module LibP2P.Switch.Upgrade
     -- * Full upgrade pipeline
   , upgradeAs
   , upgradeAsWithConfig
+  , upgradeWithSwitchConfig
+  , upgradeAsWithSecurityProtocols
   , upgradeOutbound
   , upgradeInbound
     -- * Helpers (exported for testing)
@@ -58,6 +60,7 @@ import LibP2P.Yamux.Types
   )
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
+  , ProtocolId
   , StreamIO (..)
   , negotiateInitiator
   , negotiateResponder
@@ -82,6 +85,14 @@ import LibP2P.Noise.Session
   , encryptMessage
   , mkNoiseSession
   )
+import LibP2P.Security.TLS
+  ( TLSHandshakeResult (..)
+  , TLSRole (..)
+  , libp2pALPN
+  , performTLSHandshake
+  , tlsProtocolId
+  , yamuxProtocolId
+  )
 import LibP2P.Switch.ResourceManager
   ( MemoryAccount (..)
   , ResourceError
@@ -98,6 +109,8 @@ import LibP2P.Switch.Types
   , Connection (..)
   , Direction (..)
   , MuxerSession (..)
+  , SwitchConfig (..)
+  , defaultSwitchConfig
   )
 import LibP2P.Transport
   ( ConnectionEndpoint (..)
@@ -460,79 +473,198 @@ yamuxStreamToStreamIO account yamuxStream = do
 
 -- | Upgrade a raw connection, taking every role from the direction.
 --
--- Pipeline: mss(/noise) -> Noise XX -> mss(/yamux/1.0.0) -> Yamux.
--- 'Outbound' runs the initiator/client side of all three, 'Inbound' the
--- responder/server side. go-libp2p derives the same way
--- (@isServer := dir == network.DirInbound@ in its upgrader), which is
--- what lets a TCP simultaneous connect flip roles: the peer that must
--- act as the server passes 'Inbound' even though it called connect().
+-- Byte streams negotiate Noise or TLS 1.3, then Yamux. TLS can inline
+-- Yamux negotiation through ALPN; Noise and legacy TLS peers use a second
+-- multistream-select exchange. The direction determines every protocol role.
 upgradeAs :: ResourceManager -> Direction -> KeyPair -> RawConnection -> IO Connection
 upgradeAs = upgradeAsWithConfig defaultYamuxConfig
 
 -- | Like 'upgradeAs', with an explicit Yamux configuration. A native
 -- multiplexer (QUIC) does not run Yamux, so the configuration is unused there.
-upgradeAsWithConfig :: YamuxConfig -> ResourceManager -> Direction -> KeyPair -> RawConnection -> IO Connection
-upgradeAsWithConfig yamuxConfig rm dir identityKP rawConn = case rcEndpoint rawConn of
-  ByteStreamEndpoint rawIO -> upgradeByteStream yamuxConfig rm dir identityKP rawConn rawIO
-  NativeMuxerEndpoint native -> nativeToConnection rm dir rawConn native
+upgradeAsWithConfig
+  :: YamuxConfig
+  -> ResourceManager
+  -> Direction
+  -> KeyPair
+  -> RawConnection
+  -> IO Connection
+upgradeAsWithConfig yamuxConfig rm =
+  upgradeAsWithOptions yamuxConfig rm (scSecurityProtocols defaultSwitchConfig)
+
+-- | Upgrade with both settings carried by a 'SwitchConfig'.
+upgradeWithSwitchConfig
+  :: SwitchConfig
+  -> ResourceManager
+  -> Direction
+  -> KeyPair
+  -> RawConnection
+  -> IO Connection
+upgradeWithSwitchConfig config rm =
+  upgradeAsWithOptions
+    (scYamuxConfig config)
+    rm
+    (scSecurityProtocols config)
+
+-- | Upgrade with an explicit security preference list. Exported for conformance
+-- tests and embedders that need to require one secure transport.
+upgradeAsWithSecurityProtocols
+  :: ResourceManager
+  -> [ProtocolId]
+  -> Direction
+  -> KeyPair
+  -> RawConnection
+  -> IO Connection
+upgradeAsWithSecurityProtocols rm =
+  upgradeAsWithOptions defaultYamuxConfig rm
+
+upgradeAsWithOptions
+  :: YamuxConfig
+  -> ResourceManager
+  -> [ProtocolId]
+  -> Direction
+  -> KeyPair
+  -> RawConnection
+  -> IO Connection
+upgradeAsWithOptions yamuxConfig rm securityProtocols dir identityKP rawConn =
+  case rcEndpoint rawConn of
+    ByteStreamEndpoint rawIO ->
+      upgradeByteStream yamuxConfig rm securityProtocols dir identityKP rawConn rawIO
+    NativeMuxerEndpoint native -> nativeToConnection rm dir rawConn native
+
+data MuxerNegotiation
+  = NegotiateMuxer
+  | InlinedMuxer ProtocolId
 
 upgradeByteStream
-  :: YamuxConfig -> ResourceManager -> Direction -> KeyPair -> RawConnection -> StreamIO
+  :: YamuxConfig
+  -> ResourceManager
+  -> [ProtocolId]
+  -> Direction
+  -> KeyPair
+  -> RawConnection
+  -> StreamIO
   -> IO Connection
-upgradeByteStream yamuxConfig rm dir identityKP rawConn rawIO = do
+upgradeByteStream yamuxConfig rm securityProtocols dir identityKP rawConn rawIO = do
   let isServer = dir == Inbound
       negotiate = if isServer then negotiateResponder else negotiateInitiator
       role = if isServer then "upgradeInbound" else "upgradeOutbound"
-
-  -- Step 1: multistream-select -> "/noise"
-  secResult <- negotiate rawIO ["/noise"]
+  secResult <- negotiate rawIO securityProtocols
   case secResult of
-    Accepted _ -> pure ()
-    NoProtocol -> fail (role <> ": /noise negotiation failed")
+    Accepted "/noise" ->
+      upgradeNoiseChannel yamuxConfig rm dir identityKP rawConn rawIO negotiate role
+    Accepted protocol
+      | protocol == tlsProtocolId ->
+          upgradeTLSChannel yamuxConfig rm dir identityKP rawConn rawIO negotiate role
+      | otherwise -> fail (role <> ": unsupported security protocol")
+    NoProtocol -> fail (role <> ": security protocol negotiation failed")
 
-  -- Step 2: Noise XX handshake
+upgradeNoiseChannel
+  :: YamuxConfig
+  -> ResourceManager
+  -> Direction
+  -> KeyPair
+  -> RawConnection
+  -> StreamIO
+  -> (StreamIO -> [ProtocolId] -> IO NegotiationResult)
+  -> String
+  -> IO Connection
+upgradeNoiseChannel yamuxConfig rm dir identityKP rawConn rawIO negotiate role = do
   (noiseSess, HandshakeResult remotePeerId _remotePK) <-
     performStreamHandshake identityKP dir rawIO
-
   connScope <- acquireConnectionScope rm remotePeerId dir
-  finishByteStreamUpgrade connScope noiseSess remotePeerId isServer negotiate role
+  sendRef <- newIORef noiseSess
+  recvRef <- newIORef noiseSess
+  bufRef <- newIORef BS.empty
+  let encryptedIO = noiseSessionToManagedStreamIO
+        (scopeMemoryAccount rm connScope) sendRef recvRef bufRef rawIO
+  finishSecureUpgrade yamuxConfig rm dir rawConn connScope remotePeerId "/noise"
+    encryptedIO (pure ()) NegotiateMuxer negotiate role
     `onException` atomically (releaseConnection rm connScope)
+
+upgradeTLSChannel
+  :: YamuxConfig
+  -> ResourceManager
+  -> Direction
+  -> KeyPair
+  -> RawConnection
+  -> StreamIO
+  -> (StreamIO -> [ProtocolId] -> IO NegotiationResult)
+  -> String
+  -> IO Connection
+upgradeTLSChannel yamuxConfig rm dir identityKP rawConn rawIO negotiate role = do
+  tlsResult <- performTLSHandshake identityKP tlsRole rawIO
+  muxerNegotiation <- either fail pure (tlsMuxerNegotiation tlsResult)
+  let remotePeerId = tlsRemotePeerId tlsResult
+      closeTLS = tlsClose tlsResult
+  connScope <- acquireConnectionScope rm remotePeerId dir
+    `onException` closeTLS
+  finishSecureUpgrade yamuxConfig rm dir rawConn connScope remotePeerId tlsProtocolId
+    (tlsStream tlsResult) closeTLS muxerNegotiation negotiate role
+    `onException` (closeTLS `finally` atomically (releaseConnection rm connScope))
   where
-    finishByteStreamUpgrade connScope noiseSess remotePeerId isServer negotiate role = do
-      sendRef <- newIORef noiseSess
-      recvRef <- newIORef noiseSess
-      bufRef <- newIORef BS.empty
-      let connectionMemory = scopeMemoryAccount rm connScope
-          encryptedIO = noiseSessionToManagedStreamIO
-            connectionMemory sendRef recvRef bufRef rawIO
-      muxResult <- negotiate encryptedIO ["/yamux/1.0.0"]
-      case muxResult of
-        Accepted _ -> pure ()
-        NoProtocol -> fail (role <> ": /yamux/1.0.0 negotiation failed")
-      let yamuxWrite = streamWrite encryptedIO
-          yamuxRead n = readExact encryptedIO n
-          closeOwnedTransport = rcClose rawConn
-            `finally` atomically (releaseConnection rm connScope)
-      yamuxSess <- newManagedSessionWithConfig yamuxConfig
-        (if isServer then RoleServer else RoleClient)
-        connectionMemory
-        (newStreamMemoryAccount rm connScope Inbound)
-        (newStreamMemoryAccount rm connScope Outbound)
-        yamuxWrite
-        yamuxRead
-      muxer <- yamuxToMuxerSession yamuxSess closeOwnedTransport
-      stateVar <- newTVarIO ConnOpen
-      pure Connection
-        { connPeerId = remotePeerId
-        , connDirection = dir
-        , connLocalAddr = rcLocalAddr rawConn
-        , connRemoteAddr = rcRemoteAddr rawConn
-        , connSecurity = "/noise"
-        , connMuxer = "/yamux/1.0.0"
-        , connSession = muxer
-        , connState = stateVar
-        , connResourceScope = connScope
-        }
+    tlsRole = if dir == Inbound then TLSServer else TLSClient
+
+tlsMuxerNegotiation :: TLSHandshakeResult -> Either String MuxerNegotiation
+tlsMuxerNegotiation result = case tlsNegotiatedALPN result of
+  Just protocol
+    | protocol == "/yamux/1.0.0" -> Right (InlinedMuxer yamuxProtocolId)
+    | protocol == libp2pALPN -> Right NegotiateMuxer
+    | otherwise -> Left "TLS handshake selected an unsupported ALPN protocol"
+  Nothing -> Left "TLS handshake did not negotiate ALPN"
+
+finishSecureUpgrade
+  :: YamuxConfig
+  -> ResourceManager
+  -> Direction
+  -> RawConnection
+  -> ResourceScope
+  -> PeerId
+  -> ProtocolId
+  -> StreamIO
+  -> IO ()
+  -> MuxerNegotiation
+  -> (StreamIO -> [ProtocolId] -> IO NegotiationResult)
+  -> String
+  -> IO Connection
+finishSecureUpgrade yamuxConfig rm dir rawConn connScope remotePeerId securityProtocol
+    encryptedIO closeSecurity muxerNegotiation negotiate role = do
+  muxerProtocol <- resolveMuxer encryptedIO muxerNegotiation negotiate role
+  let connectionMemory = scopeMemoryAccount rm connScope
+      closeOwnedTransport = closeSecurity `finally`
+        (rcClose rawConn `finally` atomically (releaseConnection rm connScope))
+  yamuxSess <- newManagedSessionWithConfig yamuxConfig
+    (if dir == Inbound then RoleServer else RoleClient)
+    connectionMemory
+    (newStreamMemoryAccount rm connScope Inbound)
+    (newStreamMemoryAccount rm connScope Outbound)
+    (streamWrite encryptedIO)
+    (readExact encryptedIO)
+  muxer <- yamuxToMuxerSession yamuxSess closeOwnedTransport
+  stateVar <- newTVarIO ConnOpen
+  pure Connection
+    { connPeerId = remotePeerId
+    , connDirection = dir
+    , connLocalAddr = rcLocalAddr rawConn
+    , connRemoteAddr = rcRemoteAddr rawConn
+    , connSecurity = securityProtocol
+    , connMuxer = muxerProtocol
+    , connSession = muxer
+    , connState = stateVar
+    , connResourceScope = connScope
+    }
+
+resolveMuxer
+  :: StreamIO
+  -> MuxerNegotiation
+  -> (StreamIO -> [ProtocolId] -> IO NegotiationResult)
+  -> String
+  -> IO ProtocolId
+resolveMuxer _ (InlinedMuxer protocol) _ _ = pure protocol
+resolveMuxer encryptedIO NegotiateMuxer negotiate role = do
+  muxResult <- negotiate encryptedIO [yamuxProtocolId]
+  case muxResult of
+    Accepted protocol -> pure protocol
+    NoProtocol -> fail (role <> ": /yamux/1.0.0 negotiation failed")
 
 nativeToConnection
   :: ResourceManager -> Direction -> RawConnection -> NativeMuxer

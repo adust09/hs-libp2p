@@ -11,7 +11,7 @@
 --   REDIS_ADDR     - Redis host:port (default: "redis:6379")
 --   TEST_KEY       - hex key namespacing Redis coordination keys
 --   TRANSPORT      - "tcp" or "quic-v1"
---   SECURE_CHANNEL - "noise" for TCP; unset for QUIC
+--   SECURE_CHANNEL - "noise" or "tls" for TCP; unset for QUIC
 --   MUXER          - "yamux" for TCP; unset for QUIC
 --   LISTENER_IP    - bind address (default: "0.0.0.0")
 --   DEBUG          - accepted but ignored; all logging goes to stderr
@@ -50,7 +50,9 @@ import LibP2P
   , gossipJoin
   , gossipPublish
   , newGossipSubNode
-  , newSwitch
+  , newSwitchWithConfig
+  , defaultSwitchConfig
+  , SwitchConfig (..)
   , newTCPTransport
   , newQUICTransport
   , peerIdBytes
@@ -117,8 +119,9 @@ main = do
       let pid = fromPublicKey (publicKey kp)
       logInfo $ "PeerId: " ++ T.unpack (toBase58 pid)
 
-      -- Create Switch
-      sw <- newSwitch pid kp
+      -- Create Switch. SECURE_CHANNEL selects the only offered handshake so a
+      -- TLS run cannot silently fall back to Noise.
+      sw <- newSwitchWithConfig (switchConfigFor security) pid kp
       selectedTransport <- case transport of
         "tcp" -> newTCPTransport
         "quic-v1" -> newQUICTransport kp
@@ -462,7 +465,8 @@ validateProtocols :: String -> Maybe String -> Maybe String -> Either String ()
 validateProtocols "tcp" security muxer = do
   case security of
     Just "noise" -> pure ()
-    Just other -> Left $ "secure channel " ++ other ++ " not supported (only noise)"
+    Just "tls" -> pure ()
+    Just other -> Left $ "secure channel " ++ other ++ " not supported (expected noise or tls)"
     Nothing -> Left "SECURE_CHANNEL not set (required for tcp)"
   case muxer of
     Just "yamux" -> pure ()
@@ -473,6 +477,14 @@ validateProtocols "quic-v1" _ _ =
   Left "SECURE_CHANNEL and MUXER must be unset for quic-v1"
 validateProtocols other _ _ =
   Left $ "transport " ++ other ++ " not supported (expected tcp or quic-v1)"
+
+-- | Restrict byte-stream upgrades to the secure channel requested by the test.
+switchConfigFor :: Maybe String -> SwitchConfig
+switchConfigFor (Just "noise") =
+  defaultSwitchConfig {scSecurityProtocols = ["/noise"]}
+switchConfigFor (Just "tls") =
+  defaultSwitchConfig {scSecurityProtocols = ["/tls/1.0.0"]}
+switchConfigFor _ = defaultSwitchConfig
 
 -- | Parse "host:port" string.
 parseHostPort :: String -> (String, Int)
