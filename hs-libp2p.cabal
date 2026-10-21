@@ -196,6 +196,7 @@ test-suite hs-libp2p-test
   hs-source-dirs:  test, interop/perf
   main-is:         Spec.hs
   other-modules:
+    SpecHook
     PerfInterop.Stats
     PerfInterop.StatsSpec
     LibP2P.Core.VarintSpec
