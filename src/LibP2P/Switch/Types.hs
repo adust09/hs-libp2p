@@ -13,6 +13,8 @@ module LibP2P.Switch.Types
   , ConnectionGater (..)
   , defaultConnectionGater
   , Switch (..)
+  , SwitchConfig (..)
+  , defaultSwitchConfig
   , DialError (..)
   , BackoffEntry (..)
   , ResourceError (..)
@@ -37,6 +39,7 @@ import LibP2P.Switch.ResourceManager
   , ResourceScope
   )
 import LibP2P.Transport (Listener, Transport)
+import LibP2P.Yamux.Types (YamuxConfig, defaultYamuxConfig)
 
 -- | Connection state machine.
 --
@@ -138,6 +141,17 @@ data ActiveListener = ActiveListener
   , alAddress    :: !Multiaddr     -- ^ Actual bound address (port 0 resolved)
   }
 
+-- | Switch-wide settings, fixed when the Switch is created.
+data SwitchConfig = SwitchConfig
+  { scYamuxConfig :: !YamuxConfig -- ^ Applied to every Yamux session the Switch upgrades (dial, listen, NAT probes)
+  }
+  deriving (Show, Eq)
+
+defaultSwitchConfig :: SwitchConfig
+defaultSwitchConfig = SwitchConfig
+  { scYamuxConfig = defaultYamuxConfig
+  }
+
 -- | The Switch: central coordinator of the libp2p networking stack.
 --
 -- Manages transports, connection pool, protocol handlers, and events.
@@ -159,4 +173,5 @@ data Switch = Switch
   , swNotifiers    :: !(TVar [Connection -> IO ()])                      -- ^ Callbacks on new connection
   , swDisconnectNotifiers :: !(TVar [Connection -> IO ()])               -- ^ Callbacks on connection teardown
   , swListeners    :: !(TVar [ActiveListener])                           -- ^ Active listeners
+  , swConfig       :: !SwitchConfig                                      -- ^ Settings given at creation
   }
