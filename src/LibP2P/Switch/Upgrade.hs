@@ -18,6 +18,7 @@ module LibP2P.Switch.Upgrade
   , yamuxToMuxerSession
     -- * Full upgrade pipeline
   , upgradeAs
+  , upgradeAsWithConfig
   , upgradeOutbound
   , upgradeInbound
     -- * Helpers (exported for testing)
@@ -40,7 +41,8 @@ import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
 import LibP2P.Yamux.Frame (maxStreamWindowSize)
 import LibP2P.Yamux.Session
   ( closeSession
-  , newManagedSession
+  , keepaliveLoop
+  , newManagedSessionWithConfig
   , recvLoop
   , sendLoop
   )
@@ -49,8 +51,10 @@ import LibP2P.Yamux.Stream (streamReadRetained)
 import qualified LibP2P.Yamux.Stream as YS
 import LibP2P.Yamux.Types
   ( SessionRole (..)
+  , YamuxConfig
   , YamuxSession (ysessSendCh)
   , YamuxStream (ysMemoryAccount)
+  , defaultYamuxConfig
   )
 import LibP2P.MultistreamSelect.Negotiation
   ( NegotiationResult (..)
@@ -364,7 +368,7 @@ goAwayFlushTimeoutUs :: Int
 goAwayFlushTimeoutUs = 200000
 
 -- | Wrap a YamuxSession as a MuxerSession.
--- Starts sendLoop and recvLoop as background threads.
+-- Starts sendLoop, recvLoop and keepaliveLoop as background threads.
 -- The MuxerSession provides open/accept stream operations that
 -- produce StreamIO-compatible streams.
 --
@@ -376,6 +380,15 @@ yamuxToMuxerSession yamuxSess closeTransport = do
   -- Start background loops
   sendLoopA <- async (sendLoop yamuxSess)
   recvLoopA <- async (recvLoop yamuxSess)
+  -- A failed keepalive means the peer went silent without closing the
+  -- transport, so recvLoop is still blocked on a read that will never
+  -- return. Stopping it is what makes muxAcceptStream fail and the
+  -- Switch tear the connection down.
+  keepaliveA <- async $ do
+    result <- keepaliveLoop yamuxSess
+    case result of
+      Left _ -> cancel recvLoopA
+      Right () -> pure ()
   pure MuxerSession
     { muxOpenStream = \account -> do
         result <- Yamux.openStreamWithAccount yamuxSess account
@@ -400,6 +413,7 @@ yamuxToMuxerSession yamuxSess closeTransport = do
         _ <- timeout goAwayFlushTimeoutUs $ atomically $ do
           empty <- isEmptyTQueue (ysessSendCh yamuxSess)
           unless empty retry
+        cancel keepaliveA
         cancel sendLoopA
         cancel recvLoopA
         closeTransport `catch` \(_ :: SomeException) -> pure ()
@@ -453,14 +467,19 @@ yamuxStreamToStreamIO account yamuxStream = do
 -- what lets a TCP simultaneous connect flip roles: the peer that must
 -- act as the server passes 'Inbound' even though it called connect().
 upgradeAs :: ResourceManager -> Direction -> KeyPair -> RawConnection -> IO Connection
-upgradeAs rm dir identityKP rawConn = case rcEndpoint rawConn of
-  ByteStreamEndpoint rawIO -> upgradeByteStream rm dir identityKP rawConn rawIO
+upgradeAs = upgradeAsWithConfig defaultYamuxConfig
+
+-- | Like 'upgradeAs', with an explicit Yamux configuration. A native
+-- multiplexer (QUIC) does not run Yamux, so the configuration is unused there.
+upgradeAsWithConfig :: YamuxConfig -> ResourceManager -> Direction -> KeyPair -> RawConnection -> IO Connection
+upgradeAsWithConfig yamuxConfig rm dir identityKP rawConn = case rcEndpoint rawConn of
+  ByteStreamEndpoint rawIO -> upgradeByteStream yamuxConfig rm dir identityKP rawConn rawIO
   NativeMuxerEndpoint native -> nativeToConnection rm dir rawConn native
 
 upgradeByteStream
-  :: ResourceManager -> Direction -> KeyPair -> RawConnection -> StreamIO
+  :: YamuxConfig -> ResourceManager -> Direction -> KeyPair -> RawConnection -> StreamIO
   -> IO Connection
-upgradeByteStream rm dir identityKP rawConn rawIO = do
+upgradeByteStream yamuxConfig rm dir identityKP rawConn rawIO = do
   let isServer = dir == Inbound
       negotiate = if isServer then negotiateResponder else negotiateInitiator
       role = if isServer then "upgradeInbound" else "upgradeOutbound"
@@ -494,7 +513,7 @@ upgradeByteStream rm dir identityKP rawConn rawIO = do
           yamuxRead n = readExact encryptedIO n
           closeOwnedTransport = rcClose rawConn
             `finally` atomically (releaseConnection rm connScope)
-      yamuxSess <- newManagedSession
+      yamuxSess <- newManagedSessionWithConfig yamuxConfig
         (if isServer then RoleServer else RoleClient)
         connectionMemory
         (newStreamMemoryAccount rm connScope Inbound)
