@@ -49,6 +49,7 @@ mkMockConn pid dir remoteAddr = do
     , connSession    = mockMuxerSession
     , connState      = st
     , connResourceScope = connScope
+    , connRelayLimit = Nothing
     }
 
 -- | Two distinct PeerIds for testing.

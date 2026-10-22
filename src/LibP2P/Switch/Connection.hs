@@ -9,21 +9,24 @@ module LibP2P.Switch.Connection
   ( closeConnection
   , closeAllConnections
   , newStream
+  , newStreamAllowingLimited
+  , StreamOpenError (..)
   ) where
 
 import Control.Concurrent.STM (atomically, readTVar, writeTChan, writeTVar)
-import Control.Exception (SomeException, catch, mask, onException)
+import Control.Exception (Exception, SomeException, catch, mask, onException)
 import Control.Monad (when)
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
 import LibP2P.Switch.ConnPool (allConns, removeConn)
 import LibP2P.Switch.ResourceManager
   ( Direction (..)
-  , ResourceError
+  , ResourceError (..)
   , releaseConnection
   , releaseStream
   , reserveStream
   , scopeMemoryAccount
   )
+import LibP2P.Transport (relayCircuitIsLimited)
 import LibP2P.Switch.Types
   ( ConnState (..)
   , Connection (..)
@@ -70,18 +73,48 @@ closeAllConnections sw = do
   conns <- atomically $ allConns (swConnPool sw)
   mapM_ (closeConnection sw) conns
 
+-- | Failure to open an outbound stream.
+data StreamOpenError
+  = StreamResourceLimit !ResourceError
+    -- ^ Peer or connection stream budget is exhausted
+  | StreamLimitedConnection
+    -- ^ The connection is a relay circuit with an active budget, and
+    -- the caller did not opt in. No stream slot is reserved.
+  deriving (Show, Eq)
+
+instance Exception StreamOpenError
+
 -- | Open an outbound stream on a connection, reserving a stream slot
 -- against the peer's resource scope. The slot is released when the
 -- returned stream is closed (exactly once, even on double close).
-newStream :: Switch -> Connection -> IO (Either ResourceError StreamIO)
-newStream sw conn = mask $ \restore -> do
-  reserved <- atomically $
-    reserveStream (swResourceMgr sw) (connResourceScope conn) Outbound
-  case reserved of
-    Left err -> pure (Left err)
-    Right streamScope -> do
-      let release = atomically $ releaseStream (swResourceMgr sw) streamScope
-          account = scopeMemoryAccount (swResourceMgr sw) streamScope
-      stream <- restore (muxOpenStream (connSession conn) account)
-        `onException` release
-      pure (Right stream)
+--
+-- Refuses a relay-limited connection. Protocols that must run over a
+-- relay circuit (Identify, Ping, DCUtR) use 'newStreamAllowingLimited'.
+newStream :: Switch -> Connection -> IO (Either StreamOpenError StreamIO)
+newStream = openOutboundStream False
+
+-- | Like 'newStream', but allows a relay-limited connection.
+--
+-- The circuit still dies when its budget is exhausted
+-- ('LibP2P.NAT.Relay.Limit.RelayCircuitExhausted'). Opt in only for a
+-- short exchange that can tolerate that.
+newStreamAllowingLimited
+  :: Switch -> Connection -> IO (Either StreamOpenError StreamIO)
+newStreamAllowingLimited = openOutboundStream True
+
+openOutboundStream
+  :: Bool -> Switch -> Connection -> IO (Either StreamOpenError StreamIO)
+openOutboundStream allowLimited sw conn
+  | not allowLimited && relayCircuitIsLimited (connRelayLimit conn) =
+      pure (Left StreamLimitedConnection)
+  | otherwise = mask $ \restore -> do
+      reserved <- atomically $
+        reserveStream (swResourceMgr sw) (connResourceScope conn) Outbound
+      case reserved of
+        Left err -> pure (Left (StreamResourceLimit err))
+        Right streamScope -> do
+          let release = atomically $ releaseStream (swResourceMgr sw) streamScope
+              account = scopeMemoryAccount (swResourceMgr sw) streamScope
+          stream <- restore (muxOpenStream (connSession conn) account)
+            `onException` release
+          pure (Right stream)

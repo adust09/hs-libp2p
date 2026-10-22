@@ -123,6 +123,7 @@ mkPingConnection sw openStream = do
         }
     , connState      = stateVar
     , connResourceScope = ownedScope
+    , connRelayLimit = Nothing
     }
 
 -- | Outbound ping streams currently reserved against a peer's resource

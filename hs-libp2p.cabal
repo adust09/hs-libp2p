@@ -88,6 +88,7 @@ library
     LibP2P.NAT.Relay.Message
     LibP2P.NAT.Relay
     LibP2P.NAT.Relay.Client
+    LibP2P.NAT.Relay.Limit
     LibP2P.NAT.Relay.Transport
     LibP2P.NAT.DCUtR.Message
     LibP2P.NAT.DCUtR
@@ -257,6 +258,7 @@ test-suite hs-libp2p-test
     LibP2P.NAT.Relay.MessageSpec
     LibP2P.NAT.Relay.RelaySpec
     LibP2P.NAT.Relay.ClientSpec
+    LibP2P.NAT.Relay.LimitSpec
     LibP2P.NAT.Relay.TransportSpec
     LibP2P.NAT.Relay.ReservationLifecycleSpec
     LibP2P.NAT.Relay.ReservationRefreshSpec

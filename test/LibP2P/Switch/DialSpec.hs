@@ -117,6 +117,7 @@ mkDummyConnection sw pid = do
         }
     , connState      = stateVar
     , connResourceScope = connScope
+    , connRelayLimit = Nothing
     }
 
 newTestResourceManager :: IO ResourceManager
@@ -143,6 +144,7 @@ mkMockDialTransport responderKP = pure Transport
             , rcLocalAddr  = addr
             , rcRemoteAddr = Multiaddr [IP4 0x7f000001, TCP 0]
             , rcClose      = pure ()
+            , rcRelayLimit = Nothing
             }
       _ <- async $ do
         rm <- newTestResourceManager
@@ -153,6 +155,7 @@ mkMockDialTransport responderKP = pure Transport
         , rcLocalAddr  = Multiaddr [IP4 0x7f000001, TCP 0]
         , rcRemoteAddr = addr
         , rcClose      = pure ()
+        , rcRelayLimit = Nothing
         }
 
 -- | Create a counting mock transport to verify dial deduplication.
@@ -175,6 +178,7 @@ mkCountingMockTransport responderKP counterRef = pure Transport
             , rcLocalAddr  = addr
             , rcRemoteAddr = Multiaddr [IP4 0x7f000001, TCP 0]
             , rcClose      = pure ()
+            , rcRelayLimit = Nothing
             }
       _ <- async $ do
         rm <- newTestResourceManager
@@ -185,6 +189,7 @@ mkCountingMockTransport responderKP counterRef = pure Transport
         , rcLocalAddr  = Multiaddr [IP4 0x7f000001, TCP 0]
         , rcRemoteAddr = addr
         , rcClose      = pure ()
+        , rcRelayLimit = Nothing
         }
 
 -- | Create a mock transport that records when the upgraded connection closes.
@@ -205,6 +210,7 @@ mkClosingMockTransport responderKP closeCount = pure Transport
             , rcLocalAddr = addr
             , rcRemoteAddr = Multiaddr [IP4 0x7f000001, TCP 0]
             , rcClose = pure ()
+            , rcRelayLimit = Nothing
             }
       _ <- async $ do
         rm <- newTestResourceManager
@@ -215,6 +221,7 @@ mkClosingMockTransport responderKP closeCount = pure Transport
         , rcLocalAddr = Multiaddr [IP4 0x7f000001, TCP 0]
         , rcRemoteAddr = addr
         , rcClose = atomicModifyIORef' closeCount (\n -> (n + 1, ()))
+        , rcRelayLimit = Nothing
         }
 
 -- | Create a mock transport that always fails to dial.
@@ -246,6 +253,7 @@ mkUnupgradableTransport closeCount = pure Transport
       , rcLocalAddr = Multiaddr [IP4 0x7f000001, TCP 0]
       , rcRemoteAddr = addr
       , rcClose = close
+      , rcRelayLimit = Nothing
       }
 
 spec :: Spec
