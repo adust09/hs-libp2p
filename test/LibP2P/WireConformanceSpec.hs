@@ -227,9 +227,10 @@ spec = do
     it "subscription-only RPC matches a hand-derived vector" $ do
       -- RPC: 1 subscriptions (rep SubOpts); SubOpts: 1 subscribe, 2 topicid.
       let rpc = RPC
-            { rpcSubscriptions = [SubOpts True "news"]
+            { rpcSubscriptions = [SubOpts True "news" False False]
             , rpcPublish = []
             , rpcControl = Nothing
+            , rpcPartial = Nothing
             }
           expected = BS.concat
             [ BS.pack [0x0a, 0x08]       -- field 1: 8-byte SubOpts

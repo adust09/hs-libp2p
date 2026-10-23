@@ -525,7 +525,7 @@ spec = do
         let sender = mkPeerId 1
         addPeer router sender GossipSubPeer False fixedTime
         handleSubscriptions router sender
-          [SubOpts True "blocks", SubOpts True "tx"]
+          [SubOpts True "blocks" False False, SubOpts True "tx" False False]
         peers <- readTVarIO (gsPeers router)
         case Map.lookup sender peers of
           Just ps -> psTopics ps `shouldBe` Set.fromList ["blocks", "tx"]
@@ -535,8 +535,9 @@ spec = do
         (router, _) <- mkTestRouter localPid
         let sender = mkPeerId 1
         addPeer router sender GossipSubPeer False fixedTime
-        handleSubscriptions router sender [SubOpts True "blocks", SubOpts True "tx"]
-        handleSubscriptions router sender [SubOpts False "blocks"]
+        handleSubscriptions router sender
+          [SubOpts True "blocks" False False, SubOpts True "tx" False False]
+        handleSubscriptions router sender [SubOpts False "blocks" False False]
         peers <- readTVarIO (gsPeers router)
         case Map.lookup sender peers of
           Just ps -> psTopics ps `shouldBe` Set.singleton "tx"
@@ -545,7 +546,7 @@ spec = do
       it "ignores subscriptions from unknown peers" $ do
         (router, _) <- mkTestRouter localPid
         let unknown = mkPeerId 99
-        handleSubscriptions router unknown [SubOpts True "blocks"]
+        handleSubscriptions router unknown [SubOpts True "blocks" False False]
         peers <- readTVarIO (gsPeers router)
         Map.member unknown peers `shouldBe` False
 
@@ -734,7 +735,7 @@ spec = do
         -- #155: subscribe so GRAFT can be accepted
         atomically $ modifyTVar' (gsSubscriptions router) (Set.insert "blocks")
         let rpc = RPC
-              { rpcSubscriptions = [SubOpts True "blocks"]
+              { rpcSubscriptions = [SubOpts True "blocks" False False]
               , rpcPublish = []
               , rpcControl = Just ControlMessage
                   { ctrlIHave = []
@@ -742,7 +743,9 @@ spec = do
                   , ctrlGraft = [Graft "blocks"]
                   , ctrlPrune = []
                   , ctrlIDontWant = []
+                  , ctrlExtensions = Nothing
                   }
+              , rpcPartial = Nothing
               }
         handleRPC router sender rpc
         -- Subscription should be recorded
@@ -1126,7 +1129,7 @@ spec = do
               }
         addPeer routerGl sender GossipSubPeer False fixedTime
         -- Below stGraylistThreshold (-10000): the subscription is dropped
-        handleRPC routerGl sender emptyRPC { rpcSubscriptions = [SubOpts True "t"] }
+        handleRPC routerGl sender emptyRPC { rpcSubscriptions = [SubOpts True "t" False False] }
         peers <- readTVarIO (gsPeers routerGl)
         case Map.lookup sender peers of
           Just ps -> psTopics ps `shouldBe` Set.empty
@@ -1516,7 +1519,7 @@ spec = do
               { gsScoreParams = defaultPeerScoreParams
                   { pspAppSpecificScore = const (-20000) } }
         addPeer routerGl dp GossipSubPeer False fixedTime
-        handleRPC routerGl dp emptyRPC { rpcSubscriptions = [SubOpts True "t"] }
+        handleRPC routerGl dp emptyRPC { rpcSubscriptions = [SubOpts True "t" False False] }
         peers <- readTVarIO (gsPeers routerGl)
         case Map.lookup dp peers of
           Just ps -> psTopics ps `shouldBe` Set.singleton "t"

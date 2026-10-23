@@ -10,6 +10,7 @@
 module LibP2P.Protocol.GossipSub.Types
   ( -- * Protocol constants
     gossipSubProtocolId
+  , gossipSubProtocolIdV12
   , gossipSubProtocolIdV11
   , gossipSubProtocolIdV10
   , floodSubProtocolId
@@ -20,6 +21,8 @@ module LibP2P.Protocol.GossipSub.Types
     -- * Wire types
   , PubSubMessage (..)
   , SubOpts (..)
+  , ControlExtensions (..)
+  , PartialMessage (..)
   , ControlMessage (..)
   , IHave (..)
   , IWant (..)
@@ -38,6 +41,8 @@ module LibP2P.Protocol.GossipSub.Types
     -- * Configuration
   , GossipSubParams (..)
   , defaultGossipSubParams
+  , PartialTopicMode (..)
+  , PartialMessagesHooks (..)
     -- * Peer tracking
   , PeerProtocol (..)
   , PeerState (..)
@@ -79,9 +84,13 @@ import Data.Time (NominalDiffTime, UTCTime)
 import Data.Word (Word64)
 import LibP2P.Crypto.PeerId (PeerId)
 
--- | GossipSub v1.2 protocol identifier (preferred).
+-- | GossipSub v1.3 protocol identifier (preferred).
 gossipSubProtocolId :: Text
-gossipSubProtocolId = "/meshsub/1.2.0"
+gossipSubProtocolId = "/meshsub/1.3.0"
+
+-- | GossipSub v1.2 protocol identifier, retained for compatibility.
+gossipSubProtocolIdV12 :: Text
+gossipSubProtocolIdV12 = "/meshsub/1.2.0"
 
 -- | GossipSub v1.1 protocol identifier, retained for compatibility.
 gossipSubProtocolIdV11 :: Text
@@ -123,8 +132,23 @@ data PubSubMessage = PubSubMessage
 
 -- | Subscription change announcement.
 data SubOpts = SubOpts
-  { subSubscribe :: !Bool    -- ^ True = subscribe, False = unsubscribe
-  , subTopicId   :: !Topic   -- ^ Topic identifier
+  { subSubscribe              :: !Bool   -- ^ True = subscribe, False = unsubscribe
+  , subTopicId                :: !Topic  -- ^ Topic identifier
+  , subRequestsPartial        :: !Bool   -- ^ Prefer partial messages for this topic
+  , subSupportsSendingPartial :: !Bool   -- ^ Can send partial messages for this topic
+  } deriving (Show, Eq)
+
+-- | Extensions advertised once in the first RPC on a v1.3 stream.
+data ControlExtensions = ControlExtensions
+  { extPartialMessages :: !Bool
+  } deriving (Show, Eq)
+
+-- | Opaque application-defined partial-message data for one topic/group.
+data PartialMessage = PartialMessage
+  { partialTopicId       :: !Topic
+  , partialGroupId       :: !ByteString
+  , partialMessageData   :: !(Maybe ByteString)
+  , partialPartsMetadata :: !(Maybe ByteString)
   } deriving (Show, Eq)
 
 -- | IHAVE: announce message IDs for a topic.
@@ -166,8 +190,9 @@ data ControlMessage = ControlMessage
   { ctrlIHave     :: ![IHave]
   , ctrlIWant     :: ![IWant]
   , ctrlGraft     :: ![Graft]
-  , ctrlPrune     :: ![Prune]
-  , ctrlIDontWant :: ![IDontWant]
+  , ctrlPrune      :: ![Prune]
+  , ctrlIDontWant  :: ![IDontWant]
+  , ctrlExtensions :: !(Maybe ControlExtensions)
   } deriving (Show, Eq)
 
 -- | RPC wrapper containing subscriptions, published messages, and control.
@@ -175,6 +200,7 @@ data RPC = RPC
   { rpcSubscriptions :: ![SubOpts]
   , rpcPublish       :: ![PubSubMessage]
   , rpcControl       :: !(Maybe ControlMessage)
+  , rpcPartial       :: !(Maybe PartialMessage)
   } deriving (Show, Eq)
 
 -- Signature policy
@@ -314,13 +340,30 @@ defaultGossipSubParams = GossipSubParams
   , paramOpportunisticGraftPeers = 2
   }
 
+-- Partial-message configuration
+
+-- | Per-topic partial-message behavior advertised in subscription RPCs.
+data PartialTopicMode
+  = SupportsPartialMessages
+  | RequestsPartialMessages
+  deriving (Show, Eq)
+
+-- | Runtime hooks installed by the generic partial-message extension.
+data PartialMessagesHooks = PartialMessagesHooks
+  { pmhHandleRPC :: !(PeerId -> PartialMessage -> IO Bool)
+    -- ^ Handle a partial RPC; True reports a protocol violation.
+  , pmhHeartbeat :: !(IO ())
+  , pmhEmitGossip :: !(Topic -> [PeerId] -> IO ())
+  , pmhPeerDisconnected :: !(PeerId -> IO ())
+  }
+
 -- Peer tracking
 
 -- | Peer's negotiated protocol capability. Features are gated by version:
--- v1.1 adds PX/backoff and v1.2 adds IDONTWANT. FloodSub peers receive full
--- messages but no GossipSub control messages.
+-- v1.1 adds PX/backoff, v1.2 adds IDONTWANT, and v1.3 adds extensions.
 data PeerProtocol
-  = GossipSubV12Peer  -- ^ GossipSub v1.2 (/meshsub/1.2.0)
+  = GossipSubV13Peer  -- ^ GossipSub v1.3 (/meshsub/1.3.0)
+  | GossipSubV12Peer  -- ^ GossipSub v1.2 (/meshsub/1.2.0)
   | GossipSubPeer     -- ^ GossipSub v1.1 (/meshsub/1.1.0)
   | GossipSubV10Peer  -- ^ GossipSub v1.0 (/meshsub/1.0.0)
   | FloodSubPeer      -- ^ FloodSub only (/floodsub/1.0.0)
@@ -330,6 +373,8 @@ data PeerProtocol
 data PeerState = PeerState
   { psProtocol         :: !PeerProtocol              -- ^ Protocol support
   , psTopics           :: !(Set Topic)               -- ^ Subscribed topics
+  , psPartialTopics    :: !(Map Topic PartialTopicMode)
+    -- ^ Partial-message preferences for subscribed topics.
   , psIsOutbound       :: !Bool                      -- ^ True if we dialed this peer
   , psConnectedAt      :: !UTCTime                   -- ^ Connection establishment time
   , psTopicState       :: !(Map Topic TopicPeerState) -- ^ Per-topic scoring state
@@ -484,12 +529,20 @@ data GossipSubRouter = GossipSubRouter
     -- ^ Topics the local node is subscribed to. Kept independently of
     -- mesh state: a topic joined before any peer announces it has an
     -- empty (absent) mesh entry but is still subscribed (issue #155).
+  , gsPartialTopics :: !(TVar (Map Topic PartialTopicMode))
+    -- ^ Local partial-message preferences for subscribed topics.
     -- Mesh and fanout state
   , gsMesh        :: !(TVar (Map Topic (Set PeerId)))
   , gsFanout      :: !(TVar (Map Topic (Set PeerId)))
   , gsFanoutPub   :: !(TVar (Map Topic UTCTime))
     -- Peer tracking
   , gsPeers       :: !(TVar (Map PeerId PeerState))
+  , gsPeerExtensions :: !(TVar (Map PeerId ControlExtensions))
+    -- ^ First-RPC extension advertisements; an empty value means none.
+  , gsSentExtensions :: !(TVar (Set PeerId))
+    -- ^ Peers that received our first-RPC extension advertisement.
+  , gsPartialMessagesHooks :: !(TVar (Maybe PartialMessagesHooks))
+    -- ^ Installed partial-message runtime, if enabled.
     -- Message deduplication
   , gsSeen        :: !(TVar (Map MessageId UTCTime))
     -- Backoff state
@@ -556,8 +609,8 @@ data GossipSubRouter = GossipSubRouter
 
 -- | Empty RPC with no subscriptions, messages, or control.
 emptyRPC :: RPC
-emptyRPC = RPC [] [] Nothing
+emptyRPC = RPC [] [] Nothing Nothing
 
--- | Empty control message with no IHAVE/IWANT/GRAFT/PRUNE/IDONTWANT.
+-- | Empty control message with no core controls or extension advertisement.
 emptyControlMessage :: ControlMessage
-emptyControlMessage = ControlMessage [] [] [] [] []
+emptyControlMessage = ControlMessage [] [] [] [] [] Nothing

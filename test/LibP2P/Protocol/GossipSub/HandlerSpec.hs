@@ -40,6 +40,7 @@ import LibP2P.Protocol.GossipSub.Handler
   , gossipLeave
   , gossipPublish
   , gossipSubProtocolId
+  , gossipSubProtocolIdV12
   , gossipSubProtocolIdV11
   , gossipSubProtocolIdV10
   , handleGossipSubStream
@@ -125,6 +126,7 @@ mkGossipConn sw pid = do
   (localStream, remoteStream) <- mkMemoryStreamPair
   responder <- async $ negotiateResponder remoteStream
     [ gossipSubProtocolId
+    , gossipSubProtocolIdV12
     , gossipSubProtocolIdV11
     , gossipSubProtocolIdV10
     , floodSubProtocolId
@@ -175,18 +177,19 @@ emptyRPC = RPC
   { rpcSubscriptions = []
   , rpcPublish       = []
   , rpcControl       = Nothing
+  , rpcPartial       = Nothing
   }
 
 -- | Create an RPC with a subscription announcement.
 subscribeRPC :: Topic -> RPC
 subscribeRPC topic = emptyRPC
-  { rpcSubscriptions = [SubOpts True topic]
+  { rpcSubscriptions = [SubOpts True topic False False]
   }
 
 -- | Create an RPC with an unsubscription announcement.
 unsubscribeRPC :: Topic -> RPC
 unsubscribeRPC topic = emptyRPC
-  { rpcSubscriptions = [SubOpts False topic]
+  { rpcSubscriptions = [SubOpts False topic False False]
   }
 
 spec :: Spec
@@ -304,7 +307,7 @@ spec = do
         Nothing -> expectationFailure "timeout reading RPC"
         Just (Left err) -> expectationFailure $ "decode error: " ++ err
         Just (Right received) -> do
-          rpcSubscriptions received `shouldBe` [SubOpts True "outbound-topic"]
+          rpcSubscriptions received `shouldBe` [SubOpts True "outbound-topic" False False]
 
     it "reuses cached stream on second call" $ do
       (sw, _localPid) <- mkTestSwitch
@@ -323,8 +326,8 @@ spec = do
       r2 <- timeout 2000000 $ readRPCMessage remoteReadStream maxRPCSize
       case (r1, r2) of
         (Just (Right rpc1), Just (Right rpc2)) -> do
-          rpcSubscriptions rpc1 `shouldBe` [SubOpts True "topic1"]
-          rpcSubscriptions rpc2 `shouldBe` [SubOpts True "topic2"]
+          rpcSubscriptions rpc1 `shouldBe` [SubOpts True "topic1" False False]
+          rpcSubscriptions rpc2 `shouldBe` [SubOpts True "topic2" False False]
         _ -> expectationFailure "failed to read both RPCs"
 
   describe "sendCurrentSubscriptions" $ do
@@ -343,7 +346,7 @@ spec = do
       result <- timeout 2000000 $ readRPCMessage remoteReadStream maxRPCSize
       case result of
         Just (Right rpc) ->
-          rpcSubscriptions rpc `shouldBe` [SubOpts True "early-topic"]
+          rpcSubscriptions rpc `shouldBe` [SubOpts True "early-topic" False False]
         _ -> expectationFailure "expected a subscription announcement RPC"
 
   describe "startGossipSub" $ do
@@ -373,24 +376,25 @@ spec = do
       -- Cleanup
       stopGossipSub node
 
-    -- Issue #241: v1.2 is preferred while v1.1 and v1.0 remain available
-    -- for backwards-compatible peers.
-    it "registers handlers for /meshsub/1.2.0, /meshsub/1.1.0, and /meshsub/1.0.0" $ do
+    -- Issue #242: v1.3 is preferred while older meshsub versions remain.
+    it "registers handlers for GossipSub v1.3 through v1.0" $ do
       (sw, _pid) <- mkTestSwitch
       node <- newGossipSubNode sw testParams
       startGossipSub node
-      h12 <- lookupStreamHandler sw gossipSubProtocolId
+      h13 <- lookupStreamHandler sw gossipSubProtocolId
+      h12 <- lookupStreamHandler sw gossipSubProtocolIdV12
       h11 <- lookupStreamHandler sw gossipSubProtocolIdV11
       h10 <- lookupStreamHandler sw gossipSubProtocolIdV10
-      case (h12, h11, h10) of
-        (Just _, Just _, Just _) -> pure ()
+      case (h13, h12, h11, h10) of
+        (Just _, Just _, Just _, Just _) -> pure ()
         _ -> expectationFailure "all GossipSub protocol versions should be registered"
       stopGossipSub node
-      h12' <- lookupStreamHandler sw gossipSubProtocolId
+      h13' <- lookupStreamHandler sw gossipSubProtocolId
+      h12' <- lookupStreamHandler sw gossipSubProtocolIdV12
       h11' <- lookupStreamHandler sw gossipSubProtocolIdV11
       h10' <- lookupStreamHandler sw gossipSubProtocolIdV10
-      case (h12', h11', h10') of
-        (Nothing, Nothing, Nothing) -> pure ()
+      case (h13', h12', h11', h10') of
+        (Nothing, Nothing, Nothing, Nothing) -> pure ()
         _ -> expectationFailure "all GossipSub protocol versions should be unregistered after stop"
 
     -- Issue #157 last item: floodsub compatibility — /floodsub/1.0.0 is
@@ -456,7 +460,7 @@ spec = do
       opened <- waitForCachedStream node livePid 40
       opened `shouldBe` True
       livePeers <- atomically $ readTVar (gsPeers (gsnRouter node))
-      psProtocol <$> Map.lookup livePid livePeers `shouldBe` Just GossipSubV12Peer
+      psProtocol <$> Map.lookup livePid livePeers `shouldBe` Just GossipSubV13Peer
       cancel liveResponder
       stopGossipSub node
       (lateConn, lateResponder) <- mkGossipConn sw latePid

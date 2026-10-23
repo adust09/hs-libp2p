@@ -8,7 +8,7 @@ module LibP2P.Protocol.GossipSub.IDontWant (
 ) where
 
 import Control.Concurrent.STM
-import Control.Monad (unless, when)
+import Control.Monad (filterM, unless, when)
 import Crypto.Hash qualified as Hash
 import Data.ByteArray qualified as BA
 import Data.ByteString (ByteString)
@@ -16,6 +16,11 @@ import Data.ByteString qualified as BS
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import LibP2P.Crypto.PeerId (PeerId)
+import LibP2P.Protocol.GossipSub.Extensions
+  ( localPartialMode
+  , peerSupportsPartialExtension
+  , peerSupportsSendingPartial
+  )
 import LibP2P.Protocol.GossipSub.Types
 
 {- | Immediately tell v1.2 mesh peers not to send a duplicate large message.
@@ -40,13 +45,23 @@ announceIDontWant router sender msg =
                       { ctrlIDontWant = [IDontWant [mid]]
                       }
               }
-      mapM_ (\pid -> gsSendRPC router pid rpc) (Set.toList targets)
+      recipients <- filterM (shouldReceiveIDontWant router (msgTopic msg))
+        (Set.toList targets)
+      mapM_ (\pid -> gsSendRPC router pid rpc) recipients
  where
   params = gsParams router
 
 supportsIDontWant :: Map.Map PeerId PeerState -> PeerId -> Bool
 supportsIDontWant peers pid =
-  maybe False ((== GossipSubV12Peer) . psProtocol) (Map.lookup pid peers)
+  maybe False ((`elem` [GossipSubV13Peer, GossipSubV12Peer]) . psProtocol)
+    (Map.lookup pid peers)
+
+shouldReceiveIDontWant :: GossipSubRouter -> Topic -> PeerId -> IO Bool
+shouldReceiveIDontWant router topic pid = do
+  mode <- localPartialMode router topic
+  peerSupports <- peerSupportsSendingPartial router pid topic
+  extension <- peerSupportsPartialExtension router pid
+  pure (mode /= Just RequestsPartialMessages || not (peerSupports && extension))
 
 -- | Record bounded IDONTWANT state received from a peer.
 handleIDontWant :: GossipSubRouter -> PeerId -> [IDontWant] -> IO ()
