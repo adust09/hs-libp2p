@@ -8,7 +8,7 @@ on:
 
 jobs:
   transport-interop:
-    name: transport-interop (hs <-> go, TCP Noise/TLS and QUIC v1)
+    name: transport-interop (hs <-> go, TCP, WebSocket, and QUIC v1)
     runs-on: ubuntu-latest
 
     steps:
@@ -49,8 +49,32 @@ jobs:
           --exit-code-from go-dialer
           redis hs-listener go-dialer
 
-      - name: Reset before TCP TLS
+      - name: Reset before WebSocket
         run: docker compose -f docker-compose.cross.yml down
+
+      - name: WebSocket direction 1 — go listener, hs dialer
+        run: >
+          docker compose -f docker-compose.cross.yml
+          -f docker-compose.websocket-cross.yml up
+          --exit-code-from hs-dialer
+          redis go-listener hs-dialer
+
+      - name: Reset between WebSocket directions
+        run: >
+          docker compose -f docker-compose.cross.yml
+          -f docker-compose.websocket-cross.yml down
+
+      - name: WebSocket direction 2 — hs listener, go dialer
+        run: >
+          docker compose -f docker-compose.cross.yml
+          -f docker-compose.websocket-cross.yml up
+          --exit-code-from go-dialer
+          redis hs-listener go-dialer
+
+      - name: Reset before TCP TLS
+        run: >
+          docker compose -f docker-compose.cross.yml
+          -f docker-compose.websocket-cross.yml down
 
       - name: TCP TLS direction 1 — go listener, hs dialer
         run: >

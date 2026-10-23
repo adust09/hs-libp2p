@@ -10,9 +10,9 @@
 --   IS_DIALER      - "true" or "false"
 --   REDIS_ADDR     - Redis host:port (default: "redis:6379")
 --   TEST_KEY       - hex key namespacing Redis coordination keys
---   TRANSPORT      - "tcp" or "quic-v1"
---   SECURE_CHANNEL - "noise" or "tls" for TCP; unset for QUIC
---   MUXER          - "yamux" for TCP; unset for QUIC
+--   TRANSPORT      - "tcp", "ws", or "quic-v1"
+--   SECURE_CHANNEL - "noise" or "tls" for TCP/WebSocket; unset for QUIC
+--   MUXER          - "yamux" for TCP/WebSocket; unset for QUIC
 --   LISTENER_IP    - bind address (default: "0.0.0.0")
 --   DEBUG          - accepted but ignored; all logging goes to stderr
 --
@@ -54,6 +54,7 @@ import LibP2P
   , defaultSwitchConfig
   , SwitchConfig (..)
   , newTCPTransport
+  , newWebSocketTransport
   , newQUICTransport
   , peerIdBytes
   , registerPingHandler
@@ -124,6 +125,7 @@ main = do
       sw <- newSwitchWithConfig (switchConfigFor security) pid kp
       selectedTransport <- case transport of
         "tcp" -> newTCPTransport
+        "ws" -> newWebSocketTransport
         "quic-v1" -> newQUICTransport kp
         _ -> fail "validated transport is unavailable"
       addTransport sw selectedTransport
@@ -398,7 +400,10 @@ runGossipSubDialer sw _pid redisConn addrKey = do
 -- multiaddr (with /p2p/ suffix) as text.
 listenAndResolve :: Switch -> PeerId -> String -> String -> IO T.Text
 listenAndResolve sw pid transportName ip = do
-  let suffix = if transportName == "quic-v1" then "/udp/0/quic-v1" else "/tcp/0"
+  let suffix = case transportName of
+        "quic-v1" -> "/udp/0/quic-v1"
+        "ws" -> "/tcp/0/ws"
+        _ -> "/tcp/0"
       bindAddr = case fromText (T.pack ("/ip4/" ++ ip ++ suffix)) of
         Right ma -> ma
         Left err -> error $ "Invalid bind address: " ++ err
@@ -462,21 +467,25 @@ reannounceLoop gsNode topic iterations = go iterations
 
 -- | Validate supported standalone and upgraded transport combinations.
 validateProtocols :: String -> Maybe String -> Maybe String -> Either String ()
-validateProtocols "tcp" security muxer = do
-  case security of
-    Just "noise" -> pure ()
-    Just "tls" -> pure ()
-    Just other -> Left $ "secure channel " ++ other ++ " not supported (expected noise or tls)"
-    Nothing -> Left "SECURE_CHANNEL not set (required for tcp)"
-  case muxer of
-    Just "yamux" -> pure ()
-    Just other -> Left $ "muxer " ++ other ++ " not supported (only yamux)"
-    Nothing -> Left "MUXER not set (required for tcp)"
+validateProtocols "tcp" security muxer = validateUpgradedTransport security muxer
+validateProtocols "ws" security muxer = validateUpgradedTransport security muxer
 validateProtocols "quic-v1" Nothing Nothing = Right ()
 validateProtocols "quic-v1" _ _ =
   Left "SECURE_CHANNEL and MUXER must be unset for quic-v1"
 validateProtocols other _ _ =
-  Left $ "transport " ++ other ++ " not supported (expected tcp or quic-v1)"
+  Left $ "transport " ++ other ++ " not supported (expected tcp, ws, or quic-v1)"
+
+validateUpgradedTransport :: Maybe String -> Maybe String -> Either String ()
+validateUpgradedTransport security muxer = do
+  case security of
+    Just "noise" -> pure ()
+    Just "tls" -> pure ()
+    Just other -> Left $ "secure channel " ++ other ++ " not supported (expected noise or tls)"
+    Nothing -> Left "SECURE_CHANNEL not set (required for tcp or ws)"
+  case muxer of
+    Just "yamux" -> pure ()
+    Just other -> Left $ "muxer " ++ other ++ " not supported (only yamux)"
+    Nothing -> Left "MUXER not set (required for tcp or ws)"
 
 -- | Restrict byte-stream upgrades to the secure channel requested by the test.
 switchConfigFor :: Maybe String -> SwitchConfig

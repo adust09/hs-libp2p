@@ -57,6 +57,7 @@ library
     LibP2P.Yamux.Session
     LibP2P.Transport
     LibP2P.Transport.TCP
+    LibP2P.Transport.WebSocket
     LibP2P.Transport.QUIC
     LibP2P.Security.TLS
     LibP2P.Security.TLS.Certificate
@@ -119,6 +120,7 @@ library
     crypton     >= 1.0.5 && < 1.1,
     crypton-x509 >= 1.8  && < 1.9,
     crypton-x509-validation >= 1.8 && < 1.9,
+    crypton-x509-system >= 1.8 && < 1.9,
     crypton-asn1-types >= 0.4 && < 0.5,
     crypton-asn1-encoding >= 0.9 && < 0.11,
     memory      >= 0.18  && < 0.19,
@@ -127,6 +129,7 @@ library
     network     >= 3.2.3 && < 3.3,
     quic        >= 0.2.23 && < 0.3,
     tls         >= 2.2   && < 2.3,
+    websockets  >= 0.12.7 && < 0.14,
     time-hourglass >= 0.3 && < 0.4,
     time        >= 1.9  && < 2,
     stm         >= 2.4  && < 2.6,
@@ -231,6 +234,7 @@ test-suite hs-libp2p-test
     LibP2P.Yamux.TraceReplaySpec
     LibP2P.Yamux.TransportEofSpec
     LibP2P.Transport.TCPSpec
+    LibP2P.Transport.WebSocketSpec
     LibP2P.Transport.QUICSpec
     LibP2P.Security.TLSSpec
     LibP2P.Security.TLS.CertificateSpec

@@ -6,6 +6,7 @@ module LibP2P.Transport.TCP
   ( newTCPTransport
   , multiaddrToHostPort
   , socketToStreamIO
+  , sockAddrToMultiaddr
   ) where
 
 import Control.Exception (onException)

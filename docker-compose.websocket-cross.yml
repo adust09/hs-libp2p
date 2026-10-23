@@ -1,0 +1,14 @@
+# WebSocket override for the hs-libp2p <-> go-libp2p transport cross-test.
+services:
+  go-listener:
+    environment:
+      transport: ws
+  go-dialer:
+    environment:
+      transport: ws
+  hs-listener:
+    environment:
+      TRANSPORT: ws
+  hs-dialer:
+    environment:
+      TRANSPORT: ws
