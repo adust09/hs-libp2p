@@ -56,6 +56,7 @@ import LibP2P.MultistreamSelect.Negotiation
   , negotiateInitiator
   )
 import LibP2P.Protocol.GossipSub.Heartbeat (runHeartbeat)
+import LibP2P.Protocol.GossipSub.PeerExchange (installPeerExchange)
 import LibP2P.Protocol.GossipSub.Message (readRPCMessage, writeRPCMessage)
 import LibP2P.Core.Binary (word32BE)
 import LibP2P.Multiaddr (protocols)
@@ -175,6 +176,7 @@ newGossipSubNode sw params = do
         , gsnStarted = started
         , gsnLifecycleLock = lifecycleLock
         }
+  installPeerExchange sw router
   atomically $ modifyTVar' (swDisconnectNotifiers sw)
     (runGossipDisconnect disconnectHook :)
   pure node
