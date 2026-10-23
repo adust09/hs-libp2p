@@ -50,6 +50,7 @@ spec = do
                   , ctrlIWant = [IWant [BS.pack [3]]]
                   , ctrlGraft = [Graft "blocks"]
                   , ctrlPrune = [Prune "tx" [] (Just 60)]
+                  , ctrlIDontWant = [IDontWant [BS.pack [4]]]
                   }
               }
         let encoded = encodeRPC rpc
@@ -114,6 +115,26 @@ spec = do
               { ctrlPrune = [Prune "blocks" [] Nothing] }
             rpc = emptyRPC { rpcControl = Just ctrl }
         decodeRPC (encodeRPC rpc) `shouldBe` Right rpc
+
+      it "IDONTWANT with message IDs" $ do
+        let ctrl = emptyControlMessage
+              { ctrlIDontWant =
+                  [IDontWant [BS.pack [1, 2], BS.pack [3, 4]]] }
+            rpc = emptyRPC { rpcControl = Just ctrl }
+        decodeRPC (encodeRPC rpc) `shouldBe` Right rpc
+
+      it "encodes IDONTWANT with the v1.2 protobuf field numbers" $ do
+        let rpc = emptyRPC
+              { rpcControl = Just emptyControlMessage
+                  { ctrlIDontWant = [IDontWant [BS.pack [1, 2]]] }
+              }
+            vector = BS.pack
+              [ 0x1a, 0x06       -- RPC.control, 6 bytes
+              , 0x2a, 0x04       -- ControlMessage.idontwant, 4 bytes
+              , 0x0a, 0x02, 1, 2 -- ControlIDontWant.messageIDs
+              ]
+        encodeRPC rpc `shouldBe` vector
+        decodeRPC vector `shouldBe` Right rpc
 
     describe "PubSubMessage" $ do
       it "round-trips with all fields" $ do

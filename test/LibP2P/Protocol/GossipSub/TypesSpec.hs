@@ -44,6 +44,18 @@ spec = do
         paramOpportunisticGraftTicks defaultGossipSubParams `shouldBe` 60
         paramOpportunisticGraftPeers defaultGossipSubParams `shouldBe` 2
 
+      it "uses go-libp2p-compatible IDONTWANT limits" $ do
+        paramMaxIDontWantLength defaultGossipSubParams `shouldBe` 10
+        paramMaxIDontWantMessages defaultGossipSubParams `shouldBe` 1000
+        paramIDontWantMessageThreshold defaultGossipSubParams `shouldBe` 1024
+        paramIDontWantMessageTTL defaultGossipSubParams `shouldBe` 3
+
+    describe "protocol identifiers" $ do
+      it "prefers GossipSub v1.2 while retaining v1.1 and v1.0" $ do
+        gossipSubProtocolId `shouldBe` "/meshsub/1.2.0"
+        gossipSubProtocolIdV11 `shouldBe` "/meshsub/1.1.0"
+        gossipSubProtocolIdV10 `shouldBe` "/meshsub/1.0.0"
+
     describe "defaultMessageId" $ do
       it "concatenates from and seqno" $ do
         let msg = PubSubMessage
@@ -98,8 +110,9 @@ spec = do
         rpcControl emptyRPC `shouldBe` Nothing
 
     describe "emptyControlMessage" $ do
-      it "has empty IHAVE/IWANT/GRAFT/PRUNE lists" $ do
+      it "has empty IHAVE/IWANT/GRAFT/PRUNE/IDONTWANT lists" $ do
         ctrlIHave emptyControlMessage `shouldBe` []
         ctrlIWant emptyControlMessage `shouldBe` []
         ctrlGraft emptyControlMessage `shouldBe` []
         ctrlPrune emptyControlMessage `shouldBe` []
+        ctrlIDontWant emptyControlMessage `shouldBe` []

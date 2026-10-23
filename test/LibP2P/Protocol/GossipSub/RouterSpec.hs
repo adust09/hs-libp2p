@@ -741,6 +741,7 @@ spec = do
                   , ctrlIWant = []
                   , ctrlGraft = [Graft "blocks"]
                   , ctrlPrune = []
+                  , ctrlIDontWant = []
                   }
               }
         handleRPC router sender rpc

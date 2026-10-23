@@ -1,7 +1,7 @@
 -- | GossipSub Switch integration handler (Phase 10b).
 --
 -- Bridges the GossipSub Router with the Switch by:
--- 1. Registering a StreamHandler for inbound /meshsub/1.1.0 streams
+-- 1. Registering StreamHandlers for inbound GossipSub protocol versions
 -- 2. Providing a sendRPC callback that opens/reuses outbound streams
 -- 3. Managing lifecycle (heartbeat start/stop)
 --
@@ -25,6 +25,7 @@ module LibP2P.Protocol.GossipSub.Handler
   , gossipPublish
     -- * Constants
   , gossipSubProtocolId
+  , gossipSubProtocolIdV11
   , gossipSubProtocolIdV10
   , floodSubProtocolId
   ) where
@@ -82,6 +83,7 @@ import LibP2P.Protocol.GossipSub.Router
   )
 import LibP2P.Protocol.Identify.Message (IdentifyInfo (..))
 import qualified Data.Set as Set
+import qualified LibP2P.Protocol.GossipSub.Types as Types
 import LibP2P.Protocol.GossipSub.Types
   ( GossipSubParams
   , GossipSubRouter (..)
@@ -101,29 +103,38 @@ import LibP2P.Switch.Types
   , Switch (..)
   )
 
--- | GossipSub v1.1 protocol ID (preferred).
+-- | GossipSub v1.2 protocol ID (preferred).
 gossipSubProtocolId :: ProtocolId
-gossipSubProtocolId = "/meshsub/1.1.0"
+gossipSubProtocolId = Types.gossipSubProtocolId
 
--- | GossipSub v1.0 protocol ID, advertised alongside v1.1 so that
--- v1.0-only peers still get a pubsub stream (#157).
+-- | GossipSub v1.1 protocol ID, retained for backwards compatibility.
+gossipSubProtocolIdV11 :: ProtocolId
+gossipSubProtocolIdV11 = Types.gossipSubProtocolIdV11
+
+-- | GossipSub v1.0 protocol ID, retained for backwards compatibility.
 gossipSubProtocolIdV10 :: ProtocolId
-gossipSubProtocolIdV10 = "/meshsub/1.0.0"
+gossipSubProtocolIdV10 = Types.gossipSubProtocolIdV10
 
 -- | FloodSub protocol ID, advertised alongside the meshsub protocols so
 -- that floodsub-only peers still get a pubsub stream (#157,
 -- gossipsub-v1.0.md "Compatibility with FloodSub").
 floodSubProtocolId :: ProtocolId
-floodSubProtocolId = "/floodsub/1.0.0"
+floodSubProtocolId = Types.floodSubProtocolId
 
 -- | All protocol IDs we register and offer, preferred first.
 gossipSubProtocolIds :: [ProtocolId]
 gossipSubProtocolIds =
-  [gossipSubProtocolId, gossipSubProtocolIdV10, floodSubProtocolId]
+  [ gossipSubProtocolId
+  , gossipSubProtocolIdV11
+  , gossipSubProtocolIdV10
+  , floodSubProtocolId
+  ]
 
 -- | Map a negotiated protocol ID to the peer's protocol version.
 protocolFor :: ProtocolId -> PeerProtocol
 protocolFor proto
+  | proto == gossipSubProtocolId    = GossipSubV12Peer
+  | proto == gossipSubProtocolIdV11 = GossipSubPeer
   | proto == gossipSubProtocolIdV10 = GossipSubV10Peer
   | proto == floodSubProtocolId     = FloodSubPeer
   | otherwise                       = GossipSubPeer
@@ -329,7 +340,7 @@ evictCachedStream streamsVar metaVar pid expectedToken stream = mask_ $ do
   closeQuietly stream
 
 -- | Open a mux stream and negotiate a GossipSub protocol, preferring
--- /meshsub/1.1.0 and falling back to /meshsub/1.0.0 (#157).
+-- v1.2 and falling back through v1.1, v1.0, and FloodSub.
 openAndNegotiate :: Switch -> Connection -> IO (Maybe (StreamIO, PeerProtocol))
 openAndNegotiate sw conn = do
   opened <- newStream sw conn
