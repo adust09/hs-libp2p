@@ -56,6 +56,7 @@ import LibP2P.MultistreamSelect.Negotiation
   , negotiateInitiator
   )
 import LibP2P.Protocol.GossipSub.Heartbeat (runHeartbeat)
+import LibP2P.Protocol.GossipSub.PeerExchange (installPeerExchange)
 import LibP2P.Protocol.GossipSub.Message (readRPCMessage, writeRPCMessage)
 import LibP2P.Core.Binary (word32BE)
 import LibP2P.Multiaddr (protocols)
@@ -148,7 +149,8 @@ data GossipSubNode = GossipSubNode
 -- | Create a new GossipSub node with a Router wired to the Switch.
 --
 -- The Router's gsSendRPC callback opens/reuses outbound streams to peers
--- via the Switch's connection pool.
+-- via the Switch's connection pool. Accepted peer-exchange records are
+-- stored and dialed through the same Switch (#247).
 newGossipSubNode :: Switch -> GossipSubParams -> IO GossipSubNode
 newGossipSubNode sw params = do
   streamsVar <- newTVarIO Map.empty
@@ -175,6 +177,7 @@ newGossipSubNode sw params = do
         , gsnStarted = started
         , gsnLifecycleLock = lifecycleLock
         }
+  installPeerExchange sw router
   atomically $ modifyTVar' (swDisconnectNotifiers sw)
     (runGossipDisconnect disconnectHook :)
   pure node
