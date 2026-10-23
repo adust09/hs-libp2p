@@ -75,6 +75,11 @@ module LibP2P
     -- * Transport
   , Transport (..)
   , newTCPTransport
+  , WebSocketConfig (..)
+  , defaultWebSocketConfig
+  , webSocketServerParams
+  , newWebSocketTransport
+  , newWebSocketTransportWithConfig
   , newQUICTransport
 
     -- * Connection gating
@@ -289,6 +294,13 @@ import LibP2P.Switch.Listen (ConnectionGater (..), defaultConnectionGater, switc
 import LibP2P.Switch (addTransport, newSwitch, newSwitchWithConfig, removeStreamHandler, setConnectionGater, setStreamHandler, subscribeSwitchEvents, switchClose)
 import LibP2P.Switch.Types (Connection (..), DialError (..), Direction (..), ResourceError (..), StreamHandler, Switch, SwitchConfig (..), SwitchEvent (..), defaultSwitchConfig)
 import LibP2P.Transport.TCP (newTCPTransport)
+import LibP2P.Transport.WebSocket
+  ( WebSocketConfig (..)
+  , defaultWebSocketConfig
+  , newWebSocketTransport
+  , newWebSocketTransportWithConfig
+  , webSocketServerParams
+  )
 import LibP2P.Transport.QUIC (newQUICTransport)
 import LibP2P.Transport (RelayCircuitLimit (..), Transport (..))
 import LibP2P.Yamux.Types (Micros, YamuxConfig (..), defaultYamuxConfig, microsToInt, mkMicros)

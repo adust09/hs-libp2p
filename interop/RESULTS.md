@@ -1,6 +1,6 @@
 ---
 title: Transport-Interop Results
-last_updated: 2026-10-21
+last_updated: 2026-10-23
 tags:
   - interop
   - transport
@@ -14,7 +14,32 @@ This document records reproducible evidence that the `libp2p-interop` binary
 (`interop/transport/Main.hs`) passes the upstream
 [libp2p/test-plans](https://github.com/libp2p/test-plans/tree/master/transport-interop)
 **ping** contract against go-libp2p, in both dialer and listener roles, over
-**TCP + Noise/TLS + Yamux** and native **QUIC v1**.
+**TCP + Noise/TLS + Yamux**, **WebSocket + Noise + Yamux**, and native
+**QUIC v1**.
+
+## WebSocket interoperability (2026-10-23)
+
+The `/ws` transport passed the ping contract in both directions against
+`go-libp2p v0.48.0`, with Noise and Yamux running over the WebSocket byte
+stream.
+
+```bash
+# go-libp2p listener, hs-libp2p dialer
+docker compose -f docker-compose.cross.yml \
+  -f docker-compose.websocket-cross.yml up --build \
+  --exit-code-from hs-dialer redis go-listener hs-dialer
+
+# hs-libp2p listener, go-libp2p dialer
+docker compose -f docker-compose.cross.yml \
+  -f docker-compose.websocket-cross.yml up --build \
+  --exit-code-from go-dialer redis hs-listener go-dialer
+```
+
+Both dialer containers exited 0. The Haskell client measured a 5.929 ms
+handshake-plus-ping and 0.642 ms ping RTT; the Go client measured 6.872 ms and
+0.192 ms respectively. CI runs both directions. `/wss` is covered separately
+by loopback byte-stream and full Noise/Yamux/Ping integration tests with
+explicit outer TLS server parameters.
 
 ## TLS 1.3 interoperability (2026-10-14)
 
