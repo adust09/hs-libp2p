@@ -6,7 +6,7 @@
 -- 3. Gossip emission: send IHAVE to non-mesh peers, rotate cache
 -- 4. Score decay: decay all counters for all peers
 -- 5. Seen cache cleanup: remove expired entries
--- 6. Heartbeat counter increment (for opportunistic graft timing)
+-- 6. Opportunistic grafting, then heartbeat counter increment
 module LibP2P.Protocol.GossipSub.Heartbeat
   ( heartbeatOnce
   , runHeartbeat
@@ -16,7 +16,9 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (Async, async)
 import Control.Concurrent.STM
 import Control.Monad (forM_, unless, when)
-import Data.List (sortOn)
+import Data.ByteString (ByteString)
+import Data.List (sort, sortOn)
+import Data.Maybe (listToMaybe)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Ord (Down (..))
@@ -41,6 +43,7 @@ import LibP2P.Protocol.GossipSub.Score
 heartbeatOnce :: GossipSubRouter -> IO ()
 heartbeatOnce router = do
   meshMaintenance router
+  opportunisticGraft router
   fanoutMaintenance router
   emitGossip router
   expireIWantPromises router
@@ -204,6 +207,108 @@ trimOversubscribed router topic meshPeers = do
     -- Update mesh
     atomically $ modifyTVar' (gsMesh router) $
       Map.insert topic keptSet
+
+-- Opportunistic grafting (gossipsub-v1.1.md).
+--
+-- Every 'paramOpportunisticGraftTicks' heartbeats, for each subscribed
+-- topic whose mesh median is below 'stOpportunisticGraftThreshold',
+-- GRAFT up to 'paramOpportunisticGraftPeers' peers chosen at random from
+-- those with a score strictly above that median. Runs after D_lo fill
+-- and D_hi trim so the extras survive this heartbeat and the every-
+-- heartbeat fill is unchanged. The counter is still incremented at the
+-- end of 'heartbeatOnce': the Nth call (count going from N-1 to N)
+-- grafts, matching go-libp2p's pre-increment tick. A mesh of 0 or 1 has
+-- no median and is skipped. The median is the upper one (sort ascending,
+-- index len/2), not the mean of the two middle scores.
+
+opportunisticGraft :: GossipSubRouter -> IO ()
+opportunisticGraft router = do
+  let ticks = paramOpportunisticGraftTicks (gsParams router)
+  count <- readTVarIO (gsHeartbeatCount router)
+  when (ticks > 0 && (count + 1) `mod` ticks == 0) $ do
+    subs <- readTVarIO (gsSubscriptions router)
+    forM_ (Set.toList subs) $ opportunisticGraftTopic router
+
+opportunisticGraftTopic :: GossipSubRouter -> Topic -> IO ()
+opportunisticGraftTopic router topic = do
+  now <- gsGetTime router
+  meshMap <- readTVarIO (gsMesh router)
+  peersMap <- readTVarIO (gsPeers router)
+  ipMap <- readTVarIO (gsIPPeerCount router)
+  let meshPeers = Map.findWithDefault Set.empty topic meshMap
+      scores = map (peerScoreAt router peersMap ipMap now) (Set.toList meshPeers)
+  case upperMedian scores of
+    Nothing -> pure ()
+    Just median ->
+      when (median < stOpportunisticGraftThreshold (gsThresholds router)) $
+        graftAboveMedian router topic meshPeers median now
+
+-- | Upper median. Nothing for meshes too small to compare against.
+upperMedian :: [Double] -> Maybe Double
+upperMedian scores
+  | n <= 1 = Nothing
+  | otherwise = listToMaybe (drop (n `div` 2) (sort scores))
+  where
+    n = length scores
+
+peerScoreAt
+  :: GossipSubRouter
+  -> Map.Map PeerId PeerState
+  -> Map.Map ByteString (Set.Set PeerId)
+  -> UTCTime
+  -> PeerId
+  -> Double
+peerScoreAt router peersMap ipMap now pid =
+  case Map.lookup pid peersMap of
+    Nothing -> 0
+    Just ps -> computeScore (gsScoreParams router) pid ps ipMap now
+
+graftAboveMedian
+  :: GossipSubRouter -> Topic -> Set.Set PeerId -> Double -> UTCTime -> IO ()
+graftAboveMedian router topic meshPeers median now = do
+  let wanted = paramOpportunisticGraftPeers (gsParams router)
+  selected <- selectOpportunistic router topic meshPeers median now wanted
+  unless (null selected) $ do
+    forM_ selected $ \pid ->
+      gsSendRPC router pid emptyRPC
+        { rpcControl = Just emptyControlMessage { ctrlGraft = [Graft topic] } }
+    let newMesh = Set.union meshPeers (Set.fromList selected)
+    atomically $ do
+      modifyTVar' (gsMesh router) $ Map.insert topic newMesh
+      modifyTVar' (gsPeers router) $ \pm ->
+        foldl' (\m pid -> Map.adjust (markPeerInMesh topic now) pid m)
+          pm selected
+
+selectOpportunistic
+  :: GossipSubRouter
+  -> Topic
+  -> Set.Set PeerId
+  -> Double
+  -> UTCTime
+  -> Int
+  -> IO [PeerId]
+selectOpportunistic router topic meshPeers median now wanted
+  | wanted <= 0 = pure []
+  | otherwise = do
+      peersMap <- readTVarIO (gsPeers router)
+      backoffMap <- readTVarIO (gsBackoff router)
+      ipMap <- readTVarIO (gsIPPeerCount router)
+      let direct = paramDirectPeers (gsParams router)
+          eligible =
+            [ pid
+            | (pid, ps) <- Map.toList peersMap
+            , Set.member topic (psTopics ps)
+            , not (Set.member pid meshPeers)
+            , not (Set.member pid direct)
+            , psProtocol ps /= FloodSubPeer
+            , not (isInBackoff backoffMap pid topic now)
+            , let score = computeScore (gsScoreParams router) pid ps ipMap now
+            , score >= 0
+            , score > median
+            ]
+      if null eligible
+        then pure []
+        else sampleIO (min wanted (length eligible)) eligible
 
 -- Fanout maintenance
 

@@ -651,6 +651,7 @@ finishSecureUpgrade yamuxConfig rm dir rawConn connScope remotePeerId securityPr
     , connSession = muxer
     , connState = stateVar
     , connResourceScope = connScope
+    , connRelayLimit = rcRelayLimit rawConn
     }
 
 resolveMuxer
@@ -691,6 +692,7 @@ nativeToConnection rm dir rawConn native = do
     , connSession = muxer
     , connState = stateVar
     , connResourceScope = connScope
+    , connRelayLimit = rcRelayLimit rawConn
     }
 
 openNativeStream :: MemoryAccount -> IO StreamIO -> IO StreamIO

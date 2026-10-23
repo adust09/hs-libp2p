@@ -59,6 +59,10 @@ module LibP2P
   , dial
   , closeConnection
   , newStream
+  , newStreamAllowingLimited
+  , StreamOpenError (..)
+  , RelayCircuitLimit (..)
+  , RelayCircuitExhausted (..)
   , DialError (..)
   , ResourceError (..)
   , setStreamHandler
@@ -238,12 +242,18 @@ import LibP2P.Protocol.Ping
   , sendPing
   , withPingSession
   )
-import LibP2P.Switch.Connection (closeConnection, newStream)
+import LibP2P.NAT.Relay.Limit (RelayCircuitExhausted (..))
+import LibP2P.Switch.Connection
+  ( StreamOpenError (..)
+  , closeConnection
+  , newStream
+  , newStreamAllowingLimited
+  )
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (ConnectionGater (..), defaultConnectionGater, switchListen, switchListenAddrs)
 import LibP2P.Switch (addTransport, newSwitch, newSwitchWithConfig, removeStreamHandler, setConnectionGater, setStreamHandler, subscribeSwitchEvents, switchClose)
 import LibP2P.Switch.Types (Connection (..), DialError (..), Direction (..), ResourceError (..), StreamHandler, Switch, SwitchConfig (..), SwitchEvent (..), defaultSwitchConfig)
 import LibP2P.Transport.TCP (newTCPTransport)
 import LibP2P.Transport.QUIC (newQUICTransport)
-import LibP2P.Transport (Transport (..))
+import LibP2P.Transport (RelayCircuitLimit (..), Transport (..))
 import LibP2P.Yamux.Types (Micros, YamuxConfig (..), defaultYamuxConfig, microsToInt, mkMicros)

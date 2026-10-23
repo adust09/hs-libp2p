@@ -238,6 +238,12 @@ data GossipSubParams = GossipSubParams
   , paramDirectPeers        :: !(Set PeerId)
     -- ^ Direct (explicit) peering agreements (gossipsub-v1.1.md): these
     -- peers always exchange messages and are never mesh members
+  , paramOpportunisticGraftTicks :: !Int
+    -- ^ Heartbeats between opportunistic-graft attempts (default 60).
+    -- The Nth heartbeat grafts; the first heartbeat does not.
+  , paramOpportunisticGraftPeers :: !Int
+    -- ^ Extra peers grafted when the mesh median score is below
+    -- 'stOpportunisticGraftThreshold' (default 2, gossipsub-v1.1.md)
   }
 
 -- | Default message ID: concatenation of from and seqno fields. Anonymous
@@ -277,6 +283,8 @@ defaultGossipSubParams = GossipSubParams
   , paramMaxIHaveLength    = 5000
   , paramMaxIHaveMessages  = 10
   , paramDirectPeers       = Set.empty
+  , paramOpportunisticGraftTicks = 60
+  , paramOpportunisticGraftPeers = 2
   }
 
 -- Peer tracking
