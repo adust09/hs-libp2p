@@ -103,6 +103,7 @@ library
     LibP2P.Protocol.GossipSub.Validation
     LibP2P.Protocol.GossipSub.MessageCache
     LibP2P.Protocol.GossipSub.Heartbeat
+    LibP2P.Protocol.GossipSub.DirectConnect
     LibP2P.Protocol.GossipSub.PeerExchange
     LibP2P.Protocol.GossipSub.Handler
   build-depends:
@@ -276,6 +277,7 @@ test-suite hs-libp2p-test
     LibP2P.Protocol.GossipSub.HeartbeatSpec
     LibP2P.Protocol.GossipSub.OpportunisticGraftSpec
     LibP2P.Protocol.GossipSub.HandlerSpec
+    LibP2P.Protocol.GossipSub.DirectConnectSpec
     LibP2P.Protocol.GossipSub.PeerExchangeSpec
     LibP2P.Protocol.GossipSub.MultiNodeSpec
     LibP2P.IntegrationSpec

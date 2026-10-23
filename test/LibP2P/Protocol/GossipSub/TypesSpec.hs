@@ -37,6 +37,9 @@ spec = do
         paramMcacheLen defaultGossipSubParams `shouldBe` 5
         paramMcacheGossip defaultGossipSubParams `shouldBe` 3
 
+      it "checks direct-peer connectivity every 300s" $ do
+        paramDirectConnectInterval defaultGossipSubParams `shouldBe` 300
+
       it "has opportunistic graft ticks=60 and peers=2" $ do
         paramOpportunisticGraftTicks defaultGossipSubParams `shouldBe` 60
         paramOpportunisticGraftPeers defaultGossipSubParams `shouldBe` 2

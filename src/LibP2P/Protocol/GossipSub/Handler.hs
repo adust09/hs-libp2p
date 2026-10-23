@@ -37,6 +37,7 @@ import Control.Concurrent.STM
   , atomically
   , newTVarIO
   , readTVar
+  , readTVarIO
   , writeTVar
   , modifyTVar'
   )
@@ -54,6 +55,13 @@ import LibP2P.MultistreamSelect.Negotiation
   , StreamIO (..)
   , closeQuietly
   , negotiateInitiator
+  )
+import LibP2P.Protocol.GossipSub.DirectConnect
+  ( DirectDialSlots
+  , cancelDirectDials
+  , newDirectDialSlots
+  , reconnectDirectPeer
+  , runDirectConnectLoop
   )
 import LibP2P.Protocol.GossipSub.Heartbeat (runHeartbeat)
 import LibP2P.Protocol.GossipSub.PeerExchange (installPeerExchange)
@@ -144,6 +152,10 @@ data GossipSubNode = GossipSubNode
     -- ^ True between a successful start and stop.
   , gsnLifecycleLock :: !(MVar ())
     -- ^ Serializes start and stop so heartbeat ownership cannot race.
+  , gsnDirectSlots :: !DirectDialSlots
+    -- ^ In-flight dials of configured direct peers (#259).
+  , gsnDirectConnect :: !(TVar (Maybe (Async ())))
+    -- ^ Connectivity checker. Cancelled by 'stopGossipSub'.
   }
 
 -- | Create a new GossipSub node with a Router wired to the Switch.
@@ -161,6 +173,8 @@ newGossipSubNode sw params = do
   installed <- newTVarIO False
   started <- newTVarIO False
   lifecycleLock <- newMVar ()
+  directSlots <- newDirectDialSlots
+  directConnect <- newTVarIO Nothing
   -- Create router with real sendRPC that uses the Switch
   let localPid = swLocalPeerId sw
   router <- newRouter params localPid
@@ -176,6 +190,8 @@ newGossipSubNode sw params = do
         , gsnNotifierInstalled = installed
         , gsnStarted = started
         , gsnLifecycleLock = lifecycleLock
+        , gsnDirectSlots = directSlots
+        , gsnDirectConnect = directConnect
         }
   installPeerExchange sw router
   atomically $ modifyTVar' (swDisconnectNotifiers sw)
@@ -398,11 +414,12 @@ activateGossipSub :: GossipSubNode -> IO ()
 activateGossipSub node = do
   writeIORef (gsnConnectHook node) (Just (onNewConnection node))
   writeIORef (gsnDisconnectHook node)
-    (Just (dropCachedGossipStream node))
+    (Just (onGossipDisconnect node))
   installConnectNotifier node
   registerHandlers node
   hbAsync <- runHeartbeat (gsnRouter node)
   atomically $ writeTVar (gsnHeartbeat node) (Just hbAsync)
+  startDirectMaintenance node
 
 -- | Restore the stopped state if activation fails partway through.
 rollbackGossipSubStart :: GossipSubNode -> IO ()
@@ -412,6 +429,7 @@ rollbackGossipSubStart node = do
   atomically $ writeTVar (gsnStarted node) False
   mapM_ (removeStreamHandler (gsnSwitch node)) gossipSubProtocolIds
   closeCachedStreams node
+  stopDirectMaintenance node
 
 -- | Claim the start so two concurrent or repeated starts share one heartbeat.
 claimStart :: GossipSubNode -> IO Bool
@@ -538,6 +556,7 @@ stopGossipSub node = withMVar (gsnLifecycleLock node) $ \_ -> do
     Nothing -> pure ()
   mapM_ (removeStreamHandler (gsnSwitch node)) gossipSubProtocolIds
   closeCachedStreams node
+  stopDirectMaintenance node
 
 -- | Close every cached outbound stream, releasing its resource slot.
 closeCachedStreams :: GossipSubNode -> IO ()
@@ -568,6 +587,36 @@ dropCachedGossipStream node conn = do
       then removeCachedStream (gsnStreams node) (gsnStreamMeta node) pid
       else pure Nothing
   mapM_ closeQuietly mStream
+
+-- | Start the direct-peer checker. The first pass runs immediately.
+startDirectMaintenance :: GossipSubNode -> IO ()
+startDirectMaintenance node = do
+  worker <- async $
+    runDirectConnectLoop (gsnSwitch node) (gsnRouter node)
+      (gsnStarted node) (gsnDirectSlots node)
+  atomically $ writeTVar (gsnDirectConnect node) (Just worker)
+
+-- | Cancel the checker and any dial it has claimed.
+stopDirectMaintenance :: GossipSubNode -> IO ()
+stopDirectMaintenance node = do
+  worker <- atomically $ do
+    current <- readTVar (gsnDirectConnect node)
+    writeTVar (gsnDirectConnect node) Nothing
+    pure current
+  mapM_ cancelQuiet worker
+  cancelDirectDials (gsnDirectSlots node)
+
+-- | Drop the cached stream, then redial if this was a direct peer.
+onGossipDisconnect :: GossipSubNode -> Connection -> IO ()
+onGossipDisconnect node conn = do
+  dropCachedGossipStream node conn
+  started <- readTVarIO (gsnStarted node)
+  when started $ reconnectDirectPeer (gsnSwitch node) (gsnRouter node)
+    (gsnDirectSlots node) (connPeerId conn)
+
+cancelQuiet :: Async () -> IO ()
+cancelQuiet worker =
+  cancel worker `catch` \(_ :: SomeException) -> pure ()
 
 -- | Subscribe to a topic.
 gossipJoin :: GossipSubNode -> Topic -> IO ()

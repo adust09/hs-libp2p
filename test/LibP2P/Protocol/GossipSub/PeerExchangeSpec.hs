@@ -226,6 +226,7 @@ openConn sw pid = do
         }
     , connState = stateVar
     , connResourceScope = scope
+    , connRelayLimit = Nothing
     }
 
 pause :: IO ()

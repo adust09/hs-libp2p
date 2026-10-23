@@ -238,6 +238,9 @@ data GossipSubParams = GossipSubParams
   , paramDirectPeers        :: !(Set PeerId)
     -- ^ Direct (explicit) peering agreements (gossipsub-v1.1.md): these
     -- peers always exchange messages and are never mesh members
+  , paramDirectConnectInterval :: !NominalDiffTime
+    -- ^ How often to redial a missing direct peer (default 300s).
+    -- Zero runs the initial pass only.
   , paramOpportunisticGraftTicks :: !Int
     -- ^ Heartbeats between opportunistic-graft attempts (default 60).
     -- The Nth heartbeat grafts; the first heartbeat does not.
@@ -283,6 +286,7 @@ defaultGossipSubParams = GossipSubParams
   , paramMaxIHaveLength    = 5000
   , paramMaxIHaveMessages  = 10
   , paramDirectPeers       = Set.empty
+  , paramDirectConnectInterval = 300
   , paramOpportunisticGraftTicks = 60
   , paramOpportunisticGraftPeers = 2
   }
