@@ -149,7 +149,8 @@ data GossipSubNode = GossipSubNode
 -- | Create a new GossipSub node with a Router wired to the Switch.
 --
 -- The Router's gsSendRPC callback opens/reuses outbound streams to peers
--- via the Switch's connection pool.
+-- via the Switch's connection pool. Accepted peer-exchange records are
+-- stored and dialed through the same Switch (#247).
 newGossipSubNode :: Switch -> GossipSubParams -> IO GossipSubNode
 newGossipSubNode sw params = do
   streamsVar <- newTVarIO Map.empty
