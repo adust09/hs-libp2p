@@ -241,6 +241,12 @@ data GossipSubParams = GossipSubParams
   , paramDirectConnectInterval :: !NominalDiffTime
     -- ^ How often to redial a missing direct peer (default 300s).
     -- Zero runs the initial pass only.
+  , paramOpportunisticGraftTicks :: !Int
+    -- ^ Heartbeats between opportunistic-graft attempts (default 60).
+    -- The Nth heartbeat grafts; the first heartbeat does not.
+  , paramOpportunisticGraftPeers :: !Int
+    -- ^ Extra peers grafted when the mesh median score is below
+    -- 'stOpportunisticGraftThreshold' (default 2, gossipsub-v1.1.md)
   }
 
 -- | Default message ID: concatenation of from and seqno fields. Anonymous
@@ -281,6 +287,8 @@ defaultGossipSubParams = GossipSubParams
   , paramMaxIHaveMessages  = 10
   , paramDirectPeers       = Set.empty
   , paramDirectConnectInterval = 300
+  , paramOpportunisticGraftTicks = 60
+  , paramOpportunisticGraftPeers = 2
   }
 
 -- Peer tracking

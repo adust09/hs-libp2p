@@ -88,6 +88,7 @@ library
     LibP2P.NAT.Relay.Message
     LibP2P.NAT.Relay
     LibP2P.NAT.Relay.Client
+    LibP2P.NAT.Relay.Limit
     LibP2P.NAT.Relay.Transport
     LibP2P.NAT.DCUtR.Message
     LibP2P.NAT.DCUtR
@@ -103,6 +104,7 @@ library
     LibP2P.Protocol.GossipSub.MessageCache
     LibP2P.Protocol.GossipSub.Heartbeat
     LibP2P.Protocol.GossipSub.DirectConnect
+    LibP2P.Protocol.GossipSub.PeerExchange
     LibP2P.Protocol.GossipSub.Handler
   build-depends:
     base        >= 4.18 && < 5,
@@ -258,6 +260,7 @@ test-suite hs-libp2p-test
     LibP2P.NAT.Relay.MessageSpec
     LibP2P.NAT.Relay.RelaySpec
     LibP2P.NAT.Relay.ClientSpec
+    LibP2P.NAT.Relay.LimitSpec
     LibP2P.NAT.Relay.TransportSpec
     LibP2P.NAT.Relay.ReservationLifecycleSpec
     LibP2P.NAT.Relay.ReservationRefreshSpec
@@ -272,8 +275,10 @@ test-suite hs-libp2p-test
     LibP2P.Protocol.GossipSub.ValidationSpec
     LibP2P.Protocol.GossipSub.MessageCacheSpec
     LibP2P.Protocol.GossipSub.HeartbeatSpec
+    LibP2P.Protocol.GossipSub.OpportunisticGraftSpec
     LibP2P.Protocol.GossipSub.HandlerSpec
     LibP2P.Protocol.GossipSub.DirectConnectSpec
+    LibP2P.Protocol.GossipSub.PeerExchangeSpec
     LibP2P.Protocol.GossipSub.MultiNodeSpec
     LibP2P.IntegrationSpec
     LibP2P.FaultInjectionSpec

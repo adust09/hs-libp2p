@@ -221,6 +221,7 @@ mkMockConnection sw pid stream openCountVar = do
         }
     , connState      = stateVar
     , connResourceScope = connScope
+    , connRelayLimit = Nothing
     }
 
 spec :: Spec

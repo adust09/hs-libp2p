@@ -126,6 +126,7 @@ mkRawConnection sock remoteAddr = do
     , rcLocalAddr = localAddr
     , rcRemoteAddr = remoteAddr
     , rcClose = NS.close sock
+    , rcRelayLimit = Nothing
     }
 
 -- | Listen on a TCP address.

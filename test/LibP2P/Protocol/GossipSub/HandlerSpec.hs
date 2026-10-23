@@ -143,6 +143,7 @@ mkGossipConn sw pid = do
             }
         , connState      = stateVar
         , connResourceScope = connScope
+        , connRelayLimit = Nothing
         }
   pure (conn, responder)
 

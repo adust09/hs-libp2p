@@ -97,6 +97,7 @@ mkTestConnection pid remoteAddr = do
         }
     , connState      = stateVar
     , connResourceScope = connScope
+    , connRelayLimit = Nothing
     }
 
 -- | Create a stream pair where the writer can signal EOF via streamClose.
@@ -166,6 +167,7 @@ mkPushConnection pid remoteAddr openStream = do
         }
     , connState      = stateVar
     , connResourceScope = connScope
+    , connRelayLimit = Nothing
     }
 
 -- | Insert a connection into the Switch's connection pool.
@@ -692,6 +694,7 @@ spec = do
                 }
             , connState      = stateVar
             , connResourceScope = connScope
+            , connRelayLimit = Nothing
             }
       atomically $ do
         pool <- readTVar (swConnPool sw)

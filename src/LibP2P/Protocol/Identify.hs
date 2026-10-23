@@ -38,7 +38,7 @@ module LibP2P.Protocol.Identify
 import Control.Applicative ((<|>))
 import Control.Concurrent.STM (atomically, modifyTVar', readTVar, writeTVar)
 import Control.Exception (SomeException, bracket, catch, finally, try)
-import LibP2P.Switch.Connection (newStream)
+import LibP2P.Switch.Connection (newStreamAllowingLimited)
 import Control.Monad (void)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -140,7 +140,8 @@ identifyTimeoutMicros = 5000000
 -- never answers must not pin a stream and a thread forever.
 requestIdentify :: Switch -> Connection -> IO (Either String IdentifyInfo)
 requestIdentify sw conn = do
-  opened <- newStream sw conn
+  -- Identify runs on every connection, including relayed circuits.
+  opened <- newStreamAllowingLimited sw conn
   case opened of
     Left err ->
       pure (Left ("stream reservation failed: " ++ show err))
@@ -321,7 +322,7 @@ pushIdentify sw = do
   mapM_ (\conn -> pushToConn conn `catch` \(_ :: SomeException) -> pure ()) conns
   where
     pushToConn conn = do
-      opened <- newStream sw conn
+      opened <- newStreamAllowingLimited sw conn
       case opened of
         Left _ -> pure ()
         Right stream -> bracket (pure stream) closeQuietly $ \s -> do

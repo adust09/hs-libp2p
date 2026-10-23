@@ -239,6 +239,7 @@ makeQUICConnection connection peerId localAddress remoteAddress closed = do
     , rcLocalAddr = localAddress
     , rcRemoteAddr = remoteAddress
     , rcClose = close
+    , rcRelayLimit = Nothing
     }
 
 streamToStreamIO :: QUIC.Stream -> IO StreamIO
