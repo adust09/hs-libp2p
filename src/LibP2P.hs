@@ -80,6 +80,7 @@ module LibP2P
   , webSocketServerParams
   , newWebSocketTransport
   , newWebSocketTransportWithConfig
+  , newWebTransportTransport
   , newQUICTransport
 
     -- * Connection gating
@@ -301,6 +302,7 @@ import LibP2P.Transport.WebSocket
   , newWebSocketTransportWithConfig
   , webSocketServerParams
   )
+import LibP2P.Transport.WebTransport (newWebTransportTransport)
 import LibP2P.Transport.QUIC (newQUICTransport)
 import LibP2P.Transport (RelayCircuitLimit (..), Transport (..))
 import LibP2P.Yamux.Types (Micros, YamuxConfig (..), defaultYamuxConfig, microsToInt, mkMicros)

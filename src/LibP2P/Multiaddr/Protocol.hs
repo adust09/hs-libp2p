@@ -22,6 +22,7 @@ data Protocol
   | TCP !Word16        -- ^ TCP port
   | UDP !Word16        -- ^ UDP port
   | P2P !ByteString    -- ^ Peer ID as multihash bytes
+  | Certhash !ByteString -- ^ TLS certificate fingerprint as multihash bytes
   | QuicV1             -- ^ QUIC v1 (no address)
   | WS                 -- ^ WebSocket (no address)
   | WSS                -- ^ WebSocket Secure (no address)
@@ -48,6 +49,7 @@ protocolCode (IP6 _) = 41
 protocolCode (TCP _) = 6
 protocolCode (UDP _) = 273
 protocolCode (P2P _) = 421
+protocolCode (Certhash _) = 466
 protocolCode QuicV1 = 461
 protocolCode WS = 477
 protocolCode WSS = 478
@@ -66,6 +68,7 @@ protocolName (IP6 _) = "ip6"
 protocolName (TCP _) = "tcp"
 protocolName (UDP _) = "udp"
 protocolName (P2P _) = "p2p"
+protocolName (Certhash _) = "certhash"
 protocolName QuicV1 = "quic-v1"
 protocolName WS = "ws"
 protocolName WSS = "wss"
@@ -84,6 +87,7 @@ protocolAddressSize 41 = Just (Fixed 16)      -- ip6
 protocolAddressSize 6 = Just (Fixed 2)        -- tcp
 protocolAddressSize 273 = Just (Fixed 2)      -- udp
 protocolAddressSize 421 = Just VarIntPrefixed -- p2p
+protocolAddressSize 466 = Just VarIntPrefixed -- certhash
 protocolAddressSize 461 = Just NoAddress      -- quic-v1
 protocolAddressSize 477 = Just NoAddress      -- ws
 protocolAddressSize 478 = Just NoAddress      -- wss
@@ -103,6 +107,7 @@ codeToProtocolName 41 = Just "ip6"
 codeToProtocolName 6 = Just "tcp"
 codeToProtocolName 273 = Just "udp"
 codeToProtocolName 421 = Just "p2p"
+codeToProtocolName 466 = Just "certhash"
 codeToProtocolName 461 = Just "quic-v1"
 codeToProtocolName 477 = Just "ws"
 codeToProtocolName 478 = Just "wss"

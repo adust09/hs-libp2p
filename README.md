@@ -24,7 +24,7 @@ The project is part of the [libp2p/unified-testing](https://github.com/libp2p/un
 cross-implementation interop effort, joined at the invitation of a libp2p
 maintainer. The codebase receives code review from libp2p maintainers, and
 official integration into the unified testing suite is planned within 2027.
-CI exercises hs ↔ go interoperability over TCP, WebSocket, and native QUIC v1.
+CI exercises hs ↔ go interoperability over TCP, WebSocket, native QUIC v1, and WebTransport.
 Local interop evidence lives in `interop/RESULTS.md`.
 
 ## Quickstart
@@ -44,9 +44,11 @@ main = do
   tcp <- newTCPTransport
   websocket <- newWebSocketTransport
   quic <- newQUICTransport kp
+  webtransport <- newWebTransportTransport kp
   addTransport sw tcp
   addTransport sw websocket
   addTransport sw quic
+  addTransport sw webtransport
   registerIdentifyHandlers sw
   registerPingHandler sw
 
@@ -55,6 +57,7 @@ main = do
     [ Multiaddr [IP4 0x7f000001, TCP 0]
     , Multiaddr [IP4 0x7f000001, TCP 0, WS]
     , Multiaddr [IP4 0x7f000001, UDP 0, QuicV1]
+    , Multiaddr [IP4 0x7f000001, UDP 0, QuicV1, WebTransport]
     ]
   putStrLn $ "Listening on: " ++ show addrs
 
@@ -64,6 +67,10 @@ main = do
   -- Clean shutdown
   switchClose sw
 ```
+
+`newWebTransportTransport` supports `/quic-v1/webtransport` dial/listen with
+short-lived self-signed certificates, `/certhash` verification, and Noise-based
+peer authentication.
 
 `newWebSocketTransport` supports `/ws` dial/listen and verified `/wss` dialing.
 To listen on `/wss`, load a Web-PKI `Credential`, set
@@ -87,8 +94,8 @@ cabal haddock
 
 ## Tests
 
-1408 tests cover all components, including unit tests, property tests, and
-TCP/WebSocket/QUIC loopback tests. CI additionally runs bidirectional go-libp2p interop.
+1422 tests cover all components, including unit tests, property tests, and
+TCP/WebSocket/QUIC/WebTransport loopback tests. CI additionally runs bidirectional go-libp2p interop.
 
 ```bash
 # Run all tests

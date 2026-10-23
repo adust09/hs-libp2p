@@ -11,7 +11,9 @@ module LibP2P.Noise.Handshake
   , HandshakeState (..)
     -- * Payload encoding
   , encodeNoisePayload
+  , encodeNoisePayloadWithCerthashes
   , decodeNoisePayload
+  , decodeNoiseCerthashes
   , buildHandshakePayload
     -- * Static key signing
   , signStaticKey
@@ -51,7 +53,7 @@ import qualified Crypto.Noise.DH as DH
 import Crypto.Noise.DH.Curve25519 (Curve25519)
 import Crypto.Noise.HandshakePatterns (noiseXX)
 import Crypto.Noise.Hash.SHA256 (SHA256)
-import Data.Bits (shiftR, (.&.))
+import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.ByteArray (ScrubbedBytes)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -125,6 +127,72 @@ encodeNoisePayload (NoisePayload identKey identSig) =
     <> BS.singleton 0x12
     <> encodeUvarint (fromIntegral (BS.length identSig))
     <> identSig
+
+-- | Encode a Noise payload with libp2p WebTransport certificate hashes.
+encodeNoisePayloadWithCerthashes :: NoisePayload -> [ByteString] -> ByteString
+encodeNoisePayloadWithCerthashes payload [] = encodeNoisePayload payload
+encodeNoisePayloadWithCerthashes payload hashes =
+  encodeNoisePayload payload <> lengthDelimitedField 4 extensions
+  where
+    extensions = BS.concat (map (lengthDelimitedField 1) hashes)
+
+-- | Decode WebTransport certificate hashes from Noise payload extensions.
+decodeNoiseCerthashes :: ByteString -> Either String [ByteString]
+decodeNoiseCerthashes = fmap concat . collectOuterExtensions
+
+collectOuterExtensions :: ByteString -> Either String [[ByteString]]
+collectOuterExtensions input
+  | BS.null input = Right []
+  | otherwise = do
+      (tag, rest) <- decodeUvarint input
+      let fieldNum = tag `shiftR` 3
+          wireType = tag .&. 0x7
+      if fieldNum == 4 && wireType == 2
+        then do
+          (extension, trailing) <- parseLengthDelimited rest
+          hashes <- collectCerthashes extension
+          (hashes :) <$> collectOuterExtensions trailing
+        else skipExtensionField wireType rest >>= collectOuterExtensions
+
+collectCerthashes :: ByteString -> Either String [ByteString]
+collectCerthashes input
+  | BS.null input = Right []
+  | otherwise = do
+      (tag, rest) <- decodeUvarint input
+      let fieldNum = tag `shiftR` 3
+          wireType = tag .&. 0x7
+      if fieldNum == 1 && wireType == 2
+        then do
+          (hash, trailing) <- parseLengthDelimited rest
+          (hash :) <$> collectCerthashes trailing
+        else skipExtensionField wireType rest >>= collectCerthashes
+
+lengthDelimitedField :: Word64 -> ByteString -> ByteString
+lengthDelimitedField fieldNumber bytes =
+  encodeUvarint ((fieldNumber `shiftL` 3) .|. 2)
+    <> encodeUvarint (fromIntegral (BS.length bytes))
+    <> bytes
+
+parseLengthDelimited :: ByteString -> Either String (ByteString, ByteString)
+parseLengthDelimited input = do
+  (len, rest) <- decodeUvarint input
+  let fieldLen = fromIntegral len :: Int
+  if BS.length rest < fieldLen
+    then Left "protobuf length-delimited field is truncated"
+    else Right (BS.take fieldLen rest, BS.drop fieldLen rest)
+
+skipExtensionField :: Word64 -> ByteString -> Either String ByteString
+skipExtensionField 0 input = snd <$> decodeUvarint input
+skipExtensionField 1 input = skipExtensionFixed 8 input
+skipExtensionField 2 input = snd <$> parseLengthDelimited input
+skipExtensionField 5 input = skipExtensionFixed 4 input
+skipExtensionField wireType _ =
+  Left $ "unsupported protobuf wire type " <> show wireType
+
+skipExtensionFixed :: Int -> ByteString -> Either String ByteString
+skipExtensionFixed size input
+  | BS.length input < size = Left "protobuf fixed-width field is truncated"
+  | otherwise = Right (BS.drop size input)
 
 -- | Decode a NoisePayload from protobuf bytes.
 --

@@ -58,6 +58,9 @@ library
     LibP2P.Transport
     LibP2P.Transport.TCP
     LibP2P.Transport.WebSocket
+    LibP2P.Transport.WebTransport
+    LibP2P.Transport.WebTransport.Certificate
+    LibP2P.Transport.WebTransport.HTTP3
     LibP2P.Transport.QUIC
     LibP2P.Security.TLS
     LibP2P.Security.TLS.Certificate
@@ -97,6 +100,7 @@ library
     LibP2P.Noise.Framing
     LibP2P.Noise.Handshake
     LibP2P.Noise.Session
+    LibP2P.Noise.WebTransport
     LibP2P.Protocol.GossipSub.Types
     LibP2P.Protocol.GossipSub.Message
     LibP2P.Protocol.GossipSub.Extensions
@@ -115,6 +119,7 @@ library
     base        >= 4.18 && < 5,
     bytestring  >= 0.10 && < 0.13,
     binary      >= 0.8.9 && < 0.9,
+    base64-bytestring >= 1.2 && < 1.3,
     text        >= 1.2  && < 2.2,
     cacophony   >= 0.11 && < 0.12,
     crypton     >= 1.0.5 && < 1.1,
@@ -126,6 +131,7 @@ library
     memory      >= 0.18  && < 0.19,
     ppad-base58 >= 0.2  && < 0.3,
     iproute     >= 1.7  && < 1.8,
+    http3       >= 0.1.2 && < 0.1.3,
     network     >= 3.2.3 && < 3.3,
     quic        >= 0.2.23 && < 0.3,
     tls         >= 2.2   && < 2.3,
@@ -235,6 +241,7 @@ test-suite hs-libp2p-test
     LibP2P.Yamux.TransportEofSpec
     LibP2P.Transport.TCPSpec
     LibP2P.Transport.WebSocketSpec
+    LibP2P.Transport.WebTransportSpec
     LibP2P.Transport.QUICSpec
     LibP2P.Security.TLSSpec
     LibP2P.Security.TLS.CertificateSpec
