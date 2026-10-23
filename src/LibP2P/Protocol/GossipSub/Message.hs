@@ -5,9 +5,10 @@
 --   RPC fields: subscriptions(1), publish(2), control(3)
 --   SubOpts: subscribe(1), topicid(2)
 --   Message: from(1), data(2), seqno(3), topic(4), signature(5), key(6)
---   ControlMessage: ihave(1), iwant(2), graft(3), prune(4)
+--   ControlMessage: ihave(1), iwant(2), graft(3), prune(4), idontwant(5)
 --   ControlIHave: topicID(1), messageIDs(2)
 --   ControlIWant: messageIDs(1)
+--   ControlIDontWant: messageIDs(1)
 --   ControlGraft: topicID(1)
 --   ControlPrune: topicID(1), peers(2), backoff(3)
 --   PeerInfo: peerID(1), signedPeerRecord(2)
@@ -107,6 +108,11 @@ encodeIWant :: IWant -> MessageBuilder
 encodeIWant (IWant mids) =
   foldMap (\mid -> Encode.byteString (FieldNumber 1) mid) mids
 
+-- | Encode an IDONTWANT sub-message.
+encodeIDontWant :: IDontWant -> MessageBuilder
+encodeIDontWant (IDontWant mids) =
+  foldMap (\mid -> Encode.byteString (FieldNumber 1) mid) mids
+
 -- | Encode a Graft sub-message.
 encodeGraft :: Graft -> MessageBuilder
 encodeGraft (Graft topic) =
@@ -132,6 +138,7 @@ encodeControlMessage ctrl =
   <> repEmbedded 2 encodeIWant (ctrlIWant ctrl)
   <> repEmbedded 3 encodeGraft (ctrlGraft ctrl)
   <> repEmbedded 4 encodePrune (ctrlPrune ctrl)
+  <> repEmbedded 5 encodeIDontWant (ctrlIDontWant ctrl)
 
 -- | Encode an RPC message to protobuf (no framing).
 encodeRPC :: RPC -> ByteString
@@ -177,6 +184,11 @@ iwantParser :: Parser RawMessage IWant
 iwantParser = IWant
   <$> at (repeated Decode.byteString) (FieldNumber 1)
 
+-- | Decode IDONTWANT from protobuf.
+idontwantParser :: Parser RawMessage IDontWant
+idontwantParser = IDontWant
+  <$> at (repeated Decode.byteString) (FieldNumber 1)
+
 -- | Decode Graft from protobuf.
 graftParser :: Parser RawMessage Graft
 graftParser = Graft
@@ -202,6 +214,7 @@ controlMessageParser = ControlMessage
   <*> at (repeated (embedded' iwantParser)) (FieldNumber 2)
   <*> at (repeated (embedded' graftParser)) (FieldNumber 3)
   <*> at (repeated (embedded' pruneParser)) (FieldNumber 4)
+  <*> at (repeated (embedded' idontwantParser)) (FieldNumber 5)
 
 -- | Decode a ControlMessage from raw bytes.
 decodeControlMessage :: ByteString -> Either ParseError ControlMessage

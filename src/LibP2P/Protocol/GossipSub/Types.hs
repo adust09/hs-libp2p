@@ -1,6 +1,6 @@
 -- | GossipSub core types and parameters (specs/pubsub/gossipsub).
 --
--- Protocol ID: /meshsub/1.1.0
+-- Protocol ID: /meshsub/1.2.0
 --
 -- GossipSub constructs two overlapping overlay networks per topic:
 -- a full-message mesh (eager push, degree D=6) and a metadata-only
@@ -10,6 +10,7 @@
 module LibP2P.Protocol.GossipSub.Types
   ( -- * Protocol constants
     gossipSubProtocolId
+  , gossipSubProtocolIdV11
   , gossipSubProtocolIdV10
   , floodSubProtocolId
   , maxRPCSize
@@ -22,6 +23,7 @@ module LibP2P.Protocol.GossipSub.Types
   , ControlMessage (..)
   , IHave (..)
   , IWant (..)
+  , IDontWant (..)
   , Graft (..)
   , Prune (..)
   , PeerExchangeInfo (..)
@@ -77,13 +79,16 @@ import Data.Time (NominalDiffTime, UTCTime)
 import Data.Word (Word64)
 import LibP2P.Crypto.PeerId (PeerId)
 
--- | GossipSub v1.1 protocol identifier.
+-- | GossipSub v1.2 protocol identifier (preferred).
 gossipSubProtocolId :: Text
-gossipSubProtocolId = "/meshsub/1.1.0"
+gossipSubProtocolId = "/meshsub/1.2.0"
 
--- | GossipSub v1.0 protocol identifier. Advertised alongside v1.1 for
--- backwards compatibility (gossipsub-v1.1.md: the v1.1 extensions are
--- fully backwards compatible with v1.0 of the protocol).
+-- | GossipSub v1.1 protocol identifier, retained for compatibility.
+gossipSubProtocolIdV11 :: Text
+gossipSubProtocolIdV11 = "/meshsub/1.1.0"
+
+-- | GossipSub v1.0 protocol identifier. Advertised alongside newer versions
+-- because all GossipSub extensions remain backwards compatible.
 gossipSubProtocolIdV10 :: Text
 gossipSubProtocolIdV10 = "/meshsub/1.0.0"
 
@@ -133,6 +138,11 @@ data IWant = IWant
   { iwantMessageIds :: ![MessageId]  -- ^ Requested message IDs
   } deriving (Show, Eq)
 
+-- | IDONTWANT: suppress delivery of messages with these IDs (v1.2).
+data IDontWant = IDontWant
+  { idontwantMessageIds :: ![MessageId]
+  } deriving (Show, Eq)
+
 -- | GRAFT: request mesh membership.
 data Graft = Graft
   { graftTopic :: !Topic  -- ^ Topic to graft into
@@ -151,12 +161,13 @@ data PeerExchangeInfo = PeerExchangeInfo
   , pxSignedPeerRecord  :: !(Maybe ByteString)  -- ^ Optional signed peer record
   } deriving (Show, Eq)
 
--- | GossipSub control message (IHAVE, IWANT, GRAFT, PRUNE).
+-- | GossipSub control message (IHAVE, IWANT, GRAFT, PRUNE, IDONTWANT).
 data ControlMessage = ControlMessage
-  { ctrlIHave :: ![IHave]
-  , ctrlIWant :: ![IWant]
-  , ctrlGraft :: ![Graft]
-  , ctrlPrune :: ![Prune]
+  { ctrlIHave     :: ![IHave]
+  , ctrlIWant     :: ![IWant]
+  , ctrlGraft     :: ![Graft]
+  , ctrlPrune     :: ![Prune]
+  , ctrlIDontWant :: ![IDontWant]
   } deriving (Show, Eq)
 
 -- | RPC wrapper containing subscriptions, published messages, and control.
@@ -235,6 +246,14 @@ data GossipSubParams = GossipSubParams
     -- and max ids advertised in an emitted IHAVE (go default 5000)
   , paramMaxIHaveMessages   :: !Int
     -- ^ Max IHAVE batches accepted from a peer per heartbeat (go default 10)
+  , paramMaxIDontWantLength :: !Int
+    -- ^ Max message IDs accepted from one IDONTWANT RPC (go default 10)
+  , paramMaxIDontWantMessages :: !Int
+    -- ^ Max IDONTWANT RPCs accepted from a peer per heartbeat (go default 1000)
+  , paramIDontWantMessageThreshold :: !Int
+    -- ^ Minimum payload size that triggers IDONTWANT emission (go default 1 KiB)
+  , paramIDontWantMessageTTL :: !Int
+    -- ^ Heartbeats before a received IDONTWANT expires (go default 3)
   , paramDirectPeers        :: !(Set PeerId)
     -- ^ Direct (explicit) peering agreements (gossipsub-v1.1.md): these
     -- peers always exchange messages and are never mesh members
@@ -283,23 +302,26 @@ defaultGossipSubParams = GossipSubParams
   , paramMcacheGossip      = 3
   , paramPrunePeers        = 16
   , paramIWantFollowupTime = 3
-  , paramMaxIHaveLength    = 5000
-  , paramMaxIHaveMessages  = 10
-  , paramDirectPeers       = Set.empty
-  , paramDirectConnectInterval = 300
+  , paramMaxIHaveLength          = 5000
+  , paramMaxIHaveMessages        = 10
+  , paramMaxIDontWantLength      = 10
+  , paramMaxIDontWantMessages    = 1000
+  , paramIDontWantMessageThreshold = 1024
+  , paramIDontWantMessageTTL     = 3
+  , paramDirectPeers             = Set.empty
+  , paramDirectConnectInterval   = 300
   , paramOpportunisticGraftTicks = 60
   , paramOpportunisticGraftPeers = 2
   }
 
 -- Peer tracking
 
--- | Peer's negotiated protocol capability. Peers on /meshsub/1.0.0 must
--- not receive v1.1 control extensions (PX records or the backoff field
--- in PRUNE). Peers on /floodsub/1.0.0 have no mesh: they are flooded
--- every message for topics they subscribe to and never receive control
--- messages (gossipsub-v1.0.md "Compatibility with FloodSub").
+-- | Peer's negotiated protocol capability. Features are gated by version:
+-- v1.1 adds PX/backoff and v1.2 adds IDONTWANT. FloodSub peers receive full
+-- messages but no GossipSub control messages.
 data PeerProtocol
-  = GossipSubPeer     -- ^ GossipSub v1.1 (/meshsub/1.1.0)
+  = GossipSubV12Peer  -- ^ GossipSub v1.2 (/meshsub/1.2.0)
+  | GossipSubPeer     -- ^ GossipSub v1.1 (/meshsub/1.1.0)
   | GossipSubV10Peer  -- ^ GossipSub v1.0 (/meshsub/1.0.0)
   | FloodSubPeer      -- ^ FloodSub only (/floodsub/1.0.0)
   deriving (Show, Eq)
@@ -499,6 +521,11 @@ data GossipSubRouter = GossipSubRouter
   , gsIWantServed :: !(TVar (Map PeerId Int))
     -- ^ Messages served in response to IWANT per peer since the last
     -- heartbeat, capped at 'paramMaxIHaveLength'
+  , gsIDontWantCounts :: !(TVar (Map PeerId Int))
+    -- ^ IDONTWANT RPCs accepted per peer since the last heartbeat.
+  , gsDontSendMessageIds :: !(TVar (Map PeerId (Map ByteString Int)))
+    -- ^ SHA-256 message-ID digest to remaining heartbeat TTL per peer.
+    -- Fixed-size digests bound memory retained from untrusted wire IDs.
     -- Message cache (Phase 9c)
   , gsMessageCache  :: !(TVar MessageCache)
     -- ^ Sliding-window message cache for IWANT and IHAVE
@@ -531,6 +558,6 @@ data GossipSubRouter = GossipSubRouter
 emptyRPC :: RPC
 emptyRPC = RPC [] [] Nothing
 
--- | Empty control message with no IHAVE/IWANT/GRAFT/PRUNE.
+-- | Empty control message with no IHAVE/IWANT/GRAFT/PRUNE/IDONTWANT.
 emptyControlMessage :: ControlMessage
-emptyControlMessage = ControlMessage [] [] [] []
+emptyControlMessage = ControlMessage [] [] [] [] []

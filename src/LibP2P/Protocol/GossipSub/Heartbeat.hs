@@ -27,6 +27,7 @@ import Data.Word (Word64)
 import List.Shuffle (sampleIO)
 import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Protocol.GossipSub.Types
+import LibP2P.Protocol.GossipSub.IDontWant (expireIDontWantState)
 import LibP2P.Protocol.GossipSub.MessageCache (cacheGetGossipIds, cacheShift)
 import LibP2P.Protocol.GossipSub.Router (buildPrune)
 import LibP2P.Protocol.GossipSub.Score
@@ -52,6 +53,7 @@ heartbeatOnce router = do
   expireBackoff router
   cleanSeenCache router
   resetGossipBudgets router
+  expireIDontWantState router
   -- Increment heartbeat counter
   atomically $ modifyTVar' (gsHeartbeatCount router) (+ 1)
 

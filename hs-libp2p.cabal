@@ -98,6 +98,7 @@ library
     LibP2P.Noise.Session
     LibP2P.Protocol.GossipSub.Types
     LibP2P.Protocol.GossipSub.Message
+    LibP2P.Protocol.GossipSub.IDontWant
     LibP2P.Protocol.GossipSub.Router
     LibP2P.Protocol.GossipSub.Score
     LibP2P.Protocol.GossipSub.Validation
@@ -270,6 +271,7 @@ test-suite hs-libp2p-test
     LibP2P.NAT.RegistrationSpec
     LibP2P.Protocol.GossipSub.TypesSpec
     LibP2P.Protocol.GossipSub.MessageSpec
+    LibP2P.Protocol.GossipSub.IDontWantSpec
     LibP2P.Protocol.GossipSub.RouterSpec
     LibP2P.Protocol.GossipSub.ScoreSpec
     LibP2P.Protocol.GossipSub.ValidationSpec

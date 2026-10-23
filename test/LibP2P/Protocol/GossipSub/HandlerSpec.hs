@@ -40,6 +40,7 @@ import LibP2P.Protocol.GossipSub.Handler
   , gossipLeave
   , gossipPublish
   , gossipSubProtocolId
+  , gossipSubProtocolIdV11
   , gossipSubProtocolIdV10
   , handleGossipSubStream
   , newGossipSubNode
@@ -58,6 +59,7 @@ import LibP2P.Protocol.GossipSub.Types
   ( GossipSubParams (..)
   , GossipSubRouter (..)
   , PeerProtocol (..)
+  , PeerState (..)
   , PubSubMessage (..)
   , RPC (..)
   , SubOpts (..)
@@ -122,7 +124,11 @@ mkGossipConn :: Switch -> PeerId -> IO (Connection, Async NegotiationResult)
 mkGossipConn sw pid = do
   (localStream, remoteStream) <- mkMemoryStreamPair
   responder <- async $ negotiateResponder remoteStream
-    [gossipSubProtocolId, gossipSubProtocolIdV10, floodSubProtocolId]
+    [ gossipSubProtocolId
+    , gossipSubProtocolIdV11
+    , gossipSubProtocolIdV10
+    , floodSubProtocolId
+    ]
   stateVar <- newTVarIO ConnOpen
   connScope <- atomically (reserveConnection (swResourceMgr sw) pid Inbound)
     >>= either (fail . show) pure
@@ -367,23 +373,25 @@ spec = do
       -- Cleanup
       stopGossipSub node
 
-    -- Issue #157: peers speaking only /meshsub/1.0.0 must still get a
-    -- pubsub stream — both protocol versions are registered and accepted.
-    it "registers handlers for both /meshsub/1.1.0 and /meshsub/1.0.0" $ do
+    -- Issue #241: v1.2 is preferred while v1.1 and v1.0 remain available
+    -- for backwards-compatible peers.
+    it "registers handlers for /meshsub/1.2.0, /meshsub/1.1.0, and /meshsub/1.0.0" $ do
       (sw, _pid) <- mkTestSwitch
       node <- newGossipSubNode sw testParams
       startGossipSub node
-      h11 <- lookupStreamHandler sw gossipSubProtocolId
+      h12 <- lookupStreamHandler sw gossipSubProtocolId
+      h11 <- lookupStreamHandler sw gossipSubProtocolIdV11
       h10 <- lookupStreamHandler sw gossipSubProtocolIdV10
-      case (h11, h10) of
-        (Just _, Just _) -> pure ()
-        _ -> expectationFailure "both protocol versions should be registered"
+      case (h12, h11, h10) of
+        (Just _, Just _, Just _) -> pure ()
+        _ -> expectationFailure "all GossipSub protocol versions should be registered"
       stopGossipSub node
-      h11' <- lookupStreamHandler sw gossipSubProtocolId
+      h12' <- lookupStreamHandler sw gossipSubProtocolId
+      h11' <- lookupStreamHandler sw gossipSubProtocolIdV11
       h10' <- lookupStreamHandler sw gossipSubProtocolIdV10
-      case (h11', h10') of
-        (Nothing, Nothing) -> pure ()
-        _ -> expectationFailure "both protocol versions should be unregistered after stop"
+      case (h12', h11', h10') of
+        (Nothing, Nothing, Nothing) -> pure ()
+        _ -> expectationFailure "all GossipSub protocol versions should be unregistered after stop"
 
     -- Issue #157 last item: floodsub compatibility — /floodsub/1.0.0 is
     -- registered alongside the meshsub protocols so floodsub-only peers
@@ -447,6 +455,8 @@ spec = do
       fireNotifiers sw liveConn
       opened <- waitForCachedStream node livePid 40
       opened `shouldBe` True
+      livePeers <- atomically $ readTVar (gsPeers (gsnRouter node))
+      psProtocol <$> Map.lookup livePid livePeers `shouldBe` Just GossipSubV12Peer
       cancel liveResponder
       stopGossipSub node
       (lateConn, lateResponder) <- mkGossipConn sw latePid

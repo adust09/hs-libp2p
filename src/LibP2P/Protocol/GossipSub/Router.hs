@@ -53,6 +53,12 @@ import LibP2P.Crypto.PeerRecord (PeerRecord (..), openPeerRecordEnvelope)
 import LibP2P.Crypto.Key (KeyPair (..), sign)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.Protocol.GossipSub.Types
+import LibP2P.Protocol.GossipSub.IDontWant
+  ( announceIDontWant
+  , filterAllowedPeers
+  , handleIDontWant
+  , peerRejectsMessage
+  )
 import LibP2P.Protocol.GossipSub.MessageCache (newMessageCache, cachePut, cacheGet)
 import LibP2P.Protocol.GossipSub.Score
   ( computeScore
@@ -92,6 +98,8 @@ newRouter params localPid sendRPC getTime = do
   ihaveCounts <- newTVarIO Map.empty
   iaskedCounts <- newTVarIO Map.empty
   iwantServed <- newTVarIO Map.empty
+  idontwantCounts <- newTVarIO Map.empty
+  dontSendMessageIds <- newTVarIO Map.empty
   onPX     <- newTVarIO (\_ _ -> pure ())
   signedRecords <- newTVarIO Map.empty
   pure GossipSubRouter
@@ -113,6 +121,8 @@ newRouter params localPid sendRPC getTime = do
     , gsIHaveCounts    = ihaveCounts
     , gsIAskedCounts   = iaskedCounts
     , gsIWantServed    = iwantServed
+    , gsIDontWantCounts = idontwantCounts
+    , gsDontSendMessageIds = dontSendMessageIds
     , gsMessageCache   = mcache
     , gsHeartbeatCount = hbCount
     , gsSendRPC        = sendRPC
@@ -200,6 +210,8 @@ removePeer router pid = do
     modifyTVar' (gsFanout router) (Map.map (Set.delete pid))
     modifyTVar' (gsIWantPromises router) $
       Map.filterWithKey (\(p, _) _ -> p /= pid)
+    modifyTVar' (gsIDontWantCounts router) (Map.delete pid)
+    modifyTVar' (gsDontSendMessageIds router) (Map.delete pid)
 
 clearMeshClock :: TopicPeerState -> TopicPeerState
 clearMeshClock tps = tps { tpsInMesh = False, tpsGraftTime = Nothing, tpsMeshTime = 0 }
@@ -266,11 +278,11 @@ floodSubTopicPeers peers topic =
 
 -- Protocol version gating
 
--- | True when the peer negotiated /meshsub/1.1.0. Unknown peers are
--- treated as v1.1 (the preferred protocol).
+-- | True when the peer negotiated a version supporting v1.1 extensions.
+-- Unknown peers retain the historical permissive behavior.
 peerSupportsV11 :: Map.Map PeerId PeerState -> PeerId -> Bool
 peerSupportsV11 peers pid = case Map.lookup pid peers of
-  Just ps -> psProtocol ps == GossipSubPeer
+  Just ps -> psProtocol ps `elem` [GossipSubV12Peer, GossipSubPeer]
   Nothing -> True
 
 -- | Build a PRUNE for a peer, gated on its negotiated protocol version:
@@ -411,8 +423,9 @@ publish router topic payload mKeyPair = do
     modifyTVar' (gsSeen router) (Map.insert msgId now)
     modifyTVar' (gsMessageCache router) (cachePut msgId msg)
 
-  -- Build RPC with published message
+  -- Build RPC with published message and apply any live IDONTWANTs.
   let pubRPC = emptyRPC { rpcPublish = [msg] }
+  unwanted <- readTVarIO (gsDontSendMessageIds router)
 
   if paramFloodPublish (gsParams router)
     then do
@@ -425,6 +438,7 @@ publish router topic payload mKeyPair = do
           targets = Map.foldlWithKey' (\acc pid ps ->
             if Set.member topic (psTopics ps)
                && pid /= gsLocalPeerId router
+               && not (peerRejectsMessage unwanted pid msgId)
                && (isDirectPeer router pid
                    || computeScore (gsScoreParams router) pid ps ipMap now >= threshold)
             then pid : acc
@@ -442,7 +456,8 @@ publish router topic payload mKeyPair = do
         pure (Map.findWithDefault Set.empty topic m)
       if not (Set.null meshPeers)
         then mapM_ (\pid -> gsSendRPC router pid pubRPC)
-               (Set.toList (Set.unions [meshPeers, direct, flood]))
+               (Set.toList (filterAllowedPeers unwanted msgId
+                 (Set.unions [meshPeers, direct, flood])))
         else do
           -- Fanout: use existing or create new (direct and floodsub
           -- peers excluded from selection but always sent to)
@@ -468,7 +483,8 @@ publish router topic payload mKeyPair = do
               atomically $ modifyTVar' (gsFanoutPub router) (Map.insert topic now)
               pure foPeers
           mapM_ (\pid -> gsSendRPC router pid pubRPC)
-            (Set.toList (Set.unions [targets, direct, flood]))
+            (Set.toList (filterAllowedPeers unwanted msgId
+              (Set.unions [targets, direct, flood])))
 
   -- Deliver to local application
   onMsg <- readTVarIO (gsOnMessage router)
@@ -494,8 +510,10 @@ handleRPC' router sender rpc = do
   -- Process subscriptions
   handleSubscriptions router sender (rpcSubscriptions rpc)
 
-  -- Process published messages
-  mapM_ (handlePublishedMessage router sender) (rpcPublish rpc)
+  -- IDONTWANT is emitted immediately before validation of each first-seen
+  -- large message, then the normal validation/deduplication path runs.
+  mapM_ (\msg -> announceIDontWant router sender msg
+              >> handlePublishedMessage router sender msg) (rpcPublish rpc)
 
   -- Process control messages
   case rpcControl rpc of
@@ -505,6 +523,7 @@ handleRPC' router sender rpc = do
       handleIWant router sender (ctrlIWant ctrl)
       handleGraft router sender (ctrlGraft ctrl)
       handlePrune router sender (ctrlPrune ctrl)
+      handleIDontWant router sender (ctrlIDontWant ctrl)
 
 -- | Process a published message: verify, deduplicate, validate, forward, deliver.
 --
@@ -812,8 +831,10 @@ handleIWant router sender iwants = do
   score <- peerScore router sender
   unless (score < stGossipThreshold (gsThresholds router)) $ do
     cache <- readTVarIO (gsMessageCache router)
+    unwanted <- readTVarIO (gsDontSendMessageIds router)
     let requestedIds = concatMap iwantMessageIds iwants
         found = [ msg | mid <- requestedIds
+                       , not (peerRejectsMessage unwanted sender mid)
                        , Just msg <- [cacheGet mid cache] ]
     toServe <- atomically $ do
       served <- readTVar (gsIWantServed router)
@@ -854,9 +875,12 @@ forwardMessage router sender msg = do
     m <- readTVar (gsMesh router)
     pure (Map.findWithDefault Set.empty topic m)
   peers <- readTVarIO (gsPeers router)
+  unwanted <- readTVarIO (gsDontSendMessageIds router)
   let direct = directTopicPeers router peers topic
       flood  = floodSubTopicPeers peers topic
-      targets = Set.delete sender (Set.unions [meshPeers, direct, flood])
+      candidates = Set.delete sender (Set.unions [meshPeers, direct, flood])
+      targets = filterAllowedPeers unwanted
+        (paramMessageIdFn (gsParams router) msg) candidates
       fwdRPC = emptyRPC { rpcPublish = [msg] }
   mapM_ (\pid -> gsSendRPC router pid fwdRPC) (Set.toList targets)
 
