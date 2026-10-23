@@ -273,6 +273,7 @@ test-suite hs-libp2p-test
     LibP2P.Protocol.GossipSub.ValidationSpec
     LibP2P.Protocol.GossipSub.MessageCacheSpec
     LibP2P.Protocol.GossipSub.HeartbeatSpec
+    LibP2P.Protocol.GossipSub.OpportunisticGraftSpec
     LibP2P.Protocol.GossipSub.HandlerSpec
     LibP2P.Protocol.GossipSub.MultiNodeSpec
     LibP2P.IntegrationSpec

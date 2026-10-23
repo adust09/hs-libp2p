@@ -37,6 +37,10 @@ spec = do
         paramMcacheLen defaultGossipSubParams `shouldBe` 5
         paramMcacheGossip defaultGossipSubParams `shouldBe` 3
 
+      it "has opportunistic graft ticks=60 and peers=2" $ do
+        paramOpportunisticGraftTicks defaultGossipSubParams `shouldBe` 60
+        paramOpportunisticGraftPeers defaultGossipSubParams `shouldBe` 2
+
     describe "defaultMessageId" $ do
       it "concatenates from and seqno" $ do
         let msg = PubSubMessage
