@@ -1,0 +1,18 @@
+# Override docker-compose.cross.yml to exercise WebTransport over HTTP/3.
+services:
+  hs-dialer:
+    environment:
+      TRANSPORT: webtransport
+      SECURE_CHANNEL: null
+      MUXER: null
+  hs-listener:
+    environment:
+      TRANSPORT: webtransport
+      SECURE_CHANNEL: null
+      MUXER: null
+  go-listener:
+    environment:
+      transport: webtransport
+  go-dialer:
+    environment:
+      transport: webtransport

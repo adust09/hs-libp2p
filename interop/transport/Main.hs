@@ -10,9 +10,9 @@
 --   IS_DIALER      - "true" or "false"
 --   REDIS_ADDR     - Redis host:port (default: "redis:6379")
 --   TEST_KEY       - hex key namespacing Redis coordination keys
---   TRANSPORT      - "tcp", "ws", or "quic-v1"
---   SECURE_CHANNEL - "noise" or "tls" for TCP/WebSocket; unset for QUIC
---   MUXER          - "yamux" for TCP/WebSocket; unset for QUIC
+--   TRANSPORT      - "tcp", "ws", "quic-v1", or "webtransport"
+--   SECURE_CHANNEL - "noise" or "tls" for TCP/WebSocket; unset for native transports
+--   MUXER          - "yamux" for TCP/WebSocket; unset for native transports
 --   LISTENER_IP    - bind address (default: "0.0.0.0")
 --   DEBUG          - accepted but ignored; all logging goes to stderr
 --
@@ -55,6 +55,7 @@ import LibP2P
   , SwitchConfig (..)
   , newTCPTransport
   , newWebSocketTransport
+  , newWebTransportTransport
   , newQUICTransport
   , peerIdBytes
   , registerPingHandler
@@ -126,6 +127,7 @@ main = do
       selectedTransport <- case transport of
         "tcp" -> newTCPTransport
         "ws" -> newWebSocketTransport
+        "webtransport" -> newWebTransportTransport kp
         "quic-v1" -> newQUICTransport kp
         _ -> fail "validated transport is unavailable"
       addTransport sw selectedTransport
@@ -402,6 +404,7 @@ listenAndResolve :: Switch -> PeerId -> String -> String -> IO T.Text
 listenAndResolve sw pid transportName ip = do
   let suffix = case transportName of
         "quic-v1" -> "/udp/0/quic-v1"
+        "webtransport" -> "/udp/0/quic-v1/webtransport"
         "ws" -> "/tcp/0/ws"
         _ -> "/tcp/0"
       bindAddr = case fromText (T.pack ("/ip4/" ++ ip ++ suffix)) of
@@ -472,8 +475,11 @@ validateProtocols "ws" security muxer = validateUpgradedTransport security muxer
 validateProtocols "quic-v1" Nothing Nothing = Right ()
 validateProtocols "quic-v1" _ _ =
   Left "SECURE_CHANNEL and MUXER must be unset for quic-v1"
+validateProtocols "webtransport" Nothing Nothing = Right ()
+validateProtocols "webtransport" _ _ =
+  Left "SECURE_CHANNEL and MUXER must be unset for webtransport"
 validateProtocols other _ _ =
-  Left $ "transport " ++ other ++ " not supported (expected tcp, ws, or quic-v1)"
+  Left $ "transport " ++ other ++ " not supported (expected tcp, ws, webtransport, or quic-v1)"
 
 validateUpgradedTransport :: Maybe String -> Maybe String -> Either String ()
 validateUpgradedTransport security muxer = do

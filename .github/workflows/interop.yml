@@ -8,7 +8,7 @@ on:
 
 jobs:
   transport-interop:
-    name: transport-interop (hs <-> go, TCP, WebSocket, and QUIC v1)
+    name: transport-interop (hs <-> go, TCP, WebSocket, QUIC v1, and WebTransport)
     runs-on: ubuntu-latest
 
     steps:
@@ -116,6 +116,30 @@ jobs:
         run: >
           docker compose -f docker-compose.cross.yml
           -f docker-compose.quic-cross.yml up
+          --exit-code-from go-dialer
+          redis hs-listener go-dialer
+
+      - name: Reset before WebTransport
+        run: >
+          docker compose -f docker-compose.cross.yml
+          -f docker-compose.quic-cross.yml down
+
+      - name: WebTransport direction 1 — go listener, hs dialer
+        run: >
+          docker compose -f docker-compose.cross.yml
+          -f docker-compose.webtransport-cross.yml up
+          --exit-code-from hs-dialer
+          redis go-listener hs-dialer
+
+      - name: Reset between WebTransport directions
+        run: >
+          docker compose -f docker-compose.cross.yml
+          -f docker-compose.webtransport-cross.yml down
+
+      - name: WebTransport direction 2 — hs listener, go dialer
+        run: >
+          docker compose -f docker-compose.cross.yml
+          -f docker-compose.webtransport-cross.yml up
           --exit-code-from go-dialer
           redis hs-listener go-dialer
 

@@ -26,6 +26,7 @@ allProtocols =
   , TCP 4001
   , UDP 9090
   , P2P (BS.pack ([0x12, 0x20] <> replicate 32 0xAB))
+  , Certhash (BS.pack ([0x12, 0x20] <> replicate 32 0xCD))
   , QuicV1
   , WS
   , WSS
@@ -48,6 +49,7 @@ constructorTag p = case p of
   TCP _ -> "TCP"
   UDP _ -> "UDP"
   P2P _ -> "P2P"
+  Certhash _ -> "Certhash"
   QuicV1 -> "QuicV1"
   WS -> "WS"
   WSS -> "WSS"
@@ -75,6 +77,7 @@ canonicalTable =
   , (NoiseProto, 454, "noise")
   , (QuicV1, 461, "quic-v1")
   , (WebTransport, 465, "webtransport")
+  , (Certhash BS.empty, 466, "certhash")
   , (WS, 477, "ws")
   , (WSS, 478, "wss")
   ]
@@ -99,6 +102,7 @@ spec = do
       protocolCode QuicV1 `shouldBe` 461
       protocolCode QuicV1 `shouldNotBe` 460
     it "assigns webtransport code 465" $ protocolCode WebTransport `shouldBe` 465
+    it "assigns certhash code 466" $ protocolCode (Certhash BS.empty) `shouldBe` 466
     it "assigns ws 477, wss 478" $ do
       protocolCode WS `shouldBe` 477
       protocolCode WSS `shouldBe` 478
@@ -124,6 +128,8 @@ spec = do
       encodeUvarint (protocolCode QuicV1) `shouldBe` BS.pack [0xcd, 0x03]
     it "encodes webtransport (465) as 0xd1 0x03" $
       encodeUvarint (protocolCode WebTransport) `shouldBe` BS.pack [0xd1, 0x03]
+    it "encodes certhash (466) as 0xd2 0x03" $
+      encodeUvarint (protocolCode (Certhash BS.empty)) `shouldBe` BS.pack [0xd2, 0x03]
     it "encodes ws (477) as 0xdd 0x03" $
       encodeUvarint (protocolCode WS) `shouldBe` BS.pack [0xdd, 0x03]
     it "encodes wss (478) as 0xde 0x03" $
@@ -140,8 +146,9 @@ spec = do
     it "assigns tcp and udp Fixed 2" $ do
       protocolAddressSize 6 `shouldBe` Just (Fixed 2)
       protocolAddressSize 273 `shouldBe` Just (Fixed 2)
-    it "assigns p2p and dns/dns4/dns6/dnsaddr VarIntPrefixed" $ do
+    it "assigns p2p, certhash, and dns variants VarIntPrefixed" $ do
       protocolAddressSize 421 `shouldBe` Just VarIntPrefixed
+      protocolAddressSize 466 `shouldBe` Just VarIntPrefixed
       protocolAddressSize 53 `shouldBe` Just VarIntPrefixed
       protocolAddressSize 54 `shouldBe` Just VarIntPrefixed
       protocolAddressSize 55 `shouldBe` Just VarIntPrefixed
@@ -154,7 +161,6 @@ spec = do
         protocolAddressSize (protocolCode p) `shouldSatisfy` isJust
     it "is undefined for unsupported and unassigned codes" $ do
       protocolAddressSize 460 `shouldSatisfy` isNothing -- quic draft-29 (unsupported)
-      protocolAddressSize 466 `shouldSatisfy` isNothing -- certhash (unsupported)
       protocolAddressSize 467 `shouldSatisfy` isNothing -- unassigned (former yamux bug)
       protocolAddressSize 0 `shouldSatisfy` isNothing
 
@@ -164,14 +170,13 @@ spec = do
         codeToProtocolName (protocolCode p) `shouldBe` Just (protocolName p)
     it "returns Nothing for unsupported and unassigned codes" $ do
       codeToProtocolName 460 `shouldSatisfy` isNothing
-      codeToProtocolName 466 `shouldSatisfy` isNothing
       codeToProtocolName 467 `shouldSatisfy` isNothing
       codeToProtocolName 0 `shouldSatisfy` isNothing
 
   describe "table consistency" $ do
     it "covers every constructor exactly once in this spec's tables" $ do
       map constructorTag allProtocols `shouldBe`
-        [ "IP4", "IP6", "TCP", "UDP", "P2P", "QuicV1", "WS", "WSS"
+        [ "IP4", "IP6", "TCP", "UDP", "P2P", "Certhash", "QuicV1", "WS", "WSS"
         , "DNS", "DNS4", "DNS6", "DNSAddr", "P2PCircuit", "WebTransport"
         , "NoiseProto"
         ]
