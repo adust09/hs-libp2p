@@ -32,8 +32,8 @@ spec = do
       it "full RPC with subs, publish, and control" $ do
         let rpc = RPC
               { rpcSubscriptions =
-                  [ SubOpts True "blocks"
-                  , SubOpts False "tx"
+                  [ SubOpts True "blocks" False False
+                  , SubOpts False "tx" False False
                   ]
               , rpcPublish =
                   [ PubSubMessage
@@ -51,6 +51,13 @@ spec = do
                   , ctrlGraft = [Graft "blocks"]
                   , ctrlPrune = [Prune "tx" [] (Just 60)]
                   , ctrlIDontWant = [IDontWant [BS.pack [4]]]
+                  , ctrlExtensions = Just (ControlExtensions True)
+                  }
+              , rpcPartial = Just PartialMessage
+                  { partialTopicId = "blocks"
+                  , partialGroupId = BS.pack [9]
+                  , partialMessageData = Just (BS.pack [10])
+                  , partialPartsMetadata = Just (BS.pack [11])
                   }
               }
         let encoded = encodeRPC rpc
@@ -63,9 +70,9 @@ spec = do
       it "RPC with subscriptions only" $ do
         let rpc = emptyRPC
               { rpcSubscriptions =
-                  [ SubOpts True "topic1"
-                  , SubOpts True "topic2"
-                  , SubOpts False "topic3"
+                  [ SubOpts True "topic1" False False
+                  , SubOpts True "topic2" True True
+                  , SubOpts False "topic3" False False
                   ]
               }
         let encoded = encodeRPC rpc
@@ -123,6 +130,28 @@ spec = do
             rpc = emptyRPC { rpcControl = Just ctrl }
         decodeRPC (encodeRPC rpc) `shouldBe` Right rpc
 
+      it "encodes v1.3 extension fields with canonical protobuf numbers" $ do
+        let rpc = emptyRPC
+              { rpcSubscriptions = [SubOpts True "t" True True]
+              , rpcControl = Just emptyControlMessage
+                  { ctrlExtensions = Just (ControlExtensions True) }
+              , rpcPartial = Just PartialMessage
+                  { partialTopicId = "t"
+                  , partialGroupId = BS.pack [1]
+                  , partialMessageData = Just (BS.pack [2])
+                  , partialPartsMetadata = Just (BS.pack [3])
+                  }
+              }
+            vector = BS.pack
+              [ 0x0a, 0x09, 0x08, 0x01, 0x12, 0x01, 0x74
+              , 0x18, 0x01, 0x20, 0x01
+              , 0x1a, 0x04, 0x32, 0x02, 0x50, 0x01
+              , 0x52, 0x0c, 0x0a, 0x01, 0x74, 0x12, 0x01, 0x01
+              , 0x1a, 0x01, 0x02, 0x22, 0x01, 0x03
+              ]
+        encodeRPC rpc `shouldBe` vector
+        decodeRPC vector `shouldBe` Right rpc
+
       it "encodes IDONTWANT with the v1.2 protobuf field numbers" $ do
         let rpc = emptyRPC
               { rpcControl = Just emptyControlMessage
@@ -162,7 +191,7 @@ spec = do
     describe "Framed encoding" $ do
       it "encode/decode round-trip with framing" $ do
         let rpc = emptyRPC
-              { rpcSubscriptions = [SubOpts True "test"]
+              { rpcSubscriptions = [SubOpts True "test" False False]
               , rpcPublish = [PubSubMessage Nothing (BS.pack [1]) Nothing "test" Nothing Nothing]
               }
         let framed = encodeFramed rpc
@@ -180,7 +209,7 @@ spec = do
     describe "Stream I/O" $ do
       it "write + read round-trip over stream" $ do
         let rpc = emptyRPC
-              { rpcSubscriptions = [SubOpts True "stream-test"]
+              { rpcSubscriptions = [SubOpts True "stream-test" False False]
               , rpcControl = Just emptyControlMessage
                   { ctrlGraft = [Graft "stream-test"] }
               }

@@ -51,8 +51,9 @@ spec = do
         paramIDontWantMessageTTL defaultGossipSubParams `shouldBe` 3
 
     describe "protocol identifiers" $ do
-      it "prefers GossipSub v1.2 while retaining v1.1 and v1.0" $ do
-        gossipSubProtocolId `shouldBe` "/meshsub/1.2.0"
+      it "prefers GossipSub v1.3 while retaining v1.2 through v1.0" $ do
+        gossipSubProtocolId `shouldBe` "/meshsub/1.3.0"
+        gossipSubProtocolIdV12 `shouldBe` "/meshsub/1.2.0"
         gossipSubProtocolIdV11 `shouldBe` "/meshsub/1.1.0"
         gossipSubProtocolIdV10 `shouldBe` "/meshsub/1.0.0"
 
@@ -108,6 +109,7 @@ spec = do
         rpcSubscriptions emptyRPC `shouldBe` []
         rpcPublish emptyRPC `shouldBe` []
         rpcControl emptyRPC `shouldBe` Nothing
+        rpcPartial emptyRPC `shouldBe` Nothing
 
     describe "emptyControlMessage" $ do
       it "has empty IHAVE/IWANT/GRAFT/PRUNE/IDONTWANT lists" $ do
@@ -116,3 +118,4 @@ spec = do
         ctrlGraft emptyControlMessage `shouldBe` []
         ctrlPrune emptyControlMessage `shouldBe` []
         ctrlIDontWant emptyControlMessage `shouldBe` []
+        ctrlExtensions emptyControlMessage `shouldBe` Nothing

@@ -15,7 +15,7 @@ module LibP2P.Protocol.GossipSub.Heartbeat
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (Async, async)
 import Control.Concurrent.STM
-import Control.Monad (forM_, unless, when)
+import Control.Monad (filterM, forM_, unless, when)
 import Data.ByteString (ByteString)
 import Data.List (sort, sortOn)
 import Data.Maybe (listToMaybe)
@@ -27,6 +27,12 @@ import Data.Word (Word64)
 import List.Shuffle (sampleIO)
 import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Protocol.GossipSub.Types
+import LibP2P.Protocol.GossipSub.Extensions
+  ( emitPartialGossip
+  , peerRequestsPartial
+  , peerSupportsPartialExtension
+  , runPartialHeartbeat
+  )
 import LibP2P.Protocol.GossipSub.IDontWant (expireIDontWantState)
 import LibP2P.Protocol.GossipSub.MessageCache (cacheGetGossipIds, cacheShift)
 import LibP2P.Protocol.GossipSub.Router (buildPrune)
@@ -54,6 +60,7 @@ heartbeatOnce router = do
   cleanSeenCache router
   resetGossipBudgets router
   expireIDontWantState router
+  runPartialHeartbeat router
   -- Increment heartbeat counter
   atomically $ modifyTVar' (gsHeartbeatCount router) (+ 1)
 
@@ -363,30 +370,27 @@ emitGossip router = do
       topics = Set.unions
         [ subs, Map.keysSet meshMap, Map.keysSet fanoutMap ]
 
-  -- For each topic in mesh+fanout, send IHAVE to non-mesh peers.
-  -- The advertised id list is capped at paramMaxIHaveLength (#157).
+  -- For each topic in mesh+fanout, send IHAVE or extension gossip to
+  -- non-mesh peers. The advertised id list is capped at MaxIHaveLength.
   forM_ (Set.toList topics) $ \topic -> do
     let gossipIds = take (paramMaxIHaveLength params) (cacheGetGossipIds topic cache)
+        meshPeers = Map.findWithDefault Set.empty topic meshMap
+        gossipThreshold = stGossipThreshold (gsThresholds router)
+        nonMeshPeers = [ pid | (pid, ps) <- Map.toList peersMap
+                             , Set.member topic (psTopics ps)
+                             , not (Set.member pid meshPeers)
+                             , psProtocol ps /= FloodSubPeer
+                             , computeScore (gsScoreParams router) pid ps ipMap now
+                                 >= gossipThreshold
+                             ]
+        dlazy = paramDlazy params
+        factor = paramGossipFactor params
+        targetCount = max dlazy (ceiling (factor * fromIntegral (length nonMeshPeers)))
+    targets <- sampleIO (min targetCount (length nonMeshPeers)) nonMeshPeers
+    emitPartialGossip router topic targets
     unless (null gossipIds) $ do
-      let meshPeers = Map.findWithDefault Set.empty topic meshMap
-          -- Eligible: subscribed to topic, not in mesh, and scoring at or
-          -- above the gossip threshold — no gossip is emitted towards
-          -- peers below it (gossipsub-v1.1.md gossip threshold). Floodsub
-          -- peers never receive control messages, IHAVE included (#157).
-          gossipThreshold = stGossipThreshold (gsThresholds router)
-          nonMeshPeers = [ pid | (pid, ps) <- Map.toList peersMap
-                               , Set.member topic (psTopics ps)
-                               , not (Set.member pid meshPeers)
-                               , psProtocol ps /= FloodSubPeer
-                               , computeScore (gsScoreParams router) pid ps ipMap now
-                                   >= gossipThreshold
-                               ]
-          -- Select max(D_lazy, |eligible| * gossipFactor) targets
-          dlazy = paramDlazy params
-          factor = paramGossipFactor params
-          targetCount = max dlazy (ceiling (factor * fromIntegral (length nonMeshPeers)))
-      targets <- sampleIO (min targetCount (length nonMeshPeers)) nonMeshPeers
-      forM_ targets $ \pid ->
+      fullTargets <- filterM (shouldReceiveFullGossip router topic) targets
+      forM_ fullTargets $ \pid ->
         gsSendRPC router pid emptyRPC
           { rpcControl = Just emptyControlMessage
               { ctrlIHave = [IHave topic gossipIds] }
@@ -394,6 +398,13 @@ emitGossip router = do
 
   -- Rotate cache
   atomically $ modifyTVar' (gsMessageCache router) cacheShift
+
+shouldReceiveFullGossip :: GossipSubRouter -> Topic -> PeerId -> IO Bool
+shouldReceiveFullGossip router topic pid = do
+  localSupports <- Map.member topic <$> readTVarIO (gsPartialTopics router)
+  requests <- peerRequestsPartial router pid topic
+  extension <- peerSupportsPartialExtension router pid
+  pure (not (localSupports && requests && extension))
 
 -- IWANT promise expiry (P7)
 

@@ -156,9 +156,24 @@ module LibP2P
   , newGossipSubNode
   , startGossipSub
   , stopGossipSub
+  , enablePartialMessages
   , gossipJoin
+  , gossipJoinPartial
   , gossipLeave
   , gossipPublish
+  , PartialTopicMode (..)
+  , PartialMessage (..)
+  , PartialMessagesExtension
+  , PartialMessagesConfig (..)
+  , PartialCallbackResult (..)
+  , PartialPublishAction (..)
+  , PartialPublishPlan
+  , PartialMessagesError (..)
+  , defaultPartialMessagesConfig
+  , newPartialMessagesExtension
+  , partialMeshPeers
+  , partialPeerRequests
+  , publishPartial
   ) where
 
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
@@ -209,14 +224,34 @@ import LibP2P.NAT.Relay.Transport
   )
 import LibP2P.Protocol.GossipSub.Handler
   ( GossipSubNode (..)
+  , enablePartialMessages
   , gossipJoin
+  , gossipJoinPartial
   , gossipLeave
   , gossipPublish
   , newGossipSubNode
   , startGossipSub
   , stopGossipSub
   )
-import LibP2P.Protocol.GossipSub.Types (GossipSubParams (..), defaultGossipSubParams)
+import LibP2P.Protocol.GossipSub.PartialMessages
+  ( PartialCallbackResult (..)
+  , PartialMessagesConfig (..)
+  , PartialMessagesError (..)
+  , PartialMessagesExtension
+  , PartialPublishAction (..)
+  , PartialPublishPlan
+  , defaultPartialMessagesConfig
+  , newPartialMessagesExtension
+  , partialMeshPeers
+  , partialPeerRequests
+  , publishPartial
+  )
+import LibP2P.Protocol.GossipSub.Types
+  ( GossipSubParams (..)
+  , PartialMessage (..)
+  , PartialTopicMode (..)
+  , defaultGossipSubParams
+  )
 import LibP2P.Protocol.Identify
   ( identifyPeer
   , pushIdentify
