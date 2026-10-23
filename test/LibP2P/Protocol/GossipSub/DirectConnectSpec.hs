@@ -196,16 +196,6 @@ routerWithDirect = do
   router <- newRouter params (mkPeer 1) (\pid rpc -> modifyIORef' sent ((pid, rpc) :)) (pure fixedTime)
   pure (router, sent, peer)
 
-unsigned :: Topic -> BS.ByteString -> PubSubMessage
-unsigned topic payload = PubSubMessage
-  { msgFrom = Nothing
-  , msgData = payload
-  , msgSeqNo = Nothing
-  , msgTopic = topic
-  , msgSignature = Nothing
-  , msgKey = Nothing
-  }
-
 openConn :: Switch -> PeerId -> IO Connection
 openConn sw pid = do
   stateVar <- newTVarIO ConnOpen
