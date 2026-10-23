@@ -394,4 +394,5 @@ mkMockRawConn sio local remote = pure RawConnection
   , rcLocalAddr  = local
   , rcRemoteAddr = remote
   , rcClose      = pure ()
+  , rcRelayLimit = Nothing
   }

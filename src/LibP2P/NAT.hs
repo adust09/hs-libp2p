@@ -86,7 +86,7 @@ import LibP2P.NAT.Relay.Transport
   )
 import LibP2P.Switch (addTransport, selectTransport, setStreamHandler)
 import LibP2P.Switch.ConnPool (lookupAllConns, lookupConn)
-import LibP2P.Switch.Connection (closeConnection, newStream)
+import LibP2P.Switch.Connection (closeConnection, newStream, newStreamAllowingLimited)
 import LibP2P.Switch.Dial (DialOpts (..), dialWith)
 import LibP2P.Switch.Listen (switchListenAddrs)
 import LibP2P.Protocol.Identify (identifyPeer)
@@ -293,7 +293,8 @@ unilateralUpgrade sw config relayConn addrs = do
 -- resulting TCP simultaneous connect.
 initiateOverRelay :: Switch -> DCUtRUpgradeConfig -> Connection -> IO DCUtRResult
 initiateOverRelay sw config relayConn = do
-  streamOrErr <- try (newStream sw relayConn)
+  -- The coordination stream exists to run over the relay circuit.
+  streamOrErr <- try (newStreamAllowingLimited sw relayConn)
   case streamOrErr of
     Left (e :: SomeException) ->
       pure (DCUtRFailed ("dcutr: cannot open stream: " ++ show e))
@@ -515,15 +516,16 @@ openStopStream sw targetId = do
 -- transport's listener for the relay it arrived over. The Switch then
 -- upgrades it like any other inbound raw connection.
 --
--- The relay's advertised limit is not yet enforced (issue #269).
+-- The relay's advertised limit is enforced on the relayed stream
+-- (issue #269) before the Switch upgrades it.
 registerRelayStopHandler :: Switch -> CircuitState -> IO ()
 registerRelayStopHandler sw circuitState =
   setStreamHandler sw stopProtocolId $ \conn stream -> do
     result <- handleStop stream
     case result of
       Left _ -> pure ()
-      Right (sourcePeer, _mLimit) ->
-        acceptStopStream circuitState conn sourcePeer stream
+      Right (sourcePeer, mLimit) ->
+        acceptStopStream circuitState conn sourcePeer mLimit stream
 
 -- | Register the DCUtR handler (/libp2p/dcutr).
 --

@@ -156,6 +156,7 @@ mkDummyConnection sw pid openAction = do
         }
     , connState      = stateVar
     , connResourceScope = connScope
+    , connRelayLimit = Nothing
     }
 
 -- | Mock transport whose dialed connection records rcClose calls in an IORef.
@@ -176,6 +177,7 @@ mkClosableMockTransport responderKP closedRef = pure Transport
             , rcLocalAddr  = addr
             , rcRemoteAddr = Multiaddr [IP4 0x7f000001, TCP 0]
             , rcClose      = pure ()
+            , rcRelayLimit = Nothing
             }
       _ <- async $ do
         rm <- newTestResourceManager
@@ -186,6 +188,7 @@ mkClosableMockTransport responderKP closedRef = pure Transport
         , rcLocalAddr  = Multiaddr [IP4 0x7f000001, TCP 0]
         , rcRemoteAddr = addr
         , rcClose      = writeIORef closedRef True
+        , rcRelayLimit = Nothing
         }
 
 -- | Build a TCP node with Switch.
