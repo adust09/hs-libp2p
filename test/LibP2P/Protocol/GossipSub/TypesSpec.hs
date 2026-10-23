@@ -37,6 +37,9 @@ spec = do
         paramMcacheLen defaultGossipSubParams `shouldBe` 5
         paramMcacheGossip defaultGossipSubParams `shouldBe` 3
 
+      it "checks direct-peer connectivity every 300s" $ do
+        paramDirectConnectInterval defaultGossipSubParams `shouldBe` 300
+
     describe "defaultMessageId" $ do
       it "concatenates from and seqno" $ do
         let msg = PubSubMessage
