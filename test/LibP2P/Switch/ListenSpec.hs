@@ -54,6 +54,7 @@ mkMockRawConn sio local remote = RawConnection
   , rcLocalAddr  = local
   , rcRemoteAddr = remote
   , rcClose      = pure ()
+  , rcRelayLimit = Nothing
   }
 
 spec :: Spec
@@ -94,6 +95,7 @@ spec = do
             , rcLocalAddr  = remoteAddr
             , rcRemoteAddr = localAddr
             , rcClose      = writeIORef closeRef True
+            , rcRelayLimit = Nothing
             }
           denyGater = ConnectionGater
             { gateAccept = \_ -> pure False

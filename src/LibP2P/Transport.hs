@@ -7,14 +7,35 @@
 module LibP2P.Transport
   ( ConnectionEndpoint (..)
   , NativeMuxer (..)
+  , RelayCircuitLimit (..)
+  , relayCircuitIsLimited
   , RawConnection (..)
   , Listener (..)
   , Transport (..)
   ) where
 
+import Data.Word (Word32, Word64)
 import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Multiaddr (Multiaddr)
 import LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO)
+
+-- | Budget a relay advertised for one relayed circuit (specs/relay/circuit-v2).
+--
+-- A component of 0, or an absent component, means that component is
+-- unlimited. 'Nothing' on a connection means it is not a relay circuit.
+data RelayCircuitLimit = RelayCircuitLimit
+  { rclDurationSeconds :: !(Maybe Word32)
+  , rclDataBytes       :: !(Maybe Word64)
+  } deriving (Show, Eq)
+
+-- | True when the relay imposed a non-zero duration or a non-zero
+-- per-direction data cap. A zero or omitted component does not count.
+relayCircuitIsLimited :: Maybe RelayCircuitLimit -> Bool
+relayCircuitIsLimited = maybe False active
+  where
+    active lim = positive (rclDurationSeconds lim) || positive (rclDataBytes lim)
+    positive (Just n) = n > 0
+    positive Nothing = False
 
 -- | A transport-native authenticated stream multiplexer.
 data NativeMuxer = NativeMuxer
@@ -40,6 +61,7 @@ data RawConnection = RawConnection
   , rcLocalAddr :: !Multiaddr
   , rcRemoteAddr :: !Multiaddr
   , rcClose :: !(IO ())
+  , rcRelayLimit :: !(Maybe RelayCircuitLimit)
   }
 
 -- | A listener that accepts inbound connections.

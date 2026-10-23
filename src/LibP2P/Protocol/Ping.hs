@@ -72,7 +72,7 @@ import LibP2P.MultistreamSelect.Negotiation
   , NegotiationResult (..)
   , readExactBounded
   )
-import LibP2P.Switch.Connection (newStream)
+import LibP2P.Switch.Connection (newStreamAllowingLimited)
 import LibP2P.Switch.Types
   ( Connection (..)
   , Switch (..)
@@ -183,7 +183,8 @@ data PingSession = PingSession
 -- returning.
 openPingSession :: Switch -> Connection -> IO (Either PingError PingSession)
 openPingSession sw conn = do
-  streamOrErr <- newStream sw conn
+  -- A ping is a short probe; go-libp2p opens it with WithAllowLimitedConn.
+  streamOrErr <- newStreamAllowingLimited sw conn
   case streamOrErr of
     Left err ->
       pure (Left (PingStreamError ("stream reservation failed: " ++ show err)))
