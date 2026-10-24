@@ -84,7 +84,11 @@ module LibP2P
   , newWebSocketTransportWithConfig
   , newWebTransportTransport
 #ifdef WITH_WEBRTC
-  , newWebRTCTransport
+  , STUNServer (..)
+ , WebRTCConfig (..)
+ , defaultWebRTCConfig
+ , webRTCDirectTransport
+ , webRTCTransport
 #endif
   , newQUICTransport
 
@@ -309,7 +313,13 @@ import LibP2P.Transport.WebSocket
   )
 import LibP2P.Transport.WebTransport (newWebTransportTransport)
 #ifdef WITH_WEBRTC
-import LibP2P.Transport.WebRTC (newWebRTCTransport)
+import LibP2P.Transport.WebRTC
+  ( STUNServer (..)
+  , WebRTCConfig (..)
+  , defaultWebRTCConfig
+  , webRTCDirectTransport
+  , webRTCTransport
+  )
 #endif
 import LibP2P.Transport.QUIC (newQUICTransport)
 import LibP2P.Transport (RelayCircuitLimit (..), Transport (..))

@@ -16,6 +16,12 @@ use str0m::crypto::{CryptoProvider, Fingerprint};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceCreds, Input, Output, Rtc, RtcConfig};
 
+mod direct;
+mod signaling;
+mod stun;
+
+use direct::{ParsedUsername, parse_username};
+
 const V1_PREFIX: &str = "libp2p+webrtc+v1/";
 const V2_PREFIX: &str = "libp2p+webrtc+v2/";
 const MAX_PACKET_SIZE: usize = 2048;
@@ -91,7 +97,7 @@ impl SharedChannel {
 struct ConnectionState {
     ready: bool,
     dtls_connected: bool,
-    noise_open: bool,
+    initial_channel_open: bool,
     closed: bool,
     error: Option<String>,
     local_fingerprint: Vec<u8>,
@@ -120,7 +126,7 @@ impl SharedConnection {
             state: Mutex::new(ConnectionState {
                 ready: false,
                 dtls_connected: false,
-                noise_open: false,
+                initial_channel_open: false,
                 closed: false,
                 error: None,
                 local_fingerprint,
@@ -150,13 +156,13 @@ impl SharedConnection {
         let mut state = self.state.lock().unwrap();
         state.dtls_connected = true;
         state.remote_fingerprint = remote_fingerprint;
-        state.ready = state.noise_open;
+        state.ready = state.initial_channel_open;
         self.ready.notify_all();
     }
 
-    fn mark_noise_open(&self) {
+    fn mark_initial_channel_open(&self) {
         let mut state = self.state.lock().unwrap();
-        state.noise_open = true;
+        state.initial_channel_open = true;
         state.ready = state.dtls_connected;
         self.ready.notify_all();
     }
@@ -173,6 +179,10 @@ enum Command {
     },
     CloseChannel {
         token: u64,
+    },
+    AddRemoteCandidate {
+        candidate: Candidate,
+        response: mpsc::Sender<Result<(), String>>,
     },
     Close,
 }
@@ -193,10 +203,35 @@ struct ConnectionRuntime {
     next_token: u64,
     next_timeout: Instant,
     accepted: bool,
+    close_initial_on_open: bool,
 }
 
 impl ConnectionRuntime {
-    fn new(mut rtc: Rtc, local_addr: SocketAddr, remote_addr: SocketAddr) -> Self {
+    fn new_direct(mut rtc: Rtc, local_addr: SocketAddr, remote_addr: SocketAddr) -> Self {
+        let initial = rtc.direct_api().create_data_channel(ChannelConfig {
+            negotiated: Some(0),
+            label: String::new(),
+            ..Default::default()
+        });
+        Self::new(rtc, local_addr, remote_addr, Some(initial), false)
+    }
+
+    fn new_signaled(
+        rtc: Rtc,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+        initial: Option<ChannelId>,
+    ) -> Self {
+        Self::new(rtc, local_addr, remote_addr, initial, true)
+    }
+
+    fn new(
+        mut rtc: Rtc,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+        initial: Option<ChannelId>,
+        close_initial_on_open: bool,
+    ) -> Self {
         let local_fingerprint = rtc.direct_api().local_dtls_fingerprint().bytes.clone();
         let (command_tx, command_rx) = mpsc::channel();
         let shared = Arc::new(SharedConnection::new(
@@ -205,21 +240,23 @@ impl ConnectionRuntime {
             local_addr,
             remote_addr,
         ));
-        let noise_id = rtc.direct_api().create_data_channel(ChannelConfig {
-            negotiated: Some(0),
-            label: String::new(),
-            ..Default::default()
-        });
+        let channels = initial
+            .map(|id| HashMap::from([(0, id)]))
+            .unwrap_or_default();
+        let reverse_channels = initial
+            .map(|id| HashMap::from([(id, 0)]))
+            .unwrap_or_default();
         Self {
             rtc,
             shared,
             command_rx,
-            channels: HashMap::from([(0, noise_id)]),
-            reverse_channels: HashMap::from([(noise_id, 0)]),
+            channels,
+            reverse_channels,
             pending_sends: VecDeque::new(),
             next_token: 1,
             next_timeout: Instant::now(),
             accepted: false,
+            close_initial_on_open,
         }
     }
 
@@ -263,6 +300,13 @@ impl ConnectionRuntime {
                         self.rtc.direct_api().close_data_channel(channel_id);
                     }
                 }
+                Command::AddRemoteCandidate {
+                    candidate,
+                    response,
+                } => {
+                    self.rtc.add_remote_candidate(candidate);
+                    let _ = response.send(Ok(()));
+                }
                 Command::Close => {
                     self.shared.state.lock().unwrap().closed = true;
                     return false;
@@ -300,7 +344,7 @@ impl ConnectionRuntime {
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::Connected => self.handle_connected(),
-            Event::ChannelOpen(id, _) => self.handle_channel_open(id),
+            Event::ChannelOpen(id, label) => self.handle_channel_open(id, &label),
             Event::ChannelData(data) => {
                 if let Some(channel) = self.channel(data.id) {
                     channel.push(data.data);
@@ -326,24 +370,37 @@ impl ConnectionRuntime {
         self.shared.mark_dtls_connected(remote);
     }
 
-    fn handle_channel_open(&mut self, id: ChannelId) {
-        let token = self.reverse_channels.get(&id).copied().unwrap_or_else(|| {
-            let token = self.next_token;
-            self.next_token += 1;
-            self.channels.insert(token, id);
-            self.reverse_channels.insert(id, token);
-            let mut state = self.shared.state.lock().unwrap();
-            state.channels.insert(token, Arc::new(SharedChannel::new()));
-            state.incoming.push_back(token);
-            self.shared.ready.notify_all();
-            token
-        });
+    fn handle_channel_open(&mut self, id: ChannelId, label: &str) {
+        let is_initial = self.close_initial_on_open && label == "init";
+        let token = self.channel_token(id, is_initial);
         if let Some(channel) = self.shared_channel(token) {
             channel.mark_open();
         }
         if token == 0 {
-            self.shared.mark_noise_open();
+            self.shared.mark_initial_channel_open();
+            if self.close_initial_on_open {
+                self.rtc.direct_api().close_data_channel(id);
+            }
         }
+    }
+
+    fn channel_token(&mut self, id: ChannelId, is_initial: bool) -> u64 {
+        if let Some(token) = self.reverse_channels.get(&id).copied() {
+            return token;
+        }
+        let token = if is_initial { 0 } else { self.next_token };
+        if !is_initial {
+            self.next_token += 1;
+        }
+        self.channels.insert(token, id);
+        self.reverse_channels.insert(id, token);
+        let mut state = self.shared.state.lock().unwrap();
+        state.channels.insert(token, Arc::new(SharedChannel::new()));
+        if !is_initial {
+            state.incoming.push_back(token);
+        }
+        self.shared.ready.notify_all();
+        token
     }
 
     fn channel(&self, id: ChannelId) -> Option<Arc<SharedChannel>> {
@@ -481,7 +538,7 @@ fn configure_dial(
         .start_dtls(true)
         .map_err(|err| err.to_string())?;
     rtc.direct_api().start_sctp(true);
-    Ok(ConnectionRuntime::new(rtc, local_addr, remote_addr))
+    Ok(ConnectionRuntime::new_direct(rtc, local_addr, remote_addr))
 }
 
 fn dial_server_credential(rtc: &mut Rtc, local: IceCreds, version: u8) -> Result<IceCreds, String> {
@@ -500,70 +557,6 @@ fn dial_server_credential(rtc: &mut Rtc, local: IceCreds, version: u8) -> Result
             .set_local_ice_credentials(credentials.clone());
     }
     Ok(credentials)
-}
-
-struct ParsedUsername {
-    server_ufrag: String,
-    client_ufrag: String,
-    client_password: String,
-}
-
-fn parse_username(packet: &[u8]) -> Option<ParsedUsername> {
-    if packet.len() < 20 || packet[0..2] != [0x00, 0x01] || packet[4..8] != [0x21, 0x12, 0xa4, 0x42]
-    {
-        return None;
-    }
-    let message_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
-    if message_len + 20 > packet.len() {
-        return None;
-    }
-    let mut offset = 20;
-    while offset + 4 <= message_len + 20 {
-        let kind = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
-        let len = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]) as usize;
-        offset += 4;
-        if offset + len > packet.len() {
-            return None;
-        }
-        if kind == 0x0006 {
-            let username = std::str::from_utf8(&packet[offset..offset + len]).ok()?;
-            let (server_ufrag, client_ufrag) = username.split_once(':')?;
-            if !valid_ice_ufrag(server_ufrag) || !valid_ice_ufrag(client_ufrag) {
-                return None;
-            }
-            let client_password = if let Some(value) = server_ufrag.strip_prefix(V2_PREFIX) {
-                if !valid_ice_password(value) {
-                    return None;
-                }
-                value.to_owned()
-            } else if server_ufrag.starts_with(V1_PREFIX) {
-                server_ufrag.to_owned()
-            } else {
-                return None;
-            };
-            return Some(ParsedUsername {
-                server_ufrag: server_ufrag.to_owned(),
-                client_ufrag: client_ufrag.to_owned(),
-                client_password,
-            });
-        }
-        offset += (len + 3) & !3;
-    }
-    None
-}
-
-fn valid_ice_chars(value: &str) -> bool {
-    value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/')
-}
-
-fn valid_ice_ufrag(value: &str) -> bool {
-    (4..=256).contains(&value.len()) && valid_ice_chars(value)
-}
-
-fn valid_ice_password(value: &str) -> bool {
-    (22..=256).contains(&value.len()) && valid_ice_chars(value)
 }
 
 fn configure_server(
@@ -596,7 +589,7 @@ fn configure_server(
         .start_dtls(false)
         .map_err(|err| err.to_string())?;
     rtc.direct_api().start_sctp(false);
-    Ok(ConnectionRuntime::new(rtc, local_addr, remote_addr))
+    Ok(ConnectionRuntime::new_direct(rtc, local_addr, remote_addr))
 }
 
 fn listener_loop(
@@ -760,3 +753,4 @@ fn fail_listener(shared: &ListenerShared, message: String) {
 }
 
 mod ffi;
+mod ffi_signaling;

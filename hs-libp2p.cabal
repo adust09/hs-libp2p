@@ -17,8 +17,12 @@ extra-source-files:
   ffi/webrtc/Cargo.lock
   ffi/webrtc/Cargo.toml
   ffi/webrtc/hs_webrtc.h
+  ffi/webrtc/src/direct.rs
   ffi/webrtc/src/ffi.rs
+  ffi/webrtc/src/ffi_signaling.rs
   ffi/webrtc/src/lib.rs
+  ffi/webrtc/src/signaling.rs
+  ffi/webrtc/src/stun.rs
 tested-with:     GHC == 9.10.1
 
 flag webrtc
@@ -52,8 +56,14 @@ library
     cpp-options:             -DWITH_WEBRTC
     extra-libraries:         hs_webrtc, pthread, dl, rt, util
     extra-bundled-libraries: hs_webrtc
-    other-modules:           LibP2P.Transport.WebRTC.FFI
-    exposed-modules:         LibP2P.Transport.WebRTC
+    other-modules:
+      LibP2P.Transport.WebRTC.Direct
+      LibP2P.Transport.WebRTC.FFI
+      LibP2P.Transport.WebRTC.Relay
+      LibP2P.Transport.WebRTC.Stream
+    exposed-modules:
+      LibP2P.Transport.WebRTC
+      LibP2P.Transport.WebRTC.Signaling
   exposed-modules:
     LibP2P
     LibP2P.Core.Binary

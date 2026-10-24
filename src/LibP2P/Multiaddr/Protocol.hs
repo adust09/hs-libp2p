@@ -32,6 +32,7 @@ data Protocol
   | DNSAddr !Text      -- ^ DNSAddr hostname
   | P2PCircuit         -- ^ Circuit relay marker (no address)
   | WebRTCDirect       -- ^ ICE-lite WebRTC Direct (no address)
+  | WebRTC             -- ^ Relay-signaled WebRTC (no address)
   | WebTransport       -- ^ WebTransport (no address)
   | NoiseProto         -- ^ Noise protocol marker (no address)
   deriving (Show, Eq)
@@ -60,6 +61,7 @@ protocolCode (DNS6 _) = 55
 protocolCode (DNSAddr _) = 56
 protocolCode P2PCircuit = 290
 protocolCode WebRTCDirect = 280
+protocolCode WebRTC = 281
 protocolCode WebTransport = 465
 protocolCode NoiseProto = 454
 
@@ -80,6 +82,7 @@ protocolName (DNS6 _) = "dns6"
 protocolName (DNSAddr _) = "dnsaddr"
 protocolName P2PCircuit = "p2p-circuit"
 protocolName WebRTCDirect = "webrtc-direct"
+protocolName WebRTC = "webrtc"
 protocolName WebTransport = "webtransport"
 protocolName NoiseProto = "noise"
 
@@ -100,6 +103,7 @@ protocolAddressSize 55 = Just VarIntPrefixed  -- dns6
 protocolAddressSize 56 = Just VarIntPrefixed  -- dnsaddr
 protocolAddressSize 290 = Just NoAddress      -- p2p-circuit
 protocolAddressSize 280 = Just NoAddress      -- webrtc-direct
+protocolAddressSize 281 = Just NoAddress      -- webrtc
 protocolAddressSize 465 = Just NoAddress      -- webtransport
 protocolAddressSize 454 = Just NoAddress      -- noise
 protocolAddressSize _ = Nothing
@@ -121,6 +125,7 @@ codeToProtocolName 55 = Just "dns6"
 codeToProtocolName 56 = Just "dnsaddr"
 codeToProtocolName 290 = Just "p2p-circuit"
 codeToProtocolName 280 = Just "webrtc-direct"
+codeToProtocolName 281 = Just "webrtc"
 codeToProtocolName 465 = Just "webtransport"
 codeToProtocolName 454 = Just "noise"
 codeToProtocolName _ = Nothing

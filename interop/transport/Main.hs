@@ -38,6 +38,7 @@ import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import qualified Database.Redis as Redis
 import LibP2P
   ( GossipSubNode (..)
+  , KeyPair
   , Multiaddr (..)
   , PeerId
   , PingResult (..)
@@ -55,14 +56,13 @@ import LibP2P
   , newSwitchWithConfig
   , defaultSwitchConfig
   , SwitchConfig (..)
+  , defaultNATConfig
   , newTCPTransport
   , newWebSocketTransport
   , newWebTransportTransport
-#ifdef WITH_WEBRTC
-  , newWebRTCTransport
-#endif
   , newQUICTransport
   , peerIdBytes
+  , registerNATHandlers
   , registerPingHandler
   , sendPing
   , splitP2P
@@ -74,6 +74,9 @@ import LibP2P
   , toText
   , GossipSubParams (..)
   )
+#ifdef WITH_WEBRTC
+import LibP2P (defaultWebRTCConfig, webRTCDirectTransport, webRTCTransport)
+#endif
 import LibP2P.Crypto.Key (publicKey)
 import LibP2P.Protocol.GossipSub.Types (GossipSubRouter (..), PubSubMessage (..))
 import LibP2P.Switch.Types (Switch)
@@ -115,6 +118,7 @@ main = do
     Right () -> pure ()
 
   let addrKey = BS8.pack (testKey ++ "_listener_multiaddr")
+      relayKey = BS8.pack (testKey ++ "_relay_multiaddr")
 
   -- Generate identity
   ekp <- generateKeyPair
@@ -129,16 +133,7 @@ main = do
       -- Create Switch. SECURE_CHANNEL selects the only offered handshake so a
       -- TLS run cannot silently fall back to Noise.
       sw <- newSwitchWithConfig (switchConfigFor security) pid kp
-      selectedTransport <- case transport of
-        "tcp" -> newTCPTransport
-        "ws" -> newWebSocketTransport
-        "webtransport" -> newWebTransportTransport kp
-#ifdef WITH_WEBRTC
-        "webrtc-direct" -> newWebRTCTransport kp
-#endif
-        "quic-v1" -> newQUICTransport kp
-        _ -> fail "validated transport is unavailable"
-      addTransport sw selectedTransport
+      configureTransport sw kp transport
 
       -- Connect to Redis
       let (redisHost, redisPort) = parseHostPort redisAddr
@@ -157,16 +152,16 @@ main = do
           exitFailure
 
       case (testMode, dialer) of
-        ("gossipsub", False) -> runGossipSubListener sw pid transport ip redisConn addrKey
+        ("gossipsub", False) -> runGossipSubListener sw pid transport ip redisConn addrKey relayKey
         ("gossipsub", True)  -> runGossipSubDialer sw pid redisConn addrKey
-        (_, False) -> registerPingHandler sw >> runListener sw pid transport ip redisConn addrKey
-        (_, True)  -> registerPingHandler sw >> runDialer sw pid redisConn addrKey
+        (_, False) -> registerPingHandler sw >> runListener sw pid transport ip redisConn addrKey relayKey
+        (_, True)  -> registerPingHandler sw >> runDialer sw pid transport redisConn addrKey
 
 -- | Listener mode: bind, publish address to Redis, run until Docker
 -- shuts the container down (transport contract, Listener step 5).
-runListener :: Switch -> PeerId -> String -> String -> Redis.Connection -> BS8.ByteString -> IO ()
-runListener sw pid transportName ip redisConn addrKey = do
-  addrText <- listenAndResolve sw pid transportName ip
+runListener :: Switch -> PeerId -> String -> String -> Redis.Connection -> BS8.ByteString -> BS8.ByteString -> IO ()
+runListener sw pid transportName ip redisConn addrKey relayKey = do
+  addrText <- listenAndResolve sw pid transportName ip redisConn relayKey
 
   logInfo $ "Listening on: " ++ T.unpack addrText
 
@@ -175,8 +170,8 @@ runListener sw pid transportName ip redisConn addrKey = do
   forever $ threadDelay 3600000000
 
 -- | Dialer mode: get address from Redis, dial, ping, output YAML.
-runDialer :: Switch -> PeerId -> Redis.Connection -> BS8.ByteString -> IO ()
-runDialer sw _pid redisConn addrKey = do
+runDialer :: Switch -> PeerId -> String -> Redis.Connection -> BS8.ByteString -> IO ()
+runDialer sw _pid transportName redisConn addrKey = do
   logInfo "Polling Redis for listener address..."
 
   mAddr <- pollListenerAddr redisConn addrKey
@@ -206,7 +201,8 @@ runDialer sw _pid redisConn addrKey = do
             -- (transport contract, Dialer step 4).
             t0 <- getCurrentTime
 
-            dialResult <- dial sw remotePeerId [transportAddr]
+            let dialAddr = if transportName == "webrtc" then fullAddr else transportAddr
+            dialResult <- dial sw remotePeerId [dialAddr]
             case dialResult of
               Left err -> do
                 hPutStrLn stderr $ "Dial failed: " ++ show err
@@ -238,8 +234,8 @@ runDialer sw _pid redisConn addrKey = do
                     exitSuccess
 
 -- | GossipSub listener: join topic, wait for message, reply, report to Redis.
-runGossipSubListener :: Switch -> PeerId -> String -> String -> Redis.Connection -> BS8.ByteString -> IO ()
-runGossipSubListener sw pid transportName ip redisConn addrKey = do
+runGossipSubListener :: Switch -> PeerId -> String -> String -> Redis.Connection -> BS8.ByteString -> BS8.ByteString -> IO ()
+runGossipSubListener sw pid transportName ip redisConn addrKey relayKey = do
   let gsParams = defaultGossipSubParams { paramHeartbeatInterval = 60.0 }
   gsNode <- newGossipSubNode sw gsParams
   startGossipSub gsNode
@@ -249,7 +245,7 @@ runGossipSubListener sw pid transportName ip redisConn addrKey = do
   atomically $ writeTVar (gsOnMessage (gsnRouter gsNode))
     (\topic msg -> putMVar msgMVar (topic, msgData msg))
 
-  addrText <- listenAndResolve sw pid transportName ip
+  addrText <- listenAndResolve sw pid transportName ip redisConn relayKey
   logInfo $ "GossipSub listener on: " ++ T.unpack addrText
 
   publishListenerAddr redisConn addrKey addrText
@@ -408,18 +404,11 @@ runGossipSubDialer sw _pid redisConn addrKey = do
 
 -- | Bind, resolve the non-localhost address, and return the full
 -- multiaddr (with /p2p/ suffix) as text.
-listenAndResolve :: Switch -> PeerId -> String -> String -> IO T.Text
-listenAndResolve sw pid transportName ip = do
-  let suffix = case transportName of
-        "quic-v1" -> "/udp/0/quic-v1"
-        "webtransport" -> "/udp/0/quic-v1/webtransport"
-        "webrtc-direct" -> "/udp/0/webrtc-direct"
-        "ws" -> "/tcp/0/ws"
-        _ -> "/tcp/0"
-      bindAddr = case fromText (T.pack ("/ip4/" ++ ip ++ suffix)) of
-        Right ma -> ma
-        Left err -> error $ "Invalid bind address: " ++ err
-
+listenAndResolve :: Switch -> PeerId -> String -> String -> Redis.Connection -> BS8.ByteString -> IO T.Text
+listenAndResolve sw pid transportName ip redisConn relayKey = do
+  bindAddr <- if transportName == "webrtc"
+    then relayWebRTCListenAddr redisConn relayKey
+    else pure (directListenAddr transportName ip)
   addrs <- switchListen sw defaultConnectionGater [bindAddr]
   case addrs of
     [] -> do
@@ -428,7 +417,9 @@ listenAndResolve sw pid transportName ip = do
       exitFailure
     (listenAddr : _) -> do
       -- Resolve actual IP if bound to 0.0.0.0
-      actualAddr <- resolveListenAddr listenAddr ip
+      actualAddr <- if transportName == "webrtc"
+        then pure listenAddr
+        else resolveListenAddr listenAddr ip
       let peerIdMH = peerIdBytes pid
       let fullAddr = encapsulateP2P actualAddr peerIdMH
       pure (toText fullAddr)
@@ -441,6 +432,28 @@ listenAndResolve sw pid transportName ip = do
 -- `listenerAddr` -> `{TEST_KEY}_listener_multiaddr`); a plain SET/GET
 -- string would collide with the list type and surface as Redis
 -- WRONGTYPE errors in every cross-implementation pair.
+directListenAddr :: String -> String -> Multiaddr
+directListenAddr transportName ip =
+  case fromText (T.pack ("/ip4/" ++ ip ++ suffix)) of
+    Right address -> address
+    Left err -> error $ "Invalid bind address: " ++ err
+ where
+  suffix = case transportName of
+    "quic-v1" -> "/udp/0/quic-v1"
+    "webtransport" -> "/udp/0/quic-v1/webtransport"
+    "webrtc-direct" -> "/udp/0/webrtc-direct"
+    "ws" -> "/tcp/0/ws"
+    _ -> "/tcp/0"
+
+relayWebRTCListenAddr :: Redis.Connection -> BS8.ByteString -> IO Multiaddr
+relayWebRTCListenAddr redisConn relayKey = do
+  relayValue <- pollListenerAddr redisConn relayKey
+    >>= maybe (fail "timed out waiting for relay multiaddr") pure
+  relayAddress <- either (fail . ("invalid relay multiaddr: " ++)) pure $
+    fromText (TE.decodeUtf8 relayValue)
+  pure $ case relayAddress of
+    Multiaddr protocols -> Multiaddr (protocols <> [P2PCircuit, WebRTC])
+
 publishListenerAddr :: Redis.Connection -> BS8.ByteString -> T.Text -> IO ()
 publishListenerAddr redisConn addrKey addrText = do
   result <- Redis.runRedis redisConn $ Redis.rpush addrKey [TE.encodeUtf8 addrText]
@@ -477,6 +490,25 @@ reannounceLoop gsNode topic iterations = go iterations
       gossipJoin gsNode topic
       go (n - 1)
 
+configureTransport :: Switch -> KeyPair -> String -> IO ()
+#ifdef WITH_WEBRTC
+configureTransport sw _ "webrtc" = do
+  addTransport sw =<< newTCPTransport
+  _ <- registerNATHandlers sw defaultNATConfig
+  webRTCTransport sw defaultWebRTCConfig >>= addTransport sw
+#endif
+configureTransport sw kp transportName = do
+  selectedTransport <- case transportName of
+    "tcp" -> newTCPTransport
+    "ws" -> newWebSocketTransport
+    "webtransport" -> newWebTransportTransport kp
+#ifdef WITH_WEBRTC
+    "webrtc-direct" -> webRTCDirectTransport kp
+#endif
+    "quic-v1" -> newQUICTransport kp
+    _ -> fail "validated transport is unavailable"
+  addTransport sw selectedTransport
+
 -- | Validate supported standalone and upgraded transport combinations.
 validateProtocols :: String -> Maybe String -> Maybe String -> Either String ()
 validateProtocols "tcp" security muxer = validateUpgradedTransport security muxer
@@ -491,9 +523,12 @@ validateProtocols "webtransport" _ _ =
 validateProtocols "webrtc-direct" Nothing Nothing = Right ()
 validateProtocols "webrtc-direct" _ _ =
   Left "SECURE_CHANNEL and MUXER must be unset for webrtc-direct"
+validateProtocols "webrtc" Nothing Nothing = Right ()
+validateProtocols "webrtc" _ _ =
+  Left "SECURE_CHANNEL and MUXER must be unset for webrtc"
 #endif
 validateProtocols other _ _ =
-  Left $ "transport " ++ other ++ " not supported (expected tcp, ws, webtransport, webrtc-direct, or quic-v1)"
+  Left $ "transport " ++ other ++ " not supported (expected tcp, ws, webtransport, webrtc-direct, webrtc, or quic-v1)"
 
 validateUpgradedTransport :: Maybe String -> Maybe String -> Either String ()
 validateUpgradedTransport security muxer = do
