@@ -7,7 +7,7 @@ FROM haskell:9.10-slim-bookworm AS builder
 
 WORKDIR /app
 
-COPY hs-libp2p.cabal cabal.project ./
+COPY hs-libp2p.cabal cabal.project Setup.hs LICENSE ./
 
 # Fix ppad-sha256 ARM SHA2 intrinsic compilation on Docker (GCC 12).
 RUN if [ "$(uname -m)" = "aarch64" ]; then \
@@ -18,6 +18,7 @@ RUN if [ "$(uname -m)" = "aarch64" ]; then \
 RUN cabal update && cabal build --only-dependencies lib:hs-libp2p
 
 COPY src/ src/
+COPY test/ test/
 COPY interop/ interop/
 RUN cabal build libp2p-hole-punch \
     && cp "$(cabal list-bin libp2p-hole-punch)" /app/libp2p-hole-punch \

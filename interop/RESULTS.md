@@ -1,11 +1,12 @@
 ---
 title: Transport-Interop Results
-last_updated: 2026-10-23
+last_updated: 2026-10-24
 tags:
   - interop
   - transport
   - testing
   - go-libp2p
+  - js-libp2p
 ---
 
 # Transport-Interop Results
@@ -15,7 +16,23 @@ This document records reproducible evidence that the `libp2p-interop` binary
 [libp2p/test-plans](https://github.com/libp2p/test-plans/tree/master/transport-interop)
 **ping** contract against go-libp2p, in both dialer and listener roles, over
 **TCP + Noise/TLS + Yamux**, **WebSocket + Noise + Yamux**, native
-**QUIC v1**, and **WebTransport over HTTP/3**.
+**QUIC v1**, **WebTransport over HTTP/3**, and standard relay-signaled
+**WebRTC**.
+
+## Standard WebRTC interoperability (2026-10-24)
+
+The `/p2p-circuit/webrtc` transport passed a Ping exchange in both directions
+against `js-libp2p 3.5.1` and `@libp2p/webrtc 7.0.2`. A js-libp2p Circuit Relay
+v2 server carried SDP offer/answer signaling; the resulting SCTP data channel
+carried libp2p streams directly between the peers.
+
+```bash
+./interop/webrtc/run.sh
+```
+
+Both dialers exited 0. The js-libp2p client measured a 3 ms Ping RTT to the
+Haskell listener. The Haskell client measured a 144.525 ms setup-plus-ping time
+and a 4.171 ms Ping RTT to the js-libp2p listener. CI runs both directions.
 
 ## WebTransport interoperability (2026-10-23)
 

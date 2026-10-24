@@ -210,12 +210,16 @@ fn receive_dial_packets(
 }
 
 fn await_dial(shared: &SharedConnection) -> Result<(), String> {
+    await_connection(shared, "WebRTC Direct dial")
+}
+
+pub(super) fn await_connection(shared: &SharedConnection, context: &str) -> Result<(), String> {
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     let mut state = shared.state.lock().unwrap();
     while !state.ready && state.error.is_none() && !state.closed {
         let now = Instant::now();
         if now >= deadline {
-            return Err("WebRTC Direct dial timed out".into());
+            return Err(format!("{context} timed out"));
         }
         let (next, _) = shared.ready.wait_timeout(state, deadline - now).unwrap();
         state = next;
@@ -223,7 +227,7 @@ fn await_dial(shared: &SharedConnection) -> Result<(), String> {
     match (&state.error, state.ready) {
         (Some(err), _) => Err(err.clone()),
         (_, true) => Ok(()),
-        _ => Err("WebRTC Direct dial closed before authentication".into()),
+        _ => Err(format!("{context} closed before connecting")),
     }
 }
 
@@ -546,6 +550,31 @@ mod tests {
     }
 
     #[test]
+    fn connects_with_offer_answer_and_trickle_ice() {
+        let bind_ip = "127.0.0.1".parse().unwrap();
+        let mut offer = signaling::SignalingSetup::offer(bind_ip, "").unwrap();
+        let mut answer = signaling::SignalingSetup::answer(bind_ip, "", offer.sdp()).unwrap();
+        for candidate in offer.candidates() {
+            answer.add_remote_candidate(candidate).unwrap();
+        }
+        for candidate in answer.candidates() {
+            offer.add_remote_candidate(candidate).unwrap();
+        }
+        offer.accept_answer(answer.sdp()).unwrap();
+        let client = HsWebRtcConnection {
+            shared: offer.start().unwrap(),
+        };
+        let server = HsWebRtcConnection {
+            shared: answer.start().unwrap(),
+        };
+        await_connection(&client.shared, "test client").unwrap();
+        await_connection(&server.shared, "test server").unwrap();
+        exchange_data_channel_data(&client, &server);
+        let _ = client.shared.command.send(Command::Close);
+        let _ = server.shared.command.send(Command::Close);
+    }
+
+    #[test]
     fn connects_to_wildcard_listener() {
         roundtrip("0.0.0.0", 1);
     }
@@ -612,6 +641,45 @@ mod tests {
                 _ => panic!("{}", last_error()),
             }
         }
+    }
+
+    fn exchange_data_channel_data(client: &HsWebRtcConnection, server: &HsWebRtcConnection) {
+        let client_channel = open_channel(&client.shared).unwrap();
+        let server_channel = {
+            let mut state = server.shared.state.lock().unwrap();
+            loop {
+                if let Some(token) = state.incoming.pop_front() {
+                    break token;
+                }
+                state = server.shared.ready.wait(state).unwrap();
+            }
+        };
+        let payload = b"signaled data channel".to_vec();
+        let (tx, rx) = mpsc::channel();
+        client
+            .shared
+            .command
+            .send(Command::Send {
+                token: client_channel,
+                data: payload.clone(),
+                response: tx,
+            })
+            .unwrap();
+        rx.recv().unwrap().unwrap();
+        let channel = server
+            .shared
+            .state
+            .lock()
+            .unwrap()
+            .channels
+            .get(&server_channel)
+            .cloned()
+            .unwrap();
+        let mut state = channel.state.lock().unwrap();
+        while state.messages.is_empty() {
+            state = channel.ready.wait(state).unwrap();
+        }
+        assert_eq!(state.messages.pop_front().unwrap(), payload);
     }
 
     fn exchange_noise_channel_data(

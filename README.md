@@ -24,7 +24,8 @@ The project is part of the [libp2p/unified-testing](https://github.com/libp2p/un
 cross-implementation interop effort, joined at the invitation of a libp2p
 maintainer. The codebase receives code review from libp2p maintainers, and
 official integration into the unified testing suite is planned within 2027.
-CI exercises hs ↔ go interoperability over TCP, WebSocket, native QUIC v1, and WebTransport.
+CI exercises hs ↔ go interoperability over TCP, WebSocket, native QUIC v1, WebTransport,
+and WebRTC Direct, plus hs ↔ js standard WebRTC through Circuit Relay v2.
 Local interop evidence lives in `interop/RESULTS.md`.
 
 ## Quickstart
@@ -79,6 +80,9 @@ peer authentication.
 
 `newWebRTCTransport` supports WebRTC Direct v2 with v1 fallback, DTLS
 `/certhash` verification, Noise prologue binding, and SCTP data-channel streams.
+`webRTCTransport sw defaultWebRTCConfig` adds standard relay-signaled WebRTC
+for `/p2p-circuit/webrtc` addresses; register the Circuit Relay v2 handlers and
+TCP transport on the same switch first.
 
 `newWebSocketTransport` supports `/ws` dial/listen and verified `/wss` dialing.
 To listen on `/wss`, load a Web-PKI `Credential`, set
@@ -88,14 +92,14 @@ To listen on `/wss`, load a Web-PKI `Credential`, set
 ## Building
 
 Requires **GHC 9.10.x** (the `cacophony` dependency requires `base < 4.22`).
-The optional WebRTC Direct transport additionally requires **Rust 1.85+** and
+The optional WebRTC transports additionally require **Rust 1.85+** and
 is enabled with `-fwebrtc`.
 
 ```bash
 # Build
 cabal build
 
-# Build with WebRTC Direct support
+# Build with WebRTC support
 cabal build -fwebrtc
 
 # Run tests
@@ -109,7 +113,8 @@ cabal haddock
 
 More than 1,400 tests cover all components, including unit tests, property
 tests, and TCP/WebSocket/QUIC/WebTransport/WebRTC loopback tests. CI additionally
-runs bidirectional go-libp2p interop.
+runs bidirectional go-libp2p transport interop and standard WebRTC interop with
+js-libp2p.
 
 ```bash
 # Run all tests

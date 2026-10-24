@@ -5,6 +5,7 @@ module LibP2P.Transport.WebRTC.FFI (
   CWebRTCListener,
   CWebRTCConnection,
   CWebRTCChannel,
+  CWebRTCSignaling,
   lastError,
   listenerNew,
   listenerPort,
@@ -12,10 +13,20 @@ module LibP2P.Transport.WebRTC.FFI (
   listenerAccept,
   listenerClose,
   dial,
+  signalingOfferNew,
+  signalingAnswerNew,
+  signalingSDP,
+  signalingCandidates,
+  signalingAddCandidate,
+  signalingAcceptAnswer,
+  signalingStart,
+  signalingClose,
   connectionLocalFingerprint,
   connectionRemoteFingerprint,
   connectionIP,
   connectionPort,
+  connectionAddCandidate,
+  connectionWaitReady,
   connectionNoiseChannel,
   connectionOpenChannel,
   connectionAcceptChannel,
@@ -41,6 +52,7 @@ import Foreign.Storable (peek, poke)
 data CWebRTCListener
 data CWebRTCConnection
 data CWebRTCChannel
+data CWebRTCSignaling
 
 foreign import ccall unsafe "hs_webrtc_last_error"
   cLastError :: IO CString
@@ -63,6 +75,36 @@ foreign import ccall safe "hs_webrtc_listener_close"
 foreign import ccall interruptible "hs_webrtc_dial"
   cDial :: CString -> CUShort -> Ptr Word8 -> CSize -> CUChar -> IO (Ptr CWebRTCConnection)
 
+foreign import ccall safe "hs_webrtc_signaling_offer_new"
+  cSignalingOfferNew :: CString -> CString -> IO (Ptr CWebRTCSignaling)
+
+foreign import ccall safe "hs_webrtc_signaling_answer_new"
+  cSignalingAnswerNew :: CString -> CString -> CString -> IO (Ptr CWebRTCSignaling)
+
+foreign import ccall unsafe "hs_webrtc_signaling_sdp"
+  cSignalingSDP :: Ptr CWebRTCSignaling -> IO CString
+
+foreign import ccall unsafe "hs_webrtc_signaling_candidate_count"
+  cSignalingCandidateCount :: Ptr CWebRTCSignaling -> IO CSize
+
+foreign import ccall unsafe "hs_webrtc_signaling_candidate"
+  cSignalingCandidate :: Ptr CWebRTCSignaling -> CSize -> IO CString
+
+foreign import ccall unsafe "hs_webrtc_signaling_add_candidate"
+  cSignalingAddCandidate :: Ptr CWebRTCSignaling -> CString -> IO CInt
+
+foreign import ccall unsafe "hs_webrtc_signaling_accept_answer"
+  cSignalingAcceptAnswer :: Ptr CWebRTCSignaling -> CString -> IO CInt
+
+foreign import ccall safe "hs_webrtc_signaling_start"
+  cSignalingStart :: Ptr CWebRTCSignaling -> IO (Ptr CWebRTCConnection)
+
+foreign import ccall safe "hs_webrtc_signaling_close"
+  cSignalingClose :: Ptr CWebRTCSignaling -> IO ()
+
+foreign import ccall unsafe "hs_webrtc_string_free"
+  cStringFree :: CString -> IO ()
+
 foreign import ccall unsafe "hs_webrtc_connection_local_fingerprint"
   cConnectionLocalFingerprint :: Ptr CWebRTCConnection -> Ptr Word8 -> CSize -> IO CInt
 
@@ -74,6 +116,12 @@ foreign import ccall unsafe "hs_webrtc_connection_ip"
 
 foreign import ccall unsafe "hs_webrtc_connection_port"
   cConnectionPort :: Ptr CWebRTCConnection -> CInt -> IO CUShort
+
+foreign import ccall unsafe "hs_webrtc_connection_add_candidate"
+  cConnectionAddCandidate :: Ptr CWebRTCConnection -> CString -> IO CInt
+
+foreign import ccall interruptible "hs_webrtc_connection_wait_ready"
+  cConnectionWaitReady :: Ptr CWebRTCConnection -> IO CInt
 
 foreign import ccall unsafe "hs_webrtc_connection_noise_channel"
   cConnectionNoiseChannel :: Ptr CWebRTCConnection -> IO (Ptr CWebRTCChannel)
@@ -136,6 +184,48 @@ dial ip port fingerprint version = withCString ip $ \ipPtr ->
         (fromIntegral fingerprintLength)
         (fromIntegral version)
 
+signalingOfferNew :: String -> String -> IO (Ptr CWebRTCSignaling)
+signalingOfferNew bindIP stunServers =
+  withCString bindIP $ \bindPtr -> withCString stunServers $ \serversPtr ->
+    requirePointer "create WebRTC offer"
+      =<< cSignalingOfferNew bindPtr serversPtr
+
+signalingAnswerNew :: String -> String -> String -> IO (Ptr CWebRTCSignaling)
+signalingAnswerNew bindIP stunServers offer =
+  withCString bindIP $ \bindPtr -> withCString stunServers $ \serversPtr ->
+    withCString offer $ \offerPtr ->
+      requirePointer "create WebRTC answer"
+        =<< cSignalingAnswerNew bindPtr serversPtr offerPtr
+
+signalingSDP :: Ptr CWebRTCSignaling -> IO String
+signalingSDP signaling = readOwnedCString "read WebRTC SDP" =<< cSignalingSDP signaling
+
+signalingCandidates :: Ptr CWebRTCSignaling -> IO [String]
+signalingCandidates signaling = do
+  count <- cSignalingCandidateCount signaling
+  mapM readCandidate [0 .. count - 1]
+ where
+  readCandidate index =
+    readOwnedCString "read WebRTC ICE candidate"
+      =<< cSignalingCandidate signaling (fromIntegral index)
+
+signalingAddCandidate :: Ptr CWebRTCSignaling -> String -> IO ()
+signalingAddCandidate signaling candidate = withCString candidate $ \candidatePtr ->
+  cSignalingAddCandidate signaling candidatePtr
+    >>= requireSuccess "add WebRTC ICE candidate"
+
+signalingAcceptAnswer :: Ptr CWebRTCSignaling -> String -> IO ()
+signalingAcceptAnswer signaling answer = withCString answer $ \answerPtr ->
+  cSignalingAcceptAnswer signaling answerPtr
+    >>= requireSuccess "accept WebRTC SDP answer"
+
+signalingStart :: Ptr CWebRTCSignaling -> IO (Ptr CWebRTCConnection)
+signalingStart signaling =
+  requirePointer "start WebRTC signaling connection" =<< cSignalingStart signaling
+
+signalingClose :: Ptr CWebRTCSignaling -> IO ()
+signalingClose = cSignalingClose
+
 connectionLocalFingerprint :: Ptr CWebRTCConnection -> IO ByteString
 connectionLocalFingerprint connection =
   readFingerprint (cConnectionLocalFingerprint connection)
@@ -153,6 +243,15 @@ connectionIP connection remote = allocaBytes 64 $ \output -> do
 connectionPort :: Ptr CWebRTCConnection -> Bool -> IO Word16
 connectionPort connection remote =
   fromIntegral <$> cConnectionPort connection (boolFlag remote)
+
+connectionAddCandidate :: Ptr CWebRTCConnection -> String -> IO ()
+connectionAddCandidate connection candidate = withCString candidate $ \candidatePtr ->
+  cConnectionAddCandidate connection candidatePtr
+    >>= requireSuccess "add WebRTC ICE candidate"
+
+connectionWaitReady :: Ptr CWebRTCConnection -> IO ()
+connectionWaitReady connection =
+  cConnectionWaitReady connection >>= requireSuccess "wait for WebRTC connection"
 
 connectionNoiseChannel :: Ptr CWebRTCConnection -> IO (Ptr CWebRTCChannel)
 connectionNoiseChannel connection =
@@ -194,6 +293,11 @@ channelClose = cChannelClose
 
 connectionClose :: Ptr CWebRTCConnection -> IO ()
 connectionClose = cConnectionClose
+
+readOwnedCString :: String -> CString -> IO String
+readOwnedCString action pointer = do
+  valid <- requirePointer action pointer
+  bracket (pure valid) cStringFree peekCString
 
 readFingerprint :: (Ptr Word8 -> CSize -> IO CInt) -> IO ByteString
 readFingerprint action = allocaArray 32 $ \output -> do

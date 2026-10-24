@@ -50,6 +50,7 @@ encodeProtocols = BS.concat . map encodeOne
     encodeAddress WSS = BS.empty
     encodeAddress P2PCircuit = BS.empty
     encodeAddress WebRTCDirect = BS.empty
+    encodeAddress WebRTC = BS.empty
     encodeAddress WebTransport = BS.empty
     encodeAddress NoiseProto = BS.empty
 
@@ -127,6 +128,7 @@ decodeProtocols bs
     buildNoAddrProtocol 478 = Just WSS
     buildNoAddrProtocol 290 = Just P2PCircuit
     buildNoAddrProtocol 280 = Just WebRTCDirect
+    buildNoAddrProtocol 281 = Just WebRTC
     buildNoAddrProtocol 465 = Just WebTransport
     buildNoAddrProtocol 454 = Just NoiseProto
     buildNoAddrProtocol _ = Nothing
@@ -230,6 +232,9 @@ textToProtocols input
       "webrtc-direct" -> do
         more <- parseParts rest
         Right (WebRTCDirect : more)
+      "webrtc" -> do
+        more <- parseParts rest
+        Right (WebRTC : more)
       "webtransport" -> do
         more <- parseParts rest
         Right (WebTransport : more)

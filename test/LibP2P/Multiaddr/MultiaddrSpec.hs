@@ -134,6 +134,10 @@ spec = do
       textToProtocols "/ip4/127.0.0.1/udp/443/webrtc-direct"
         `shouldBe` Right [IP4 0x7f000001, UDP 443, WebRTCDirect]
 
+    it "parses /webrtc as a no-address protocol" $ do
+      textToProtocols "/p2p-circuit/webrtc"
+        `shouldBe` Right [P2PCircuit, WebRTC]
+
     it "parses /ipfs/<peer-id> as the legacy alias of /p2p/<peer-id>" $ do
       let mh = BS.pack $ [0x12, 0x20] <> replicate 32 0xAB
       let b58 = TE.decodeUtf8 (B58.encode mh)

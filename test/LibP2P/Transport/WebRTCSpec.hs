@@ -3,25 +3,28 @@
 module LibP2P.Transport.WebRTCSpec (spec) where
 
 #ifdef WITH_WEBRTC
+import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (concurrently)
 import Control.Exception (bracket)
 import Control.Monad (replicateM)
 import Data.ByteArray.Encoding (Base (Base16), convertFromBase)
 import Data.ByteString qualified as BS
 import Data.ByteString.Char8 qualified as C8
+import Data.Maybe (listToMaybe)
 import Data.Text (Text)
 import LibP2P.Core.Multihash qualified as Multihash
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair, publicKey)
-import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
+import LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes)
 import LibP2P.Multiaddr (Multiaddr (..), fromText)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
-import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
+import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkMemoryStreamPair)
+import LibP2P.NAT (defaultNATConfig, registerNATHandlers)
 import LibP2P.Protocol.Ping (PingResult (..), registerPingHandler, sendPing)
 import LibP2P.Switch (addTransport, newSwitch, switchClose)
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (defaultConnectionGater, switchListen)
-import LibP2P.Switch.Types (Connection (..))
+import LibP2P.Switch.Types (Connection (..), Switch)
 import LibP2P.Transport (
   ConnectionEndpoint (..),
   Listener (..),
@@ -29,29 +32,67 @@ import LibP2P.Transport (
   RawConnection (..),
   Transport (..),
  )
+import LibP2P.Transport.TCP (newTCPTransport)
 import LibP2P.Transport.WebRTC (
   buildWebRTCNoisePrologue,
   canDialWebRTC,
-  newWebRTCTransport,
+  canDialWebRTCDirect,
+  defaultWebRTCConfig,
+  webRTCDirectTransport,
+  webRTCTransport,
+ )
+import LibP2P.Transport.WebRTC.Signaling (
+  SignalingMessage (..),
+  decodeSignalingMessage,
+  encodeSignalingMessage,
+  readSignalingMessage,
+  writeSignalingMessage,
  )
 import System.Timeout (timeout)
 import Test.Hspec
 
 spec :: Spec
 spec = do
-  describe "canDialWebRTC" $ do
+  describe "canDialWebRTCDirect" $ do
     it "accepts IPv4 and IPv6 WebRTC Direct addresses with SHA-256 certhashes" $ do
-      canDialWebRTC (parseAddr sampleIPv4Address) `shouldBe` True
-      canDialWebRTC (parseAddr sampleIPv6Address) `shouldBe` True
+      canDialWebRTCDirect (parseAddr sampleIPv4Address) `shouldBe` True
+      canDialWebRTCDirect (parseAddr sampleIPv6Address) `shouldBe` True
 
     it "accepts listen addresses and rejects malformed transport stacks" $ do
-      canDialWebRTC (parseAddr listenAddress) `shouldBe` True
-      canDialWebRTC (parseAddr "/ip4/127.0.0.1/tcp/443/ws") `shouldBe` False
+      canDialWebRTCDirect (parseAddr listenAddress) `shouldBe` True
+      canDialWebRTCDirect (parseAddr "/ip4/127.0.0.1/tcp/443/ws") `shouldBe` False
 
     it "rejects non-SHA-256 certhashes" $ do
       let identityHash = Multihash.encodeMultihash Multihash.Identity "certificate"
           address = Multiaddr [IP4 0x7f000001, UDP 443, WebRTCDirect, Certhash identityHash]
-      canDialWebRTC address `shouldBe` False
+      canDialWebRTCDirect address `shouldBe` False
+
+  describe "canDialWebRTC" $ do
+    it "accepts relay-signaled listen and dial addresses" $ do
+      let relay = BS.pack [0x00, 0x01]
+          target = BS.pack [0x00, 0x02]
+          prefix = [IP4 0x7f000001, TCP 4001, P2P relay, P2PCircuit, WebRTC]
+      canDialWebRTC (Multiaddr prefix) `shouldBe` True
+      canDialWebRTC (Multiaddr (prefix <> [P2P target])) `shouldBe` True
+
+    it "rejects WebRTC Direct and malformed relay stacks" $ do
+      canDialWebRTC (parseAddr listenAddress) `shouldBe` False
+      canDialWebRTC (Multiaddr [P2PCircuit, WebRTC]) `shouldBe` False
+
+  describe "WebRTC signaling messages" $ do
+    it "encodes the protobuf type and UTF-8 payload" $ do
+      encodeSignalingMessage (SDPAnswer "answer")
+        `shouldBe` BS.pack [0x08, 0x01, 0x12, 0x06, 0x61, 0x6e, 0x73, 0x77, 0x65, 0x72]
+
+    it "round-trips offer, answer, and ICE candidate messages" $ do
+      let messages = [SDPOffer "offer", SDPAnswer "answer", ICECandidate "{\"candidate\":\"x\"}"]
+      map (decodeSignalingMessage . encodeSignalingMessage) messages
+        `shouldBe` map Right messages
+
+    it "reads and writes length-delimited messages over a stream" $ do
+      (writer, reader) <- mkMemoryStreamPair
+      writeSignalingMessage writer (ICECandidate "candidate")
+      readSignalingMessage reader `shouldReturn` Right (ICECandidate "candidate")
 
   describe "buildWebRTCNoisePrologue" $ do
     it "matches the specification vector and fingerprint order" $ do
@@ -77,7 +118,7 @@ spec = do
 
     it "advertises exactly one SHA-256 certificate hash" $ do
       (_, serverKey) <- generateIdentity
-      transport <- newWebRTCTransport serverKey
+      transport <- webRTCDirectTransport serverKey
       bracket
         (transportListen transport (parseAddr listenAddress))
         listenerClose
@@ -89,8 +130,8 @@ spec = do
       (serverPeer, serverKey) <- generateIdentity
       bracket (newSwitch clientPeer clientKey) switchClose $ \clientSwitch ->
         bracket (newSwitch serverPeer serverKey) switchClose $ \serverSwitch -> do
-          newWebRTCTransport clientKey >>= addTransport clientSwitch
-          newWebRTCTransport serverKey >>= addTransport serverSwitch
+          webRTCDirectTransport clientKey >>= addTransport clientSwitch
+          webRTCDirectTransport serverKey >>= addTransport serverSwitch
           registerPingHandler serverSwitch
           addresses <-
             switchListen serverSwitch defaultConnectionGater [parseAddr listenAddress]
@@ -106,13 +147,57 @@ spec = do
             Just (Right (PingResult rtt)) -> rtt `shouldSatisfy` (> 0)
             other -> expectationFailure $ "WebRTC Direct Ping failed: " <> show other
 
+    it "runs Ping over Circuit Relay signaling and direct WebRTC" $
+      withRelayWebRTC $ \clientSwitch serverPeer address -> do
+        connectionResult <- timeout 20000000 $ dial clientSwitch serverPeer [address]
+        connection <- case connectionResult of
+          Nothing -> fail "relay-signaled WebRTC dial timed out"
+          Just (Left err) -> fail $ "relay-signaled WebRTC dial failed: " <> show err
+          Just (Right established) -> pure established
+        connSecurity connection `shouldBe` "/webrtc"
+        connMuxer connection `shouldBe` "/webrtc"
+        pingResult <- timeout 5000000 $ sendPing clientSwitch connection
+        case pingResult of
+          Just (Right (PingResult rtt)) -> rtt `shouldSatisfy` (> 0)
+          other -> expectationFailure $ "relay-signaled WebRTC Ping failed: " <> show other
+
+withRelayWebRTC :: (Switch -> PeerId -> Multiaddr -> IO a) -> IO a
+withRelayWebRTC action = do
+  (relayPeer, relayKey) <- generateIdentity
+  bracket (newSwitch relayPeer relayKey) switchClose $ \relaySwitch -> do
+    addTransport relaySwitch =<< newTCPTransport
+    _ <- registerNATHandlers relaySwitch defaultNATConfig
+    relayAddresses <- switchListen relaySwitch defaultConnectionGater [parseAddr "/ip4/127.0.0.1/tcp/0"]
+    relayAddress <- maybe (fail "relay did not bind") pure (listToMaybe relayAddresses)
+    (serverPeer, serverKey) <- generateIdentity
+    bracket (newSwitch serverPeer serverKey) switchClose $ \serverSwitch -> do
+      addTransport serverSwitch =<< newTCPTransport
+      _ <- registerNATHandlers serverSwitch defaultNATConfig
+      webRTCTransport serverSwitch defaultWebRTCConfig >>= addTransport serverSwitch
+      registerPingHandler serverSwitch
+      let listenAddress' = appendProtocols relayAddress
+            [P2P (peerIdBytes relayPeer), P2PCircuit, WebRTC]
+      serverAddresses <- switchListen serverSwitch defaultConnectionGater [listenAddress']
+      serverAddress <- maybe (fail "WebRTC listener did not bind") pure (listToMaybe serverAddresses)
+      (clientPeer, clientKey) <- generateIdentity
+      bracket (newSwitch clientPeer clientKey) switchClose $ \clientSwitch -> do
+        addTransport clientSwitch =<< newTCPTransport
+        _ <- registerNATHandlers clientSwitch defaultNATConfig
+        webRTCTransport clientSwitch defaultWebRTCConfig >>= addTransport clientSwitch
+        threadDelay 300000
+        action clientSwitch serverPeer $
+          appendProtocols serverAddress [P2P (peerIdBytes serverPeer)]
+
+appendProtocols :: Multiaddr -> [Protocol] -> Multiaddr
+appendProtocols (Multiaddr protocols) suffix = Multiaddr (protocols <> suffix)
+
 withWebRTCPair ::
   ((PeerId, PeerId, RawConnection, RawConnection) -> IO a) -> IO a
 withWebRTCPair action = do
   (clientPeer, clientKey) <- generateIdentity
   (serverPeer, serverKey) <- generateIdentity
-  clientTransport <- newWebRTCTransport clientKey
-  serverTransport <- newWebRTCTransport serverKey
+  clientTransport <- webRTCDirectTransport clientKey
+  serverTransport <- webRTCDirectTransport serverKey
   bracket
     (transportListen serverTransport (parseAddr listenAddress))
     listenerClose
