@@ -21,6 +21,8 @@ module LibP2P.Noise.Handshake
     -- * Handshake lifecycle
   , initHandshakeInitiator
   , initHandshakeResponder
+  , initHandshakeInitiatorWithPrologue
+  , initHandshakeResponderWithPrologue
   , writeHandshakeMsg
   , readHandshakeMsg
   , sessionComplete
@@ -254,26 +256,31 @@ decodeNoisePayload bs0 = do
 -- | Initialize a handshake state for the initiator role.
 -- Returns (HandshakeState, noiseStaticPublicKey).
 initHandshakeInitiator :: Key.KeyPair -> IO (HandshakeState, ByteString)
-initHandshakeInitiator _identityKP = do
-  noiseStaticKP <- dhGenKey :: IO (DH.KeyPair Curve25519)
-  noiseEphemeralKP <- dhGenKey :: IO (DH.KeyPair Curve25519)
-  let noiseStaticPub = convert (dhPubToBytes (snd noiseStaticKP)) :: ByteString
-  let opts = setLocalStatic (Just noiseStaticKP)
-           . setLocalEphemeral (Just noiseEphemeralKP)
-           $ defaultHandshakeOpts InitiatorRole ""
-  let ns = noiseState opts noiseXX :: CacophonyState
-  pure (HandshakeState ns, noiseStaticPub)
+initHandshakeInitiator identity =
+  initHandshakeInitiatorWithPrologue identity BS.empty
+
+-- | Initialize an initiator handshake with a transport-binding prologue.
+initHandshakeInitiatorWithPrologue :: Key.KeyPair -> ByteString -> IO (HandshakeState, ByteString)
+initHandshakeInitiatorWithPrologue _identityKP = initHandshake InitiatorRole
 
 -- | Initialize a handshake state for the responder role.
 -- Returns (HandshakeState, noiseStaticPublicKey).
 initHandshakeResponder :: Key.KeyPair -> IO (HandshakeState, ByteString)
-initHandshakeResponder _identityKP = do
+initHandshakeResponder identity =
+  initHandshakeResponderWithPrologue identity BS.empty
+
+-- | Initialize a responder handshake with a transport-binding prologue.
+initHandshakeResponderWithPrologue :: Key.KeyPair -> ByteString -> IO (HandshakeState, ByteString)
+initHandshakeResponderWithPrologue _identityKP = initHandshake ResponderRole
+
+initHandshake :: HandshakeRole -> ByteString -> IO (HandshakeState, ByteString)
+initHandshake role prologue = do
   noiseStaticKP <- dhGenKey :: IO (DH.KeyPair Curve25519)
   noiseEphemeralKP <- dhGenKey :: IO (DH.KeyPair Curve25519)
   let noiseStaticPub = convert (dhPubToBytes (snd noiseStaticKP)) :: ByteString
   let opts = setLocalStatic (Just noiseStaticKP)
            . setLocalEphemeral (Just noiseEphemeralKP)
-           $ defaultHandshakeOpts ResponderRole ""
+           $ defaultHandshakeOpts role (convert prologue)
   let ns = noiseState opts noiseXX :: CacophonyState
   pure (HandshakeState ns, noiseStaticPub)
 

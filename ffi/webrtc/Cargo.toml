@@ -1,0 +1,15 @@
+[package]
+name = "hs-libp2p-webrtc"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+
+[lib]
+name = "hs_webrtc"
+crate-type = ["staticlib"]
+
+[dependencies]
+str0m = { version = "0.24.1", default-features = false, features = ["rust-crypto"] }
+str0m-rust-crypto = "0.6.0"

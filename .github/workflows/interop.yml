@@ -8,7 +8,7 @@ on:
 
 jobs:
   transport-interop:
-    name: transport-interop (hs <-> go, TCP, WebSocket, QUIC v1, and WebTransport)
+    name: transport-interop (hs <-> go, TCP, WebSocket, QUIC v1, WebTransport, and WebRTC Direct)
     runs-on: ubuntu-latest
 
     steps:
@@ -143,9 +143,45 @@ jobs:
           --exit-code-from go-dialer
           redis hs-listener go-dialer
 
+      - name: Reset before WebRTC Direct
+        run: >
+          docker compose -f docker-compose.cross.yml
+          -f docker-compose.webtransport-cross.yml down
+
+      - name: Build WebRTC-enabled hs-libp2p interop image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: interop/transport/WebRTCDockerfile
+          load: true
+          tags: hs-libp2p-webrtc-interop:latest
+          cache-from: type=gha,scope=webrtc-interop
+          cache-to: type=gha,mode=max,scope=webrtc-interop
+
+      - name: WebRTC Direct direction 1 — go listener, hs dialer
+        run: >
+          docker compose -f docker-compose.cross.yml
+          -f docker-compose.webrtc-cross.yml up
+          --exit-code-from hs-dialer
+          redis go-listener hs-dialer
+
+      - name: Reset between WebRTC Direct directions
+        run: >
+          docker compose -f docker-compose.cross.yml
+          -f docker-compose.webrtc-cross.yml down
+
+      - name: WebRTC Direct direction 2 — hs listener, go dialer
+        run: >
+          docker compose -f docker-compose.cross.yml
+          -f docker-compose.webrtc-cross.yml up
+          --exit-code-from go-dialer
+          redis hs-listener go-dialer
+
       - name: Tear down
         if: always()
-        run: docker compose -f docker-compose.cross.yml down -v
+        run: >
+          docker compose -f docker-compose.cross.yml
+          -f docker-compose.webrtc-cross.yml down -v
 
   perf-interop:
     name: perf-interop (hs <-> nim, tcp+noise+yamux)

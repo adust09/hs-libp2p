@@ -29,6 +29,8 @@ Local interop evidence lives in `interop/RESULTS.md`.
 
 ## Quickstart
 
+The WebRTC lines below require building with `cabal build -fwebrtc`.
+
 ```haskell
 import LibP2P
 import LibP2P.Crypto.Key (publicKey)
@@ -45,10 +47,12 @@ main = do
   websocket <- newWebSocketTransport
   quic <- newQUICTransport kp
   webtransport <- newWebTransportTransport kp
+  webrtc <- newWebRTCTransport kp
   addTransport sw tcp
   addTransport sw websocket
   addTransport sw quic
   addTransport sw webtransport
+  addTransport sw webrtc
   registerIdentifyHandlers sw
   registerPingHandler sw
 
@@ -58,6 +62,7 @@ main = do
     , Multiaddr [IP4 0x7f000001, TCP 0, WS]
     , Multiaddr [IP4 0x7f000001, UDP 0, QuicV1]
     , Multiaddr [IP4 0x7f000001, UDP 0, QuicV1, WebTransport]
+    , Multiaddr [IP4 0x7f000001, UDP 0, WebRTCDirect]
     ]
   putStrLn $ "Listening on: " ++ show addrs
 
@@ -72,6 +77,9 @@ main = do
 short-lived self-signed certificates, `/certhash` verification, and Noise-based
 peer authentication.
 
+`newWebRTCTransport` supports WebRTC Direct v2 with v1 fallback, DTLS
+`/certhash` verification, Noise prologue binding, and SCTP data-channel streams.
+
 `newWebSocketTransport` supports `/ws` dial/listen and verified `/wss` dialing.
 To listen on `/wss`, load a Web-PKI `Credential`, set
 `webSocketServerTLSParams = Just (webSocketServerParams credential)` on
@@ -80,10 +88,15 @@ To listen on `/wss`, load a Web-PKI `Credential`, set
 ## Building
 
 Requires **GHC 9.10.x** (the `cacophony` dependency requires `base < 4.22`).
+The optional WebRTC Direct transport additionally requires **Rust 1.85+** and
+is enabled with `-fwebrtc`.
 
 ```bash
 # Build
 cabal build
+
+# Build with WebRTC Direct support
+cabal build -fwebrtc
 
 # Run tests
 cabal test
@@ -94,8 +107,9 @@ cabal haddock
 
 ## Tests
 
-1422 tests cover all components, including unit tests, property tests, and
-TCP/WebSocket/QUIC/WebTransport loopback tests. CI additionally runs bidirectional go-libp2p interop.
+More than 1,400 tests cover all components, including unit tests, property
+tests, and TCP/WebSocket/QUIC/WebTransport/WebRTC loopback tests. CI additionally
+runs bidirectional go-libp2p interop.
 
 ```bash
 # Run all tests

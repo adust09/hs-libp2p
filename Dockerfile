@@ -8,7 +8,7 @@ WORKDIR /app
 
 # Copy only the package description first, so the dependency-build layer below
 # is cached and reused as long as hs-libp2p.cabal / cabal.project are unchanged.
-COPY hs-libp2p.cabal cabal.project ./
+COPY hs-libp2p.cabal cabal.project Setup.hs LICENSE ./
 
 # Fix ppad-sha256 ARM SHA2 intrinsic compilation on Docker (GCC 12).
 # Only apply ARM-specific flags on aarch64; skip on x86_64.
@@ -23,13 +23,15 @@ RUN if [ "$(uname -m)" = "aarch64" ]; then \
 # source-only edits skip it. We target the library (not the executable) because
 # the executable depends on the local hs-libp2p library, which cannot be built
 # before its source is copied below.
-RUN cabal update && cabal build --only-dependencies lib:hs-libp2p
+RUN cabal update && cabal build --disable-tests --only-dependencies lib:hs-libp2p
 
 # Copy sources and build the project itself.
+COPY ffi/ ffi/
 COPY src/ src/
+COPY test/ test/
 COPY interop/ interop/
-RUN cabal build libp2p-interop \
-    && cp "$(cabal list-bin libp2p-interop)" /app/libp2p-interop \
+RUN cabal build --disable-tests exe:libp2p-interop \
+    && cp "$(find dist-newstyle -type f -path '*/build/libp2p-interop/libp2p-interop' | head -1)" /app/libp2p-interop \
     && strip /app/libp2p-interop
 
 # Stage 2: Minimal runtime image

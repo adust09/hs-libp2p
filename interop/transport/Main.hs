@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+
 -- | Interop test daemon for the libp2p/unified-testing framework.
 --
 -- Implements the "modern" transport test-app contract
@@ -10,7 +12,7 @@
 --   IS_DIALER      - "true" or "false"
 --   REDIS_ADDR     - Redis host:port (default: "redis:6379")
 --   TEST_KEY       - hex key namespacing Redis coordination keys
---   TRANSPORT      - "tcp", "ws", "quic-v1", or "webtransport"
+--   TRANSPORT      - "tcp", "ws", "quic-v1", "webtransport", or "webrtc-direct"
 --   SECURE_CHANNEL - "noise" or "tls" for TCP/WebSocket; unset for native transports
 --   MUXER          - "yamux" for TCP/WebSocket; unset for native transports
 --   LISTENER_IP    - bind address (default: "0.0.0.0")
@@ -56,6 +58,9 @@ import LibP2P
   , newTCPTransport
   , newWebSocketTransport
   , newWebTransportTransport
+#ifdef WITH_WEBRTC
+  , newWebRTCTransport
+#endif
   , newQUICTransport
   , peerIdBytes
   , registerPingHandler
@@ -128,6 +133,9 @@ main = do
         "tcp" -> newTCPTransport
         "ws" -> newWebSocketTransport
         "webtransport" -> newWebTransportTransport kp
+#ifdef WITH_WEBRTC
+        "webrtc-direct" -> newWebRTCTransport kp
+#endif
         "quic-v1" -> newQUICTransport kp
         _ -> fail "validated transport is unavailable"
       addTransport sw selectedTransport
@@ -405,6 +413,7 @@ listenAndResolve sw pid transportName ip = do
   let suffix = case transportName of
         "quic-v1" -> "/udp/0/quic-v1"
         "webtransport" -> "/udp/0/quic-v1/webtransport"
+        "webrtc-direct" -> "/udp/0/webrtc-direct"
         "ws" -> "/tcp/0/ws"
         _ -> "/tcp/0"
       bindAddr = case fromText (T.pack ("/ip4/" ++ ip ++ suffix)) of
@@ -478,8 +487,13 @@ validateProtocols "quic-v1" _ _ =
 validateProtocols "webtransport" Nothing Nothing = Right ()
 validateProtocols "webtransport" _ _ =
   Left "SECURE_CHANNEL and MUXER must be unset for webtransport"
+#ifdef WITH_WEBRTC
+validateProtocols "webrtc-direct" Nothing Nothing = Right ()
+validateProtocols "webrtc-direct" _ _ =
+  Left "SECURE_CHANNEL and MUXER must be unset for webrtc-direct"
+#endif
 validateProtocols other _ _ =
-  Left $ "transport " ++ other ++ " not supported (expected tcp, ws, webtransport, or quic-v1)"
+  Left $ "transport " ++ other ++ " not supported (expected tcp, ws, webtransport, webrtc-direct, or quic-v1)"
 
 validateUpgradedTransport :: Maybe String -> Maybe String -> Either String ()
 validateUpgradedTransport security muxer = do
