@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+
 -- | hs-libp2p: Haskell implementation of the libp2p networking stack.
 --
 -- This is the public API facade for the library. Import this module
@@ -81,6 +83,9 @@ module LibP2P
   , newWebSocketTransport
   , newWebSocketTransportWithConfig
   , newWebTransportTransport
+#ifdef WITH_WEBRTC
+  , newWebRTCTransport
+#endif
   , newQUICTransport
 
     -- * Connection gating
@@ -303,6 +308,9 @@ import LibP2P.Transport.WebSocket
   , webSocketServerParams
   )
 import LibP2P.Transport.WebTransport (newWebTransportTransport)
+#ifdef WITH_WEBRTC
+import LibP2P.Transport.WebRTC (newWebRTCTransport)
+#endif
 import LibP2P.Transport.QUIC (newQUICTransport)
 import LibP2P.Transport (RelayCircuitLimit (..), Transport (..))
 import LibP2P.Yamux.Types (Micros, YamuxConfig (..), defaultYamuxConfig, microsToInt, mkMicros)

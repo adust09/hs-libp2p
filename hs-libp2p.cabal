@@ -11,9 +11,23 @@ license-file:    LICENSE
 author:          adust09
 maintainer:      adust09
 category:        Network
-build-type:      Simple
+build-type:      Custom
 extra-doc-files: README.md
+extra-source-files:
+  ffi/webrtc/Cargo.lock
+  ffi/webrtc/Cargo.toml
+  ffi/webrtc/hs_webrtc.h
+  ffi/webrtc/src/ffi.rs
+  ffi/webrtc/src/lib.rs
 tested-with:     GHC == 9.10.1
+
+flag webrtc
+  description: Build the WebRTC Direct transport (requires Rust 1.85+)
+  default:     False
+  manual:      True
+
+custom-setup
+  setup-depends: base, Cabal, directory, filepath, process
 
 source-repository head
   type:     git
@@ -32,8 +46,14 @@ common lang
 library
   import:          warnings, lang
   hs-source-dirs:  src
-  other-modules: PackageInfo_hs_libp2p
+  other-modules:   PackageInfo_hs_libp2p
   autogen-modules: PackageInfo_hs_libp2p
+  if flag(webrtc)
+    cpp-options:             -DWITH_WEBRTC
+    extra-libraries:         hs_webrtc, pthread, dl, rt, util
+    extra-bundled-libraries: hs_webrtc
+    other-modules:           LibP2P.Transport.WebRTC.FFI
+    exposed-modules:         LibP2P.Transport.WebRTC
   exposed-modules:
     LibP2P
     LibP2P.Core.Binary
@@ -146,6 +166,8 @@ library
 
 executable libp2p-interop
   import:          warnings, lang
+  if flag(webrtc)
+    cpp-options:   -DWITH_WEBRTC
   hs-source-dirs:  interop/transport
   main-is:         Main.hs
   build-depends:
@@ -209,6 +231,8 @@ executable libp2p-kad-dht-node
 
 test-suite hs-libp2p-test
   import:          warnings, lang
+  if flag(webrtc)
+    cpp-options:   -DWITH_WEBRTC
   type:            exitcode-stdio-1.0
   hs-source-dirs:  test, interop/perf
   main-is:         Spec.hs
@@ -242,6 +266,7 @@ test-suite hs-libp2p-test
     LibP2P.Transport.TCPSpec
     LibP2P.Transport.WebSocketSpec
     LibP2P.Transport.WebTransportSpec
+    LibP2P.Transport.WebRTCSpec
     LibP2P.Transport.QUICSpec
     LibP2P.Security.TLSSpec
     LibP2P.Security.TLS.CertificateSpec

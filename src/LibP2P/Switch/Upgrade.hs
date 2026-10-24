@@ -11,6 +11,7 @@
 module LibP2P.Switch.Upgrade
   ( -- * Streaming handshake
     performStreamHandshake
+  , performStreamHandshakeWithPrologue
     -- * Encrypted StreamIO
   , noiseSessionToStreamIO
   , noiseSessionToManagedStreamIO
@@ -74,7 +75,9 @@ import LibP2P.Noise.Handshake
   , encodeNoisePayload
   , getRemoteNoiseStaticKey
   , initHandshakeInitiator
+  , initHandshakeInitiatorWithPrologue
   , initHandshakeResponder
+  , initHandshakeResponderWithPrologue
   , readHandshakeMsg
   , verifyStaticKey
   , writeHandshakeMsg
@@ -153,9 +156,15 @@ writeFramedMessage stream msg =
 -- Returns (NoiseSession, HandshakeResult) with the remote PeerId.
 performStreamHandshake
   :: KeyPair -> Direction -> StreamIO -> IO (NoiseSession, HandshakeResult)
-performStreamHandshake identityKP dir stream = case dir of
-  Outbound -> performInitiatorHandshake identityKP stream
-  Inbound  -> performResponderHandshake identityKP stream
+performStreamHandshake identityKP dir =
+  performStreamHandshakeWithPrologue identityKP dir BS.empty
+
+-- | Perform Noise XX with a transport-binding prologue.
+performStreamHandshakeWithPrologue
+  :: KeyPair -> Direction -> ByteString -> StreamIO -> IO (NoiseSession, HandshakeResult)
+performStreamHandshakeWithPrologue identityKP dir prologue stream = case dir of
+  Outbound -> performInitiatorHandshake identityKP prologue stream
+  Inbound  -> performResponderHandshake identityKP prologue stream
 
 -- | Initiator (dialer) side of the Noise XX handshake.
 --
@@ -163,9 +172,12 @@ performStreamHandshake identityKP dir stream = case dir of
 --   1. Initiator → Responder: e (empty payload)
 --   2. Responder → Initiator: e, ee, s, es (responder identity payload)
 --   3. Initiator → Responder: s, se (initiator identity payload)
-performInitiatorHandshake :: KeyPair -> StreamIO -> IO (NoiseSession, HandshakeResult)
-performInitiatorHandshake identityKP stream = do
-  (hsState0, noiseStaticPub) <- initHandshakeInitiator identityKP
+performInitiatorHandshake :: KeyPair -> ByteString -> StreamIO -> IO (NoiseSession, HandshakeResult)
+performInitiatorHandshake identityKP prologue stream = do
+  (hsState0, noiseStaticPub) <-
+    if BS.null prologue
+      then initHandshakeInitiator identityKP
+      else initHandshakeInitiatorWithPrologue identityKP prologue
 
   -- Message 1: → (empty payload)
   (msg1, hsState1) <- either (fail . ("initiator msg1 write: " <>)) pure $
@@ -203,9 +215,12 @@ performInitiatorHandshake identityKP stream = do
   pure (noiseSession, HandshakeResult remotePeerId remotePubKey)
 
 -- | Responder (listener) side of the Noise XX handshake.
-performResponderHandshake :: KeyPair -> StreamIO -> IO (NoiseSession, HandshakeResult)
-performResponderHandshake identityKP stream = do
-  (hsState0, noiseStaticPub) <- initHandshakeResponder identityKP
+performResponderHandshake :: KeyPair -> ByteString -> StreamIO -> IO (NoiseSession, HandshakeResult)
+performResponderHandshake identityKP prologue stream = do
+  (hsState0, noiseStaticPub) <-
+    if BS.null prologue
+      then initHandshakeResponder identityKP
+      else initHandshakeResponderWithPrologue identityKP prologue
 
   -- Message 1: ← (empty payload)
   msg1 <- readFramedMessage stream

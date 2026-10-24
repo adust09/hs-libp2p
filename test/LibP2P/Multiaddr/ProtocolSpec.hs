@@ -35,6 +35,7 @@ allProtocols =
   , DNS6 "example.com"
   , DNSAddr "example.com"
   , P2PCircuit
+  , WebRTCDirect
   , WebTransport
   , NoiseProto
   ]
@@ -58,6 +59,7 @@ constructorTag p = case p of
   DNS6 _ -> "DNS6"
   DNSAddr _ -> "DNSAddr"
   P2PCircuit -> "P2PCircuit"
+  WebRTCDirect -> "WebRTCDirect"
   WebTransport -> "WebTransport"
   NoiseProto -> "NoiseProto"
 
@@ -72,6 +74,7 @@ canonicalTable =
   , (DNS6 "", 55, "dns6")
   , (DNSAddr "", 56, "dnsaddr")
   , (UDP 0, 273, "udp")
+  , (WebRTCDirect, 280, "webrtc-direct")
   , (P2PCircuit, 290, "p2p-circuit")
   , (P2P BS.empty, 421, "p2p")
   , (NoiseProto, 454, "noise")
@@ -95,6 +98,7 @@ spec = do
       protocolCode (DNS6 "") `shouldBe` 55
       protocolCode (DNSAddr "") `shouldBe` 56
     it "assigns udp code 273" $ protocolCode (UDP 0) `shouldBe` 273
+    it "assigns webrtc-direct code 280" $ protocolCode WebRTCDirect `shouldBe` 280
     it "assigns p2p-circuit code 290" $ protocolCode P2PCircuit `shouldBe` 290
     it "assigns p2p code 421" $ protocolCode (P2P BS.empty) `shouldBe` 421
     it "assigns noise code 454" $ protocolCode NoiseProto `shouldBe` 454
@@ -118,6 +122,8 @@ spec = do
       encodeUvarint (protocolCode (DNSAddr "")) `shouldBe` BS.pack [0x38]
     it "encodes udp (273) as 0x91 0x02" $
       encodeUvarint (protocolCode (UDP 0)) `shouldBe` BS.pack [0x91, 0x02]
+    it "encodes webrtc-direct (280) as 0x98 0x02" $
+      encodeUvarint (protocolCode WebRTCDirect) `shouldBe` BS.pack [0x98, 0x02]
     it "encodes p2p-circuit (290) as 0xa2 0x02" $
       encodeUvarint (protocolCode P2PCircuit) `shouldBe` BS.pack [0xa2, 0x02]
     it "encodes p2p (421) as 0xa5 0x03" $
@@ -154,7 +160,7 @@ spec = do
       protocolAddressSize 55 `shouldBe` Just VarIntPrefixed
       protocolAddressSize 56 `shouldBe` Just VarIntPrefixed
     it "assigns NoAddress to all zero-address protocols" $
-      forM_ [290, 454, 461, 465, 477, 478 :: Word64] $ \code ->
+      forM_ [280, 290, 454, 461, 465, 477, 478 :: Word64] $ \code ->
         protocolAddressSize code `shouldBe` Just NoAddress
     it "is defined for the code of every constructor (totality)" $
       forM_ allProtocols $ \p ->
@@ -177,7 +183,7 @@ spec = do
     it "covers every constructor exactly once in this spec's tables" $ do
       map constructorTag allProtocols `shouldBe`
         [ "IP4", "IP6", "TCP", "UDP", "P2P", "Certhash", "QuicV1", "WS", "WSS"
-        , "DNS", "DNS4", "DNS6", "DNSAddr", "P2PCircuit", "WebTransport"
+        , "DNS", "DNS4", "DNS6", "DNSAddr", "P2PCircuit", "WebRTCDirect", "WebTransport"
         , "NoiseProto"
         ]
       length canonicalTable `shouldBe` length allProtocols
