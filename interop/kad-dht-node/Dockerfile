@@ -8,7 +8,7 @@ FROM haskell:9.10-slim-bookworm AS builder
 WORKDIR /app
 
 # Copy package description first for dependency cache
-COPY hs-libp2p.cabal cabal.project ./
+COPY hs-libp2p.cabal cabal.project Setup.hs ./
 
 # Fix ppad-sha256 ARM SHA2 intrinsic compilation on Docker (GCC 12).
 # Only apply ARM-specific flags on aarch64; skip on x86_64.

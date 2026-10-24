@@ -7,7 +7,7 @@ FROM haskell:9.10-slim-bookworm AS builder
 
 WORKDIR /app
 
-COPY hs-libp2p.cabal cabal.project ./
+COPY hs-libp2p.cabal cabal.project Setup.hs ./
 
 # Fix ppad-sha256 ARM SHA2 intrinsic compilation on Docker (GCC 12).
 RUN if [ "$(uname -m)" = "aarch64" ]; then \
