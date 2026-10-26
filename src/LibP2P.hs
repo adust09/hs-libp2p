@@ -146,6 +146,18 @@ module LibP2P
   , findProviders
   , findPeer
 
+    -- * Discovery (Rendezvous)
+  , RendezvousConfig (..)
+  , defaultRendezvousConfig
+  , RendezvousError (..)
+  , DiscoveryEvent (..)
+  , registerRendezvousPoint
+  , registeredCount
+  , registerSelf
+  , unregisterSelf
+  , discover
+  , inspectRegistration
+  , pushDiscoverEvents
     -- * NAT traversal (AutoNAT, Circuit Relay v2, DCUtR)
   , NATConfig (..)
   , defaultNATConfig
@@ -266,6 +278,19 @@ import LibP2P.Protocol.GossipSub.Types
   , PartialMessage (..)
   , PartialTopicMode (..)
   , defaultGossipSubParams
+  )
+import LibP2P.Discovery.Rendezvous
+  ( RendezvousConfig (..)
+  , defaultRendezvousConfig
+  , RendezvousError (..)
+  , DiscoveryEvent (..)
+  , registerRendezvousPoint
+  , registeredCount
+  , registerSelf
+  , unregisterSelf
+  , discover
+  , inspectRegistration
+  , pushDiscoverEvents
   )
 import LibP2P.Protocol.Identify
   ( identifyPeer
