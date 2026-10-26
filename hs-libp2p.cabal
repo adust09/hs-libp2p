@@ -119,6 +119,9 @@ library
     LibP2P.NAT.AutoNAT
     LibP2P.Crypto.SignedEnvelope
     LibP2P.Crypto.PeerRecord
+    LibP2P.Discovery.MDNS.Message
+    LibP2P.Discovery.MDNS
+    LibP2P.Discovery.Types
     LibP2P.NAT.Relay.Message
     LibP2P.NAT.Relay
     LibP2P.NAT.Relay.Client
@@ -307,6 +310,7 @@ test-suite hs-libp2p-test
     LibP2P.NAT.AutoNAT.AutoNATSpec
     LibP2P.Crypto.SignedEnvelopeSpec
     LibP2P.Crypto.PeerRecordSpec
+    LibP2P.Discovery.MDNSSpec
     LibP2P.NAT.Relay.MessageSpec
     LibP2P.NAT.Relay.RelaySpec
     LibP2P.NAT.Relay.ClientSpec
