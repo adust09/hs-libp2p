@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+
 -- | hs-libp2p: Haskell implementation of the libp2p networking stack.
 --
 -- This is the public API facade for the library. Import this module
@@ -59,6 +61,10 @@ module LibP2P
   , dial
   , closeConnection
   , newStream
+  , newStreamAllowingLimited
+  , StreamOpenError (..)
+  , RelayCircuitLimit (..)
+  , RelayCircuitExhausted (..)
   , DialError (..)
   , ResourceError (..)
   , setStreamHandler
@@ -71,6 +77,19 @@ module LibP2P
     -- * Transport
   , Transport (..)
   , newTCPTransport
+  , WebSocketConfig (..)
+  , defaultWebSocketConfig
+  , webSocketServerParams
+  , newWebSocketTransport
+  , newWebSocketTransportWithConfig
+  , newWebTransportTransport
+#ifdef WITH_WEBRTC
+  , STUNServer (..)
+ , WebRTCConfig (..)
+ , defaultWebRTCConfig
+ , webRTCDirectTransport
+ , webRTCTransport
+#endif
   , newQUICTransport
 
     -- * Connection gating
@@ -127,6 +146,15 @@ module LibP2P
   , findProviders
   , findPeer
 
+    -- * Discovery (mDNS)
+  , MDNSConfig (..)
+  , defaultMDNSConfig
+  , MDNSService (..)
+  , newMDNSService
+  , stopMDNSService
+  , DiscoveryEvent (..)
+  , newDiscoveryQueue
+  , drainDiscoveryQueue
     -- * NAT traversal (AutoNAT, Circuit Relay v2, DCUtR)
   , NATConfig (..)
   , defaultNATConfig
@@ -152,9 +180,24 @@ module LibP2P
   , newGossipSubNode
   , startGossipSub
   , stopGossipSub
+  , enablePartialMessages
   , gossipJoin
+  , gossipJoinPartial
   , gossipLeave
   , gossipPublish
+  , PartialTopicMode (..)
+  , PartialMessage (..)
+  , PartialMessagesExtension
+  , PartialMessagesConfig (..)
+  , PartialCallbackResult (..)
+  , PartialPublishAction (..)
+  , PartialPublishPlan
+  , PartialMessagesError (..)
+  , defaultPartialMessagesConfig
+  , newPartialMessagesExtension
+  , partialMeshPeers
+  , partialPeerRequests
+  , publishPartial
   ) where
 
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
@@ -205,14 +248,46 @@ import LibP2P.NAT.Relay.Transport
   )
 import LibP2P.Protocol.GossipSub.Handler
   ( GossipSubNode (..)
+  , enablePartialMessages
   , gossipJoin
+  , gossipJoinPartial
   , gossipLeave
   , gossipPublish
   , newGossipSubNode
   , startGossipSub
   , stopGossipSub
   )
-import LibP2P.Protocol.GossipSub.Types (GossipSubParams (..), defaultGossipSubParams)
+import LibP2P.Protocol.GossipSub.PartialMessages
+  ( PartialCallbackResult (..)
+  , PartialMessagesConfig (..)
+  , PartialMessagesError (..)
+  , PartialMessagesExtension
+  , PartialPublishAction (..)
+  , PartialPublishPlan
+  , defaultPartialMessagesConfig
+  , newPartialMessagesExtension
+  , partialMeshPeers
+  , partialPeerRequests
+  , publishPartial
+  )
+import LibP2P.Protocol.GossipSub.Types
+  ( GossipSubParams (..)
+  , PartialMessage (..)
+  , PartialTopicMode (..)
+  , defaultGossipSubParams
+  )
+import LibP2P.Discovery.MDNS
+  ( MDNSConfig (..)
+  , MDNSService (..)
+  , defaultMDNSConfig
+  , newMDNSService
+  , stopMDNSService
+  )
+import LibP2P.Discovery.Types
+  ( DiscoveryEvent (..)
+  , drainDiscoveryQueue
+  , newDiscoveryQueue
+  )
 import LibP2P.Protocol.Identify
   ( identifyPeer
   , pushIdentify
@@ -238,12 +313,35 @@ import LibP2P.Protocol.Ping
   , sendPing
   , withPingSession
   )
-import LibP2P.Switch.Connection (closeConnection, newStream)
+import LibP2P.NAT.Relay.Limit (RelayCircuitExhausted (..))
+import LibP2P.Switch.Connection
+  ( StreamOpenError (..)
+  , closeConnection
+  , newStream
+  , newStreamAllowingLimited
+  )
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (ConnectionGater (..), defaultConnectionGater, switchListen, switchListenAddrs)
 import LibP2P.Switch (addTransport, newSwitch, newSwitchWithConfig, removeStreamHandler, setConnectionGater, setStreamHandler, subscribeSwitchEvents, switchClose)
 import LibP2P.Switch.Types (Connection (..), DialError (..), Direction (..), ResourceError (..), StreamHandler, Switch, SwitchConfig (..), SwitchEvent (..), defaultSwitchConfig)
 import LibP2P.Transport.TCP (newTCPTransport)
+import LibP2P.Transport.WebSocket
+  ( WebSocketConfig (..)
+  , defaultWebSocketConfig
+  , newWebSocketTransport
+  , newWebSocketTransportWithConfig
+  , webSocketServerParams
+  )
+import LibP2P.Transport.WebTransport (newWebTransportTransport)
+#ifdef WITH_WEBRTC
+import LibP2P.Transport.WebRTC
+  ( STUNServer (..)
+  , WebRTCConfig (..)
+  , defaultWebRTCConfig
+  , webRTCDirectTransport
+  , webRTCTransport
+  )
+#endif
 import LibP2P.Transport.QUIC (newQUICTransport)
-import LibP2P.Transport (Transport (..))
+import LibP2P.Transport (RelayCircuitLimit (..), Transport (..))
 import LibP2P.Yamux.Types (Micros, YamuxConfig (..), defaultYamuxConfig, microsToInt, mkMicros)

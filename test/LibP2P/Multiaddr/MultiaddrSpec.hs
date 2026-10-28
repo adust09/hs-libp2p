@@ -37,6 +37,7 @@ spec = do
       encodeProtocols [WS] `shouldBe` BS.pack [0xdd, 0x03]
       encodeProtocols [WSS] `shouldBe` BS.pack [0xde, 0x03]
       encodeProtocols [P2PCircuit] `shouldBe` BS.pack [0xa2, 0x02]
+      encodeProtocols [WebRTCDirect] `shouldBe` BS.pack [0x98, 0x02]
       encodeProtocols [WebTransport] `shouldBe` BS.pack [0xd1, 0x03]
       encodeProtocols [NoiseProto] `shouldBe` BS.pack [0xc6, 0x03]
 
@@ -82,6 +83,16 @@ spec = do
       let ps = [IP4 0x7f000001, TCP 4001, P2P peerIdBytes]
       decodeProtocols (encodeProtocols ps) `shouldBe` Right ps
 
+    it "decode(encode(ps)) == ps for WebRTC Direct certhash" $ do
+      let certificateHash = BS.pack ([0x12, 0x20] <> replicate 32 0xAB)
+          ps = [IP4 0x7f000001, UDP 443, WebRTCDirect, Certhash certificateHash]
+      decodeProtocols (encodeProtocols ps) `shouldBe` Right ps
+
+    it "decode(encode(ps)) == ps for WebTransport certhash" $ do
+      let certificateHash = BS.pack ([0x12, 0x20] <> replicate 32 0xCD)
+          ps = [IP4 0x7f000001, UDP 443, QuicV1, WebTransport, Certhash certificateHash]
+      decodeProtocols (encodeProtocols ps) `shouldBe` Right ps
+
   describe "Text encoding" $ do
     it "renders /ip4/127.0.0.1/tcp/4001" $ do
       let ps = [IP4 0x7f000001, TCP 4001]
@@ -95,6 +106,17 @@ spec = do
       let ps = [DNS4 "example.com", TCP 443, WSS]
       protocolsToText ps `shouldBe` ("/dns4/example.com/tcp/443/wss" :: Text)
 
+    it "renders WebRTC Direct addresses" $ do
+      let certificateHash = BS.pack ([0x12, 0x20] <> replicate 32 0xAB)
+          rendered = protocolsToText [IP4 0x7f000001, UDP 443, WebRTCDirect, Certhash certificateHash]
+      rendered `shouldSatisfy` T.isPrefixOf "/ip4/127.0.0.1/udp/443/webrtc-direct/certhash/u"
+
+    it "round-trips certhash text using multibase base64url" $ do
+      let certificateHash = BS.pack ([0x12, 0x20] <> replicate 32 0xCD)
+          rendered = protocolsToText [Certhash certificateHash]
+      rendered `shouldSatisfy` T.isPrefixOf "/certhash/u"
+      textToProtocols rendered `shouldBe` Right [Certhash certificateHash]
+
   describe "Text parsing" $ do
     it "parses /ip4/127.0.0.1/tcp/4001" $ do
       textToProtocols "/ip4/127.0.0.1/tcp/4001"
@@ -107,6 +129,14 @@ spec = do
     it "parses /dns4/example.com/tcp/443/wss" $ do
       textToProtocols "/dns4/example.com/tcp/443/wss"
         `shouldBe` Right [DNS4 "example.com", TCP 443, WSS]
+
+    it "parses /webrtc-direct as a no-address protocol" $ do
+      textToProtocols "/ip4/127.0.0.1/udp/443/webrtc-direct"
+        `shouldBe` Right [IP4 0x7f000001, UDP 443, WebRTCDirect]
+
+    it "parses /webrtc as a no-address protocol" $ do
+      textToProtocols "/p2p-circuit/webrtc"
+        `shouldBe` Right [P2PCircuit, WebRTC]
 
     it "parses /ipfs/<peer-id> as the legacy alias of /p2p/<peer-id>" $ do
       let mh = BS.pack $ [0x12, 0x20] <> replicate 32 0xAB
@@ -409,6 +439,7 @@ genProtocol =
     , TCP <$> arbitrary
     , UDP <$> arbitrary
     , P2P <$> genIdentityMultihash
+    , Certhash <$> genIdentityMultihash
     , DNS <$> genDnsName
     , DNS4 <$> genDnsName
     , DNS6 <$> genDnsName
@@ -417,6 +448,7 @@ genProtocol =
     , pure WS
     , pure WSS
     , pure P2PCircuit
+    , pure WebRTCDirect
     , pure WebTransport
     , pure NoiseProto
     ]

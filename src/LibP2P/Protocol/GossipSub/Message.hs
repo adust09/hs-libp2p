@@ -2,12 +2,13 @@
 --
 -- Wire format from specs/pubsub (rpc.proto):
 --   Message framing: [uvarint length][protobuf RPC]
---   RPC fields: subscriptions(1), publish(2), control(3)
---   SubOpts: subscribe(1), topicid(2)
+--   RPC fields: subscriptions(1), publish(2), control(3), partial(10)
+--   SubOpts: subscribe(1), topicid(2), requestsPartial(3), supportsPartial(4)
 --   Message: from(1), data(2), seqno(3), topic(4), signature(5), key(6)
---   ControlMessage: ihave(1), iwant(2), graft(3), prune(4)
+--   ControlMessage: ihave(1), iwant(2), graft(3), prune(4), idontwant(5), extensions(6)
 --   ControlIHave: topicID(1), messageIDs(2)
 --   ControlIWant: messageIDs(1)
+--   ControlIDontWant: messageIDs(1)
 --   ControlGraft: topicID(1)
 --   ControlPrune: topicID(1), peers(2), backoff(3)
 --   PeerInfo: peerID(1), signedPeerRecord(2)
@@ -61,6 +62,11 @@ optUint64 :: Word -> Maybe Word64 -> MessageBuilder
 optUint64 _ Nothing  = mempty
 optUint64 n (Just v) = Encode.uint64 (FieldNumber (fromIntegral n)) v
 
+trueBool :: Word -> Bool -> MessageBuilder
+trueBool n value
+  | value = Encode.bool (FieldNumber (fromIntegral n)) True
+  | otherwise = mempty
+
 optEmbedded :: Word -> (a -> MessageBuilder) -> Maybe a -> MessageBuilder
 optEmbedded _ _ Nothing  = mempty
 optEmbedded n f (Just v) = Encode.embedded (FieldNumber (fromIntegral n)) (f v)
@@ -95,6 +101,8 @@ encodeSubOpts :: SubOpts -> MessageBuilder
 encodeSubOpts sub =
      Encode.bool (FieldNumber 1) (subSubscribe sub)
   <> Encode.text (FieldNumber 2) (TL.fromStrict (subTopicId sub))
+  <> trueBool 3 (subRequestsPartial sub)
+  <> trueBool 4 (subSupportsSendingPartial sub)
 
 -- | Encode an IHave sub-message.
 encodeIHave :: IHave -> MessageBuilder
@@ -105,6 +113,11 @@ encodeIHave (IHave topic mids) =
 -- | Encode an IWant sub-message.
 encodeIWant :: IWant -> MessageBuilder
 encodeIWant (IWant mids) =
+  foldMap (\mid -> Encode.byteString (FieldNumber 1) mid) mids
+
+-- | Encode an IDONTWANT sub-message.
+encodeIDontWant :: IDontWant -> MessageBuilder
+encodeIDontWant (IDontWant mids) =
   foldMap (\mid -> Encode.byteString (FieldNumber 1) mid) mids
 
 -- | Encode a Graft sub-message.
@@ -125,6 +138,10 @@ encodePrune prn =
   <> repEmbedded 2 encodePeerExchangeInfo (prunePeers prn)
   <> optUint64 3 (pruneBackoff prn)
 
+-- | Encode a v1.3 extensions advertisement.
+encodeControlExtensions :: ControlExtensions -> MessageBuilder
+encodeControlExtensions ext = trueBool 10 (extPartialMessages ext)
+
 -- | Encode a ControlMessage sub-message.
 encodeControlMessage :: ControlMessage -> MessageBuilder
 encodeControlMessage ctrl =
@@ -132,6 +149,16 @@ encodeControlMessage ctrl =
   <> repEmbedded 2 encodeIWant (ctrlIWant ctrl)
   <> repEmbedded 3 encodeGraft (ctrlGraft ctrl)
   <> repEmbedded 4 encodePrune (ctrlPrune ctrl)
+  <> repEmbedded 5 encodeIDontWant (ctrlIDontWant ctrl)
+  <> optEmbedded 6 encodeControlExtensions (ctrlExtensions ctrl)
+
+-- | Encode an opaque partial-message extension payload.
+encodePartialMessage :: PartialMessage -> MessageBuilder
+encodePartialMessage partial =
+     Encode.text (FieldNumber 1) (TL.fromStrict (partialTopicId partial))
+  <> optBytes 2 (Just (partialGroupId partial))
+  <> optBytes 3 (partialMessageData partial)
+  <> optBytes 4 (partialPartsMetadata partial)
 
 -- | Encode an RPC message to protobuf (no framing).
 encodeRPC :: RPC -> ByteString
@@ -139,6 +166,7 @@ encodeRPC rpc = BL.toStrict $ Encode.toLazyByteString $
      repEmbedded 1 encodeSubOpts (rpcSubscriptions rpc)
   <> repEmbedded 2 encodePubSubMessage (rpcPublish rpc)
   <> optEmbedded 3 encodeControlMessage (rpcControl rpc)
+  <> optEmbedded 10 encodePartialMessage (rpcPartial rpc)
 
 -- Decoding
 
@@ -165,6 +193,8 @@ subOptsParser :: Parser RawMessage SubOpts
 subOptsParser = SubOpts
   <$> at (one Decode.bool False) (FieldNumber 1)
   <*> at (one (TL.toStrict <$> Decode.text) "") (FieldNumber 2)
+  <*> at (one Decode.bool False) (FieldNumber 3)
+  <*> at (one Decode.bool False) (FieldNumber 4)
 
 -- | Decode IHave from protobuf.
 ihaveParser :: Parser RawMessage IHave
@@ -175,6 +205,11 @@ ihaveParser = IHave
 -- | Decode IWant from protobuf.
 iwantParser :: Parser RawMessage IWant
 iwantParser = IWant
+  <$> at (repeated Decode.byteString) (FieldNumber 1)
+
+-- | Decode IDONTWANT from protobuf.
+idontwantParser :: Parser RawMessage IDontWant
+idontwantParser = IDontWant
   <$> at (repeated Decode.byteString) (FieldNumber 1)
 
 -- | Decode Graft from protobuf.
@@ -202,6 +237,21 @@ controlMessageParser = ControlMessage
   <*> at (repeated (embedded' iwantParser)) (FieldNumber 2)
   <*> at (repeated (embedded' graftParser)) (FieldNumber 3)
   <*> at (repeated (embedded' pruneParser)) (FieldNumber 4)
+  <*> at (repeated (embedded' idontwantParser)) (FieldNumber 5)
+  <*> at (embedded controlExtensionsParser) (FieldNumber 6)
+
+-- | Decode a v1.3 extensions advertisement.
+controlExtensionsParser :: Parser RawMessage ControlExtensions
+controlExtensionsParser = ControlExtensions
+  <$> at (one Decode.bool False) (FieldNumber 10)
+
+-- | Decode an opaque partial-message extension payload.
+partialMessageParser :: Parser RawMessage PartialMessage
+partialMessageParser = PartialMessage
+  <$> at (one (TL.toStrict <$> Decode.text) "") (FieldNumber 1)
+  <*> at (one Decode.byteString BS.empty) (FieldNumber 2)
+  <*> at (optional Decode.byteString) (FieldNumber 3)
+  <*> at (optional Decode.byteString) (FieldNumber 4)
 
 -- | Decode a ControlMessage from raw bytes.
 decodeControlMessage :: ByteString -> Either ParseError ControlMessage
@@ -213,6 +263,7 @@ rpcParser = RPC
   <$> at (repeated (embedded' subOptsParser)) (FieldNumber 1)
   <*> at (repeated (embedded' pubSubMessageParser)) (FieldNumber 2)
   <*> at (embedded controlMessageParser) (FieldNumber 3)
+  <*> at (embedded partialMessageParser) (FieldNumber 10)
 
 -- | Decode an RPC from raw bytes.
 decodeRPC :: ByteString -> Either ParseError RPC

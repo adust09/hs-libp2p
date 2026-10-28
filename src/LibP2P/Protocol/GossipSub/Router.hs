@@ -13,6 +13,7 @@ module LibP2P.Protocol.GossipSub.Router
   , setSignedPeerRecord
     -- * Topic subscription
   , join
+  , joinPartial
   , leave
     -- * Publishing
   , publish
@@ -39,10 +40,11 @@ module LibP2P.Protocol.GossipSub.Router
 
 import Prelude
 import Control.Exception (throwIO)
-import Control.Monad (unless, when)
+import Control.Monad (filterM, unless, when)
 import Control.Concurrent.STM
 import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (isJust)
 import qualified Data.Set as Set
 import Data.Time (UTCTime, addUTCTime, diffUTCTime)
 import Data.Word (Word64)
@@ -53,6 +55,19 @@ import LibP2P.Crypto.PeerRecord (PeerRecord (..), openPeerRecordEnvelope)
 import LibP2P.Crypto.Key (KeyPair (..), sign)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.Protocol.GossipSub.Types
+import LibP2P.Protocol.GossipSub.Extensions
+  ( handleExtensionAdvertisement
+  , handlePartialMessageRPC
+  , notifyPartialPeerDisconnected
+  , peerRequestsPartial
+  , peerSupportsPartialExtension
+  )
+import LibP2P.Protocol.GossipSub.IDontWant
+  ( announceIDontWant
+  , filterAllowedPeers
+  , handleIDontWant
+  , peerRejectsMessage
+  )
 import LibP2P.Protocol.GossipSub.MessageCache (newMessageCache, cachePut, cacheGet)
 import LibP2P.Protocol.GossipSub.Score
   ( computeScore
@@ -74,10 +89,14 @@ newRouter :: GossipSubParams
           -> IO GossipSubRouter
 newRouter params localPid sendRPC getTime = do
   subs     <- newTVarIO Set.empty
+  partialTopics <- newTVarIO Map.empty
   mesh     <- newTVarIO Map.empty
   fanout   <- newTVarIO Map.empty
   fanoutPub <- newTVarIO Map.empty
   peers    <- newTVarIO Map.empty
+  peerExtensions <- newTVarIO Map.empty
+  sentExtensions <- newTVarIO Set.empty
+  partialHooks <- newTVarIO Nothing
   seen     <- newTVarIO Map.empty
   backoff  <- newTVarIO Map.empty
   retained <- newTVarIO Map.empty
@@ -92,16 +111,22 @@ newRouter params localPid sendRPC getTime = do
   ihaveCounts <- newTVarIO Map.empty
   iaskedCounts <- newTVarIO Map.empty
   iwantServed <- newTVarIO Map.empty
+  idontwantCounts <- newTVarIO Map.empty
+  dontSendMessageIds <- newTVarIO Map.empty
   onPX     <- newTVarIO (\_ _ -> pure ())
   signedRecords <- newTVarIO Map.empty
   pure GossipSubRouter
     { gsParams         = params
     , gsLocalPeerId    = localPid
     , gsSubscriptions  = subs
+    , gsPartialTopics  = partialTopics
     , gsMesh           = mesh
     , gsFanout         = fanout
     , gsFanoutPub      = fanoutPub
     , gsPeers          = peers
+    , gsPeerExtensions = peerExtensions
+    , gsSentExtensions = sentExtensions
+    , gsPartialMessagesHooks = partialHooks
     , gsSeen           = seen
     , gsBackoff        = backoff
     , gsRetainedScores = retained
@@ -113,6 +138,8 @@ newRouter params localPid sendRPC getTime = do
     , gsIHaveCounts    = ihaveCounts
     , gsIAskedCounts   = iaskedCounts
     , gsIWantServed    = iwantServed
+    , gsIDontWantCounts = idontwantCounts
+    , gsDontSendMessageIds = dontSendMessageIds
     , gsMessageCache   = mcache
     , gsHeartbeatCount = hbCount
     , gsSendRPC        = sendRPC
@@ -157,6 +184,7 @@ addPeer router pid proto isOutbound now = atomically $ do
           saved
             { psProtocol        = proto
             , psTopics          = Set.empty
+            , psPartialTopics   = Map.empty
             , psIsOutbound      = isOutbound
             , psConnectedAt     = now
             , psIPAddress       = Nothing
@@ -164,6 +192,7 @@ addPeer router pid proto isOutbound now = atomically $ do
         _ -> PeerState
           { psProtocol        = proto
           , psTopics          = Set.empty
+          , psPartialTopics   = Map.empty
           , psIsOutbound      = isOutbound
           , psConnectedAt     = now
           , psTopicState      = Map.empty
@@ -195,11 +224,16 @@ removePeer router pid = do
           Just ip -> modifyTVar' (gsIPPeerCount router) (removeIPMember ip pid)
           Nothing -> pure ()
     modifyTVar' (gsPeers router) (Map.delete pid)
+    modifyTVar' (gsPeerExtensions router) (Map.delete pid)
+    modifyTVar' (gsSentExtensions router) (Set.delete pid)
     modifyTVar' (gsMesh router) (Map.map (Set.delete pid))
     modifyTVar' (gsSignedPeerRecords router) (Map.delete pid)
     modifyTVar' (gsFanout router) (Map.map (Set.delete pid))
     modifyTVar' (gsIWantPromises router) $
       Map.filterWithKey (\(p, _) _ -> p /= pid)
+    modifyTVar' (gsIDontWantCounts router) (Map.delete pid)
+    modifyTVar' (gsDontSendMessageIds router) (Map.delete pid)
+  notifyPartialPeerDisconnected router pid
 
 clearMeshClock :: TopicPeerState -> TopicPeerState
 clearMeshClock tps = tps { tpsInMesh = False, tpsGraftTime = Nothing, tpsMeshTime = 0 }
@@ -266,11 +300,11 @@ floodSubTopicPeers peers topic =
 
 -- Protocol version gating
 
--- | True when the peer negotiated /meshsub/1.1.0. Unknown peers are
--- treated as v1.1 (the preferred protocol).
+-- | True when the peer negotiated a version supporting v1.1 extensions.
+-- Unknown peers retain the historical permissive behavior.
 peerSupportsV11 :: Map.Map PeerId PeerState -> PeerId -> Bool
 peerSupportsV11 peers pid = case Map.lookup pid peers of
-  Just ps -> psProtocol ps == GossipSubPeer
+  Just ps -> psProtocol ps `elem` [GossipSubV13Peer, GossipSubV12Peer, GossipSubPeer]
   Nothing -> True
 
 -- | Build a PRUNE for a peer, gated on its negotiated protocol version:
@@ -290,19 +324,31 @@ buildPrune router pid topic withPX backoffSecs = do
 
 -- Topic subscription
 
--- | Subscribe to a topic (JOIN): announce, fanout→mesh transition, fill to D, GRAFT.
+-- | Subscribe to a topic using full messages.
 join :: GossipSubRouter -> Topic -> IO ()
-join router topic = do
+join router topic = joinWithMode router topic Nothing
+
+-- | Subscribe while advertising partial-message support or preference.
+joinPartial :: GossipSubRouter -> Topic -> PartialTopicMode -> IO ()
+joinPartial router topic mode = joinWithMode router topic (Just mode)
+
+-- | Subscribe to a topic (JOIN): announce, fanout→mesh transition, fill to D, GRAFT.
+joinWithMode :: GossipSubRouter -> Topic -> Maybe PartialTopicMode -> IO ()
+joinWithMode router topic partialMode = do
   -- 1. Record the subscription. This must happen regardless of how many
   -- peers currently know the topic: the subscription set (not mesh key
   -- presence) is what GRAFT acceptance and hello-packet announcements
   -- consult (gossipsub-v1.0.md JOIN/GRAFT; issue #155).
-  atomically $ modifyTVar' (gsSubscriptions router) (Set.insert topic)
+  atomically $ do
+    modifyTVar' (gsSubscriptions router) (Set.insert topic)
+    modifyTVar' (gsPartialTopics router) $ case partialMode of
+      Nothing -> Map.delete topic
+      Just mode -> Map.insert topic mode
 
   -- 2. Announce subscription to all known peers
   peers <- readTVarIO (gsPeers router)
   let allPeerIds = Map.keys peers
-      subRPC = emptyRPC { rpcSubscriptions = [SubOpts True topic] }
+      subRPC = emptyRPC { rpcSubscriptions = [subscriptionOption True topic partialMode] }
   mapM_ (\pid -> gsSendRPC router pid subRPC) allPeerIds
 
   -- 3. Check fanout and transition to mesh
@@ -360,12 +406,14 @@ join router topic = do
 leave :: GossipSubRouter -> Topic -> IO ()
 leave router topic = do
   -- 1. Drop the subscription
-  atomically $ modifyTVar' (gsSubscriptions router) (Set.delete topic)
+  atomically $ do
+    modifyTVar' (gsSubscriptions router) (Set.delete topic)
+    modifyTVar' (gsPartialTopics router) (Map.delete topic)
 
   -- 2. Announce unsubscription to all known peers
   peers <- readTVarIO (gsPeers router)
   let allPeerIds = Map.keys peers
-      unsubRPC = emptyRPC { rpcSubscriptions = [SubOpts False topic] }
+      unsubRPC = emptyRPC { rpcSubscriptions = [subscriptionOption False topic Nothing] }
   mapM_ (\pid -> gsSendRPC router pid unsubRPC) allPeerIds
 
   -- 3. Send PRUNE with unsubscribe backoff and peer exchange to mesh
@@ -411,8 +459,9 @@ publish router topic payload mKeyPair = do
     modifyTVar' (gsSeen router) (Map.insert msgId now)
     modifyTVar' (gsMessageCache router) (cachePut msgId msg)
 
-  -- Build RPC with published message
+  -- Build RPC with published message and apply any live IDONTWANTs.
   let pubRPC = emptyRPC { rpcPublish = [msg] }
+  unwanted <- readTVarIO (gsDontSendMessageIds router)
 
   if paramFloodPublish (gsParams router)
     then do
@@ -425,11 +474,12 @@ publish router topic payload mKeyPair = do
           targets = Map.foldlWithKey' (\acc pid ps ->
             if Set.member topic (psTopics ps)
                && pid /= gsLocalPeerId router
+               && not (peerRejectsMessage unwanted pid msgId)
                && (isDirectPeer router pid
                    || computeScore (gsScoreParams router) pid ps ipMap now >= threshold)
             then pid : acc
             else acc) [] peers
-      mapM_ (\pid -> gsSendRPC router pid pubRPC) targets
+      sendFullMessageTo router topic pubRPC targets
     else do
       -- Mesh-based publish; subscribed direct and floodsub peers are
       -- always included although they are never mesh or fanout members
@@ -441,8 +491,9 @@ publish router topic payload mKeyPair = do
         m <- readTVar (gsMesh router)
         pure (Map.findWithDefault Set.empty topic m)
       if not (Set.null meshPeers)
-        then mapM_ (\pid -> gsSendRPC router pid pubRPC)
-               (Set.toList (Set.unions [meshPeers, direct, flood]))
+        then sendFullMessageTo router topic pubRPC
+               (Set.toList (filterAllowedPeers unwanted msgId
+                 (Set.unions [meshPeers, direct, flood])))
         else do
           -- Fanout: use existing or create new (direct and floodsub
           -- peers excluded from selection but always sent to)
@@ -467,8 +518,9 @@ publish router topic payload mKeyPair = do
             else do
               atomically $ modifyTVar' (gsFanoutPub router) (Map.insert topic now)
               pure foPeers
-          mapM_ (\pid -> gsSendRPC router pid pubRPC)
-            (Set.toList (Set.unions [targets, direct, flood]))
+          sendFullMessageTo router topic pubRPC
+            (Set.toList (filterAllowedPeers unwanted msgId
+              (Set.unions [targets, direct, flood])))
 
   -- Deliver to local application
   onMsg <- readTVarIO (gsOnMessage router)
@@ -491,11 +543,16 @@ handleRPC router sender rpc = do
 
 handleRPC' :: GossipSubRouter -> PeerId -> RPC -> IO ()
 handleRPC' router sender rpc = do
-  -- Process subscriptions
+  -- Extensions may only be advertised in the first v1.3 RPC.
+  handleExtensionAdvertisement router sender rpc
+
+  -- Process subscriptions before extension payloads in the same RPC.
   handleSubscriptions router sender (rpcSubscriptions rpc)
 
-  -- Process published messages
-  mapM_ (handlePublishedMessage router sender) (rpcPublish rpc)
+  -- IDONTWANT is emitted immediately before validation of each first-seen
+  -- large message, then the normal validation/deduplication path runs.
+  mapM_ (\msg -> announceIDontWant router sender msg
+              >> handlePublishedMessage router sender msg) (rpcPublish rpc)
 
   -- Process control messages
   case rpcControl rpc of
@@ -505,6 +562,9 @@ handleRPC' router sender rpc = do
       handleIWant router sender (ctrlIWant ctrl)
       handleGraft router sender (ctrlGraft ctrl)
       handlePrune router sender (ctrlPrune ctrl)
+      handleIDontWant router sender (ctrlIDontWant ctrl)
+
+  handlePartialMessageRPC router sender rpc
 
 -- | Process a published message: verify, deduplicate, validate, forward, deliver.
 --
@@ -812,8 +872,10 @@ handleIWant router sender iwants = do
   score <- peerScore router sender
   unless (score < stGossipThreshold (gsThresholds router)) $ do
     cache <- readTVarIO (gsMessageCache router)
+    unwanted <- readTVarIO (gsDontSendMessageIds router)
     let requestedIds = concatMap iwantMessageIds iwants
         found = [ msg | mid <- requestedIds
+                       , not (peerRejectsMessage unwanted sender mid)
                        , Just msg <- [cacheGet mid cache] ]
     toServe <- atomically $ do
       served <- readTVar (gsIWantServed router)
@@ -833,12 +895,12 @@ handleSubscriptions router sender subs = atomically $
     case Map.lookup sender peerMap of
       Nothing -> peerMap  -- Unknown peer, ignore
       Just ps ->
-        let topics' = foldl (\ts sub ->
-              if subSubscribe sub
-                then Set.insert (subTopicId sub) ts
-                else Set.delete (subTopicId sub) ts
-              ) (psTopics ps) subs
-        in Map.insert sender ps { psTopics = topics' } peerMap
+        let topics' = foldl updateTopics (psTopics ps) subs
+            partial' = foldl updatePartialTopics (psPartialTopics ps) subs
+        in Map.insert sender ps
+          { psTopics = topics'
+          , psPartialTopics = partial'
+          } peerMap
 
 -- Message forwarding
 
@@ -854,11 +916,47 @@ forwardMessage router sender msg = do
     m <- readTVar (gsMesh router)
     pure (Map.findWithDefault Set.empty topic m)
   peers <- readTVarIO (gsPeers router)
+  unwanted <- readTVarIO (gsDontSendMessageIds router)
   let direct = directTopicPeers router peers topic
       flood  = floodSubTopicPeers peers topic
-      targets = Set.delete sender (Set.unions [meshPeers, direct, flood])
+      candidates = Set.delete sender (Set.unions [meshPeers, direct, flood])
+      targets = filterAllowedPeers unwanted
+        (paramMessageIdFn (gsParams router) msg) candidates
       fwdRPC = emptyRPC { rpcPublish = [msg] }
-  mapM_ (\pid -> gsSendRPC router pid fwdRPC) (Set.toList targets)
+  sendFullMessageTo router topic fwdRPC (Set.toList targets)
+
+sendFullMessageTo :: GossipSubRouter -> Topic -> RPC -> [PeerId] -> IO ()
+sendFullMessageTo router topic rpc peers = do
+  targets <- filterM shouldSend peers
+  mapM_ (\pid -> gsSendRPC router pid rpc) targets
+ where
+  shouldSend pid = do
+    localSupports <- Map.member topic <$> readTVarIO (gsPartialTopics router)
+    peerRequests <- peerRequestsPartial router pid topic
+    peerSupportsExtension <- peerSupportsPartialExtension router pid
+    pure (not (localSupports && peerRequests && peerSupportsExtension))
+
+updateTopics :: Set.Set Topic -> SubOpts -> Set.Set Topic
+updateTopics topics sub
+  | subSubscribe sub = Set.insert (subTopicId sub) topics
+  | otherwise = Set.delete (subTopicId sub) topics
+
+updatePartialTopics
+  :: Map.Map Topic PartialTopicMode -> SubOpts -> Map.Map Topic PartialTopicMode
+updatePartialTopics topics sub
+  | not (subSubscribe sub) = Map.delete (subTopicId sub) topics
+  | subRequestsPartial sub = Map.insert (subTopicId sub) RequestsPartialMessages topics
+  | subSupportsSendingPartial sub =
+      Map.insert (subTopicId sub) SupportsPartialMessages topics
+  | otherwise = Map.delete (subTopicId sub) topics
+
+subscriptionOption :: Bool -> Topic -> Maybe PartialTopicMode -> SubOpts
+subscriptionOption subscribed topic mode = SubOpts
+  { subSubscribe = subscribed
+  , subTopicId = topic
+  , subRequestsPartial = mode == Just RequestsPartialMessages
+  , subSupportsSendingPartial = isJust mode
+  }
 
 -- Scoring
 

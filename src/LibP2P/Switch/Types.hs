@@ -38,7 +38,7 @@ import LibP2P.Switch.ResourceManager
   , ResourceManager
   , ResourceScope
   )
-import LibP2P.Transport (Listener, Transport)
+import LibP2P.Transport (Listener, RelayCircuitLimit, Transport)
 import LibP2P.Yamux.Types (YamuxConfig, defaultYamuxConfig)
 
 -- | Connection state machine.
@@ -73,6 +73,11 @@ data Connection = Connection
   , connSession    :: !MuxerSession    -- ^ Muxer session for opening/accepting streams
   , connState      :: !(TVar ConnState) -- ^ Mutable connection state
   , connResourceScope :: !ResourceScope -- ^ Resource scope owned by this connection
+  , connRelayLimit :: !(Maybe RelayCircuitLimit)
+    -- ^ Relay-advertised circuit budget. 'Nothing' unless this connection
+    -- is the byte stream of a relayed circuit. A non-zero component makes
+    -- 'LibP2P.Switch.Connection.newStream' refuse the connection unless
+    -- the caller opts in.
   }
 
 -- | A protocol stream handler.

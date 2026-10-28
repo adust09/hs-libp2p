@@ -3,9 +3,8 @@ dist-newstyle/
 .claude/
 .serena/
 docs/
-test/
+ffi/webrtc/target/
 *.md
-LICENSE
 .DS_Store
 cabal.project.local
 cabal.project.freeze

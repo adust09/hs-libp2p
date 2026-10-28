@@ -171,6 +171,26 @@ spec = do
               <> BS.singleton 0x22 <> encodeUvarint (fromIntegral (BS.length ext)) <> ext
       decodeNoisePayload encoded `shouldBe` Right (NoisePayload key sig)
 
+    it "round-trips WebTransport certhashes in Noise extensions" $ do
+      let payload = NoisePayload (BS.replicate 36 0x11) (BS.replicate 64 0x22)
+          hashes =
+            [ BS.pack ([0x12, 0x20] <> replicate 32 0xAA)
+            , BS.pack ([0x12, 0x20] <> replicate 32 0xBB)
+            ]
+          encoded = encodeNoisePayloadWithCerthashes payload hashes
+      decodeNoisePayload encoded `shouldBe` Right payload
+      decodeNoiseCerthashes encoded `shouldBe` Right hashes
+
+    it "returns no certhashes when extensions are absent" $ do
+      let payload = NoisePayload (BS.replicate 36 0x11) (BS.replicate 64 0x22)
+      decodeNoiseCerthashes (encodeNoisePayload payload) `shouldBe` Right []
+
+    it "ignores other Noise extension fields" $ do
+      let payload = NoisePayload (BS.replicate 36 0x11) (BS.replicate 64 0x22)
+          streamMuxer = BS.singleton 0x12 <> encodeUvarint 12 <> "/yamux/1.0.0"
+          extension = BS.singleton 0x22 <> encodeUvarint (fromIntegral (BS.length streamMuxer)) <> streamMuxer
+      decodeNoiseCerthashes (encodeNoisePayload payload <> extension) `shouldBe` Right []
+
     it "skips an unknown high-numbered varint field between known fields" $ do
       -- Field 2047, wire type 0: tag = 2047 << 3 = 16376 (multi-byte tag).
       let key = BS.replicate 36 0x11

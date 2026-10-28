@@ -21,7 +21,7 @@ import LibP2P.Switch.ResourceManager
 import LibP2P.Switch.Types (Connection (..), Direction (..), MuxerSession (..))
 import LibP2P.Switch.Upgrade hiding (upgradeInbound, upgradeOutbound)
 import qualified LibP2P.Switch.Upgrade as Upgrade
-import LibP2P.Transport (ConnectionEndpoint (..), RawConnection (..))
+import LibP2P.Transport (ConnectionEndpoint (..), RawConnection (..), RelayCircuitLimit (..))
 import Test.Hspec
 
 -- | Generate a test identity (PeerId, KeyPair).
@@ -56,6 +56,7 @@ mkMockRawConn sio local remote = pure RawConnection
   , rcLocalAddr  = local
   , rcRemoteAddr = remote
   , rcClose      = pure ()
+  , rcRelayLimit = Nothing
   }
 
 localAddr :: Multiaddr
@@ -305,6 +306,24 @@ spec = do
       connPeerId connB `shouldBe` pidA
       connSecurity connA `shouldBe` "/noise"
       connMuxer connA `shouldBe` "/yamux/1.0.0"
+      connRelayLimit connA `shouldBe` Nothing
+      connRelayLimit connB `shouldBe` Nothing
+      muxClose (connSession connA)
+      muxClose (connSession connB)
+
+    it "retains a relay circuit budget through upgrade" $ do
+      (_pidA, kpA) <- mkTestIdentity
+      (_pidB, kpB) <- mkTestIdentity
+      (rawA, rawB) <- mkMemoryStreamPair
+      rawConnA <- mkMockRawConn rawA localAddr remoteAddr
+      rawConnB <- mkMockRawConn rawB remoteAddr localAddr
+      let budget = Just (RelayCircuitLimit (Just 120) (Just 131072))
+          withBudget raw = raw { rcRelayLimit = budget }
+      (connA, connB) <- concurrently
+        (upgradeOutbound kpA (withBudget rawConnA))
+        (upgradeInbound kpB (withBudget rawConnB))
+      connRelayLimit connA `shouldBe` budget
+      connRelayLimit connB `shouldBe` budget
       muxClose (connSession connA)
       muxClose (connSession connB)
 

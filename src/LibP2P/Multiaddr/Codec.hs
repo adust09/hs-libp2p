@@ -10,6 +10,7 @@ import Data.Bits (shiftL, shiftR, (.&.))
 import Data.ByteString (ByteString)
 import Data.Char (isDigit)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base64.URL as B64URL
 import Data.IP (IPv6, fromHostAddress6, toHostAddress6)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -38,7 +39,8 @@ encodeProtocols = BS.concat . map encodeOne
     encodeAddress (IP6 bs) = bs
     encodeAddress (TCP port) = word16BE port
     encodeAddress (UDP port) = word16BE port
-    encodeAddress (P2P mh) = encodeUvarint (fromIntegral (BS.length mh)) <> mh
+    encodeAddress (P2P mh) = encodeVarBytes mh
+    encodeAddress (Certhash mh) = encodeVarBytes mh
     encodeAddress (DNS t) = encodeVarText t
     encodeAddress (DNS4 t) = encodeVarText t
     encodeAddress (DNS6 t) = encodeVarText t
@@ -47,13 +49,17 @@ encodeProtocols = BS.concat . map encodeOne
     encodeAddress WS = BS.empty
     encodeAddress WSS = BS.empty
     encodeAddress P2PCircuit = BS.empty
+    encodeAddress WebRTCDirect = BS.empty
+    encodeAddress WebRTC = BS.empty
     encodeAddress WebTransport = BS.empty
     encodeAddress NoiseProto = BS.empty
 
     encodeVarText :: Text -> ByteString
-    encodeVarText t =
-      let bs = TE.encodeUtf8 t
-       in encodeUvarint (fromIntegral (BS.length bs)) <> bs
+    encodeVarText = encodeVarBytes . TE.encodeUtf8
+
+    encodeVarBytes :: ByteString -> ByteString
+    encodeVarBytes bytes =
+      encodeUvarint (fromIntegral (BS.length bytes)) <> bytes
 
 -- | Decode binary multiaddr format to a list of protocols.
 decodeProtocols :: ByteString -> Either String [Protocol]
@@ -107,6 +113,9 @@ decodeProtocols bs
     buildVarProtocol 421 mh = case validateMultihash mh of
       Right _ -> Just $ P2P mh
       Left _  -> Nothing
+    buildVarProtocol 466 mh = case validateMultihash mh of
+      Right _ -> Just $ Certhash mh
+      Left _  -> Nothing
     buildVarProtocol 53 bs' = DNS <$> decodeUtf8Safe bs'
     buildVarProtocol 54 bs' = DNS4 <$> decodeUtf8Safe bs'
     buildVarProtocol 55 bs' = DNS6 <$> decodeUtf8Safe bs'
@@ -118,6 +127,8 @@ decodeProtocols bs
     buildNoAddrProtocol 477 = Just WS
     buildNoAddrProtocol 478 = Just WSS
     buildNoAddrProtocol 290 = Just P2PCircuit
+    buildNoAddrProtocol 280 = Just WebRTCDirect
+    buildNoAddrProtocol 281 = Just WebRTC
     buildNoAddrProtocol 465 = Just WebTransport
     buildNoAddrProtocol 454 = Just NoiseProto
     buildNoAddrProtocol _ = Nothing
@@ -132,6 +143,7 @@ protocolsToText = T.concat . map renderOne
     renderOne p@(TCP port) = "/" <> protocolName p <> "/" <> T.pack (show port)
     renderOne p@(UDP port) = "/" <> protocolName p <> "/" <> T.pack (show port)
     renderOne p@(P2P mh) = "/" <> protocolName p <> "/" <> renderBase58 mh
+    renderOne p@(Certhash mh) = "/" <> protocolName p <> "/u" <> renderBase64URL mh
     renderOne p@(DNS t) = "/" <> protocolName p <> "/" <> t
     renderOne p@(DNS4 t) = "/" <> protocolName p <> "/" <> t
     renderOne p@(DNS6 t) = "/" <> protocolName p <> "/" <> t
@@ -153,6 +165,9 @@ protocolsToText = T.concat . map renderOne
     -- Minimal base58btc encoding for PeerId display
     renderBase58 :: ByteString -> Text
     renderBase58 = TE.decodeUtf8 . B58.encode
+
+    renderBase64URL :: ByteString -> Text
+    renderBase64URL = TE.decodeUtf8 . B64URL.encodeUnpadded
 
 -- | Parse human-readable text form to a list of protocols.
 --
@@ -191,6 +206,9 @@ textToProtocols input
         withAddr rest $ \addr remaining -> do
           mh <- parsePeerIdAddr addr
           Right (P2P mh, remaining)
+      "certhash" -> withAddr rest $ \addr remaining -> do
+        mh <- parseCerthash addr
+        Right (Certhash mh, remaining)
       "dns" -> withAddr rest $ \addr remaining ->
         Right (DNS addr, remaining)
       "dns4" -> withAddr rest $ \addr remaining ->
@@ -211,6 +229,12 @@ textToProtocols input
       "p2p-circuit" -> do
         more <- parseParts rest
         Right (P2PCircuit : more)
+      "webrtc-direct" -> do
+        more <- parseParts rest
+        Right (WebRTCDirect : more)
+      "webrtc" -> do
+        more <- parseParts rest
+        Right (WebRTC : more)
       "webtransport" -> do
         more <- parseParts rest
         Right (WebTransport : more)
@@ -276,6 +300,18 @@ textToProtocols input
     parsePeerIdAddr t = case parsePeerId t of
       Right pid -> Right (peerIdBytes pid)
       Left err -> Left $ "textToProtocols: invalid peer ID: " <> err
+
+    parseCerthash :: Text -> Either String ByteString
+    parseCerthash text = do
+      bytes <- case T.uncons text of
+        Just ('u', encoded) -> B64URL.decodeUnpadded (TE.encodeUtf8 encoded)
+        Just ('z', encoded) ->
+          maybe (Left "invalid base58btc") Right $
+            B58.decode (TE.encodeUtf8 encoded)
+        _ -> Left "unsupported multibase prefix"
+      case validateMultihash bytes of
+        Right _ -> Right bytes
+        Left err -> Left $ "textToProtocols: invalid certhash: " <> err
 
 -- | Safely decode UTF-8 bytes to Text, returning Nothing on invalid input.
 decodeUtf8Safe :: ByteString -> Maybe Text

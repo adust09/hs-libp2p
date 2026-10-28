@@ -1,11 +1,12 @@
 ---
 title: Transport-Interop Results
-last_updated: 2026-10-21
+last_updated: 2026-10-24
 tags:
   - interop
   - transport
   - testing
   - go-libp2p
+  - js-libp2p
 ---
 
 # Transport-Interop Results
@@ -14,7 +15,70 @@ This document records reproducible evidence that the `libp2p-interop` binary
 (`interop/transport/Main.hs`) passes the upstream
 [libp2p/test-plans](https://github.com/libp2p/test-plans/tree/master/transport-interop)
 **ping** contract against go-libp2p, in both dialer and listener roles, over
-**TCP + Noise/TLS + Yamux** and native **QUIC v1**.
+**TCP + Noise/TLS + Yamux**, **WebSocket + Noise + Yamux**, native
+**QUIC v1**, **WebTransport over HTTP/3**, and standard relay-signaled
+**WebRTC**.
+
+## Standard WebRTC interoperability (2026-10-24)
+
+The `/p2p-circuit/webrtc` transport passed a Ping exchange in both directions
+against `js-libp2p 3.5.1` and `@libp2p/webrtc 7.0.2`. A js-libp2p Circuit Relay
+v2 server carried SDP offer/answer signaling; the resulting SCTP data channel
+carried libp2p streams directly between the peers.
+
+```bash
+./interop/webrtc/run.sh
+```
+
+Both dialers exited 0. The js-libp2p client measured a 3 ms Ping RTT to the
+Haskell listener. The Haskell client measured a 144.525 ms setup-plus-ping time
+and a 4.171 ms Ping RTT to the js-libp2p listener. CI runs both directions.
+
+## WebTransport interoperability (2026-10-23)
+
+The `/quic-v1/webtransport` transport passed the ping contract in both
+directions against `go-libp2p v0.48.0`, including `/certhash` certificate
+verification, HTTP/3 Extended CONNECT, and Noise peer authentication.
+
+```bash
+# go-libp2p listener, hs-libp2p dialer
+docker compose -f docker-compose.cross.yml \
+  -f docker-compose.webtransport-cross.yml up --build \
+  --exit-code-from hs-dialer redis go-listener hs-dialer
+
+# hs-libp2p listener, go-libp2p dialer
+docker compose -f docker-compose.cross.yml \
+  -f docker-compose.webtransport-cross.yml up --build \
+  --exit-code-from go-dialer redis hs-listener go-dialer
+```
+
+Both dialer containers exited 0. The Haskell client measured a 12.778 ms
+handshake-plus-ping and 0.326 ms ping RTT; the Go client measured 12.840 ms and
+0.152 ms respectively. CI runs both directions.
+
+## WebSocket interoperability (2026-10-23)
+
+The `/ws` transport passed the ping contract in both directions against
+`go-libp2p v0.48.0`, with Noise and Yamux running over the WebSocket byte
+stream.
+
+```bash
+# go-libp2p listener, hs-libp2p dialer
+docker compose -f docker-compose.cross.yml \
+  -f docker-compose.websocket-cross.yml up --build \
+  --exit-code-from hs-dialer redis go-listener hs-dialer
+
+# hs-libp2p listener, go-libp2p dialer
+docker compose -f docker-compose.cross.yml \
+  -f docker-compose.websocket-cross.yml up --build \
+  --exit-code-from go-dialer redis hs-listener go-dialer
+```
+
+Both dialer containers exited 0. The Haskell client measured a 5.929 ms
+handshake-plus-ping and 0.642 ms ping RTT; the Go client measured 6.872 ms and
+0.192 ms respectively. CI runs both directions. `/wss` is covered separately
+by loopback byte-stream and full Noise/Yamux/Ping integration tests with
+explicit outer TLS server parameters.
 
 ## TLS 1.3 interoperability (2026-10-14)
 
@@ -68,8 +132,9 @@ docker compose -f docker-compose.cross.yml \
 
 Both dialer containers completed one libp2p Ping and exited 0. The QUIC source
 dependency is pinned in `cabal.project`; that revision includes client
-certificate requests and correct `RESET_STREAM` final-size handling needed for
-go-libp2p interoperability. CI runs these two commands after the TCP matrix.
+certificate requests, RFC 9221 QUIC datagrams, and correct `RESET_STREAM`
+final-size handling needed for go-libp2p interoperability. CI runs these two
+commands after the TCP matrix.
 
 ## Historical TCP results
 
