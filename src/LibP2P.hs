@@ -146,11 +146,22 @@ module LibP2P
   , findProviders
   , findPeer
 
-    -- * Discovery (Rendezvous)
+    -- * Discovery
+  , DiscoveryEvent (..)
+  , newDiscoveryQueue
+  , drainDiscoveryQueue
+
+    -- ** mDNS
+  , MDNSConfig (..)
+  , defaultMDNSConfig
+  , MDNSService (..)
+  , newMDNSService
+  , stopMDNSService
+
+    -- ** Rendezvous
   , RendezvousConfig (..)
   , defaultRendezvousConfig
   , RendezvousError (..)
-  , DiscoveryEvent (..)
   , registerRendezvousPoint
   , registeredCount
   , registerSelf
@@ -279,18 +290,29 @@ import LibP2P.Protocol.GossipSub.Types
   , PartialTopicMode (..)
   , defaultGossipSubParams
   )
+import LibP2P.Discovery.MDNS
+  ( MDNSConfig (..)
+  , MDNSService (..)
+  , defaultMDNSConfig
+  , newMDNSService
+  , stopMDNSService
+  )
 import LibP2P.Discovery.Rendezvous
   ( RendezvousConfig (..)
-  , defaultRendezvousConfig
   , RendezvousError (..)
-  , DiscoveryEvent (..)
+  , defaultRendezvousConfig
+  , discover
+  , inspectRegistration
+  , pushDiscoverEvents
   , registerRendezvousPoint
   , registeredCount
   , registerSelf
   , unregisterSelf
-  , discover
-  , inspectRegistration
-  , pushDiscoverEvents
+  )
+import LibP2P.Discovery.Types
+  ( DiscoveryEvent (..)
+  , drainDiscoveryQueue
+  , newDiscoveryQueue
   )
 import LibP2P.Protocol.Identify
   ( identifyPeer
