@@ -146,15 +146,29 @@ module LibP2P
   , findProviders
   , findPeer
 
-    -- * Discovery (mDNS)
+    -- * Discovery
+  , DiscoveryEvent (..)
+  , newDiscoveryQueue
+  , drainDiscoveryQueue
+
+    -- ** mDNS
   , MDNSConfig (..)
   , defaultMDNSConfig
   , MDNSService (..)
   , newMDNSService
   , stopMDNSService
-  , DiscoveryEvent (..)
-  , newDiscoveryQueue
-  , drainDiscoveryQueue
+
+    -- ** Rendezvous
+  , RendezvousConfig (..)
+  , defaultRendezvousConfig
+  , RendezvousError (..)
+  , registerRendezvousPoint
+  , registeredCount
+  , registerSelf
+  , unregisterSelf
+  , discover
+  , inspectRegistration
+  , pushDiscoverEvents
     -- * NAT traversal (AutoNAT, Circuit Relay v2, DCUtR)
   , NATConfig (..)
   , defaultNATConfig
@@ -282,6 +296,18 @@ import LibP2P.Discovery.MDNS
   , defaultMDNSConfig
   , newMDNSService
   , stopMDNSService
+  )
+import LibP2P.Discovery.Rendezvous
+  ( RendezvousConfig (..)
+  , RendezvousError (..)
+  , defaultRendezvousConfig
+  , discover
+  , inspectRegistration
+  , pushDiscoverEvents
+  , registerRendezvousPoint
+  , registeredCount
+  , registerSelf
+  , unregisterSelf
   )
 import LibP2P.Discovery.Types
   ( DiscoveryEvent (..)
