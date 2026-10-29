@@ -174,6 +174,16 @@ module LibP2P
   , defaultNATConfig
   , registerNATHandlers
   , registerAutoNATHandler
+  , registerAutoNATV2Handlers
+  , checkAutoNATV2
+  , AutoNATV2Config (..)
+  , defaultAutoNATV2Config
+  , AutoNATV2State
+  , AutoNATV2Request (..)
+  , AutoNATV2Result (..)
+  , NATStatus (..)
+  , autoNATV2DialProtocolId
+  , autoNATV2DialBackProtocolId
   , registerRelayHopHandler
   , registerRelayStopHandler
   , registerDCUtRHandler
@@ -245,12 +255,26 @@ import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO (..))
 import LibP2P.NAT
   ( NATConfig (..)
+  , checkAutoNATV2
   , defaultNATConfig
   , registerAutoNATHandler
+  , registerAutoNATV2Handlers
   , registerDCUtRHandler
   , registerNATHandlers
   , registerRelayHopHandler
   , registerRelayStopHandler
+  )
+import LibP2P.NAT.AutoNAT (NATStatus (..))
+import LibP2P.NAT.AutoNAT.V2
+  ( AutoNATV2Config (..)
+  , AutoNATV2Request (..)
+  , AutoNATV2Result (..)
+  , AutoNATV2State
+  , defaultAutoNATV2Config
+  )
+import LibP2P.NAT.AutoNAT.V2.Message
+  ( autoNATV2DialBackProtocolId
+  , autoNATV2DialProtocolId
   )
 import LibP2P.NAT.Relay (RelayConfig (..), RelayState, defaultRelayConfig, newRelayState)
 import LibP2P.NAT.Relay.Transport

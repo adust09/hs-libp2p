@@ -1,10 +1,12 @@
 -- | NAT traversal handler registration (specs/autonat, specs/relay, specs/relay/DCUtR).
 --
--- Wires the AutoNAT, Circuit Relay v2, and DCUtR module implementations
+-- Wires the AutoNAT v1/v2, Circuit Relay v2, and DCUtR module implementations
 -- into the Switch protocol registry, in the style of
 -- 'LibP2P.Protocol.Identify.registerIdentifyHandlers':
 --
---   /libp2p/autonat/1.0.0            — AutoNAT dial-back server
+--   /libp2p/autonat/1.0.0            — AutoNAT v1 dial-back server
+--   /libp2p/autonat/2/dial-request   — AutoNAT v2 address probe
+--   /libp2p/autonat/2/dial-back      — AutoNAT v2 nonce verification
 --   /libp2p/circuit/relay/0.2.0/hop  — Circuit Relay v2 relay server
 --   /libp2p/circuit/relay/0.2.0/stop — Circuit Relay v2 target (inbound relayed streams)
 --   /libp2p/dcutr                    — DCUtR hole-punch coordination (handler side)
@@ -15,6 +17,8 @@ module LibP2P.NAT
     -- * Registration
   , registerNATHandlers
   , registerAutoNATHandler
+  , registerAutoNATV2Handlers
+  , checkAutoNATV2
   , registerRelayHopHandler
   , registerRelayStopHandler
   , registerDCUtRHandler
@@ -34,13 +38,23 @@ module LibP2P.NAT
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async)
-import Control.Concurrent.STM (atomically, modifyTVar', readTVar)
-import Control.Monad (filterM, unless, void)
+import Control.Concurrent.STM (atomically, modifyTVar', readTVar, writeTVar)
+import Control.Monad (filterM, unless, void, when)
 import Data.List (nub)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
+import Data.Word (Word64)
 import System.Timeout (timeout)
 import qualified Data.Map.Strict as Map
-import Control.Exception (SomeException, catch, try)
+import Control.Exception
+  ( SomeAsyncException
+  , SomeException
+  , catch
+  , finally
+  , fromException
+  , onException
+  , throwIO
+  , try
+  )
 import LibP2P.Crypto.PeerId (PeerId, peerIdBytes)
 import LibP2P.Multiaddr (Multiaddr (..), encapsulate, fromBytes, isPublicAddr, isRelayedAddr)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
@@ -51,6 +65,26 @@ import LibP2P.MultistreamSelect.Negotiation
   )
 import LibP2P.NAT.AutoNAT (AutoNATConfig (..), handleAutoNAT)
 import LibP2P.NAT.AutoNAT.Message (autoNATProtocolId)
+import LibP2P.NAT.AutoNAT.V2
+  ( AutoNATV2Config
+  , AutoNATV2Request
+  , AutoNATV2Result
+  , AutoNATV2ServerOps (..)
+  , AutoNATV2State
+  , defaultAutoNATV2Config
+  , handleAutoNATV2DialBack
+  , handleAutoNATV2DialRequest
+  , newAutoNATV2State
+  , requestAutoNATV2
+  )
+import LibP2P.NAT.AutoNAT.V2.Message
+  ( DialBackV2 (..)
+  , DialStatusV2 (..)
+  , autoNATV2DialBackProtocolId
+  , autoNATV2DialProtocolId
+  , readDialBackResponseV2
+  , writeDialBackV2
+  )
 import LibP2P.NAT.DCUtR (DCUtRConfig (..), DCUtRResult (..), handleDCUtR, initiateDCUtR)
 import LibP2P.NAT.DCUtR.Message (dcutrProtocolId)
 import LibP2P.NAT.Relay
@@ -89,6 +123,7 @@ import LibP2P.Switch.ConnPool (lookupAllConns, lookupConn)
 import LibP2P.Switch.Connection (closeConnection, newStream, newStreamAllowingLimited)
 import LibP2P.Switch.Dial (DialOpts (..), dialWith)
 import LibP2P.Switch.Listen (switchListenAddrs)
+import LibP2P.Switch.ResourceManager (releaseConnection)
 import LibP2P.Protocol.Identify (identifyPeer)
 import LibP2P.Protocol.Identify.Message (IdentifyInfo (..))
 import LibP2P.Switch.Types
@@ -99,7 +134,7 @@ import LibP2P.Switch.Types
   , Switch (..)
   )
 import LibP2P.Switch.Upgrade (upgradeWithSwitchConfig)
-import LibP2P.Transport (Transport (..))
+import LibP2P.Transport (RawConnection (..), Transport (..))
 
 -- | Configuration for the NAT traversal handlers.
 data NATConfig = NATConfig
@@ -109,6 +144,8 @@ data NATConfig = NATConfig
     -- ^ Tuning for the circuit client's reservation refresh loop
   , ncDCUtRUpgrade      :: DCUtRUpgradeConfig
     -- ^ Tuning for the DCUtR direct-connection upgrade
+  , ncAutoNATV2Config   :: AutoNATV2Config
+    -- ^ AutoNAT v2 amplification protection and request limits
   }
 
 -- | Tuning for the DCUtR upgrade that runs on an inbound relayed
@@ -152,27 +189,31 @@ defaultNATConfig = NATConfig
   { ncRelayConfig        = defaultRelayConfig
   , ncReservationRefresh = defaultReservationRefreshConfig
   , ncDCUtRUpgrade       = defaultDCUtRUpgradeConfig
+  , ncAutoNATV2Config    = defaultAutoNATV2Config
   }
 
 -- | Register the NAT protocol handlers and the circuit client transport
 -- on the Switch.
 --
--- Returns the relay server state (so callers can inspect
--- reservations/circuits) and the circuit client state, which ties
--- 'transportListen' on a @p2p-circuit@ address to the inbound @stop@
--- streams that arrive over the connection to that relay.
-registerNATHandlers :: Switch -> NATConfig -> IO (RelayState, CircuitState)
+-- Returns the relay server state, circuit client state, and AutoNAT v2
+-- state. The latter must be passed to 'checkAutoNATV2' so an inbound
+-- dial-back nonce can be correlated with its request.
+registerNATHandlers
+  :: Switch
+  -> NATConfig
+  -> IO (RelayState, CircuitState, AutoNATV2State)
 registerNATHandlers sw config = do
   relayState <- newRelayState (ncRelayConfig config)
   circuitState <- newCircuitState
   addTransport sw (circuitTransport sw circuitState (ncReservationRefresh config))
   registerAutoNATHandler sw
+  autoNATV2State <- registerAutoNATV2Handlers sw (ncAutoNATV2Config config)
   registerRelayHopHandler sw relayState
   registerRelayStopHandler sw circuitState
   registerDCUtRHandler sw (ncDCUtRUpgrade config)
   registerDCUtRUpgrade sw (ncDCUtRUpgrade config)
   registerReservationCleanup sw relayState
-  pure (relayState, circuitState)
+  pure (relayState, circuitState, autoNATV2State)
 
 -- | Drop a peer's relay reservation once its last connection to us goes
 -- away (specs/relay/circuit-v2): "the reservation remains valid until
@@ -416,6 +457,98 @@ registerAutoNATHandler sw =
           }
     in handleAutoNAT config stream (connPeerId conn) (connRemoteAddr conn)
 
+-- | Register both AutoNAT v2 protocol handlers and return the state used to
+-- correlate request nonces with fresh dial-back connections.
+registerAutoNATV2Handlers :: Switch -> AutoNATV2Config -> IO AutoNATV2State
+registerAutoNATV2Handlers sw config = do
+  state <- newAutoNATV2State config
+  let serverOps = AutoNATV2ServerOps
+        { an2CanDial = \_peer addr -> isJust <$> selectTransport sw addr
+        , an2DialBack = freshDialBackV2 sw
+        }
+  setStreamHandler sw autoNATV2DialProtocolId $ \conn stream -> do
+    _ <- timeout autoNATV2StreamTimeoutMicros $
+      handleAutoNATV2DialRequest
+        state serverOps stream (connPeerId conn) (connRemoteAddr conn)
+    pure ()
+  setStreamHandler sw autoNATV2DialBackProtocolId $ \conn stream -> do
+    _ <- timeout autoNATV2StreamTimeoutMicros $
+      handleAutoNATV2DialBack state stream (connLocalAddr conn)
+    pure ()
+  pure state
+
+-- | Run an AutoNAT v2 request over an existing connection.
+checkAutoNATV2
+  :: Switch
+  -> AutoNATV2State
+  -> Connection
+  -> [AutoNATV2Request]
+  -> IO (Either String AutoNATV2Result)
+checkAutoNATV2 sw state conn requests = do
+  checked <- timeout autoNATV2StreamTimeoutMicros $ do
+    streamResult <- newStream sw conn
+    case streamResult of
+      Left _ -> pure (Left "unable to open an AutoNAT v2 stream")
+      Right stream -> do
+        negotiated <- negotiateInitiator stream [autoNATV2DialProtocolId]
+        case negotiated of
+          Accepted _ -> requestAutoNATV2 state stream requests
+          NoProtocol -> do
+            closeQuietly stream
+            pure (Left "peer does not support AutoNAT v2")
+  pure $ fromMaybe (Left "AutoNAT v2 request timed out") checked
+
+-- | Dial back on a fresh connection and exchange the nonce protocol.
+freshDialBackV2 :: Switch -> PeerId -> Multiaddr -> Word64 -> IO DialStatusV2
+freshDialBackV2 sw peer addr nonce = do
+  connection <- openFreshDialBack sw peer addr
+  case connection of
+    Left _ -> pure DialStatusError
+    Right conn ->
+      exchange conn `finally` closeProbeConnection sw conn
+  where
+    exchange conn = do
+      let exchangeNonce stream = do
+            negotiated <- negotiateInitiator stream [autoNATV2DialBackProtocolId]
+            case negotiated of
+              NoProtocol -> ioError (userError "protocol unavailable")
+              Accepted _ -> do
+                writeDialBackV2 stream (DialBackV2 nonce)
+                response <- readDialBackResponseV2 stream
+                either (const (ioError (userError "invalid dial-back response"))) pure response
+      attempted <- trySync $ do
+        streamResult <- newStream sw conn
+        stream <- either (const (ioError (userError "stream unavailable"))) pure streamResult
+        exchangeNonce stream `finally` closeQuietly stream
+      pure $ case attempted of
+        Left (_ :: SomeException) -> DialStatusBackError
+        Right () -> DialStatusOK
+
+openFreshDialBack
+  :: Switch -> PeerId -> Multiaddr -> IO (Either String Connection)
+openFreshDialBack sw peer addr = do
+  transport <- selectTransport sw addr
+  case transport of
+    Nothing -> pure (Left "no transport for AutoNAT v2 dial-back")
+    Just selected -> do
+      upgraded <- trySync $ do
+        raw <- transportDial selected addr
+        upgradeWithSwitchConfig
+          (swConfig sw) (swResourceMgr sw) Outbound (swIdentityKey sw) raw
+          `onException` rcClose raw
+      case upgraded of
+        Left (_ :: SomeException) -> pure (Left "AutoNAT v2 dial-back failed")
+        Right conn
+          | connPeerId conn == peer -> pure (Right conn)
+          | otherwise -> do
+              closeProbeConnection sw conn
+              pure (Left "AutoNAT v2 peer identity mismatch")
+
+-- | Bound each AutoNAT v2 stream, matching go-libp2p's 15 second service
+-- timeout.
+autoNATV2StreamTimeoutMicros :: Int
+autoNATV2StreamTimeoutMicros = 15000000
+
 -- | Dial back a peer on a fresh connection, verify its identity, and close.
 -- Returns the address that actually succeeded, not the first candidate.
 freshDialBack :: Switch -> PeerId -> [Multiaddr] -> IO (Either String Multiaddr)
@@ -439,12 +572,35 @@ probeAddr sw pid addr = do
     Nothing -> pure (Left ("dial-back: no transport for " ++ show addr))
     Just transport -> do
       rawConn <- transportDial transport addr
-      conn <- upgradeWithSwitchConfig (swConfig sw) (swResourceMgr sw) Outbound (swIdentityKey sw) rawConn
+      conn <- upgradeWithSwitchConfig
+        (swConfig sw) (swResourceMgr sw) Outbound (swIdentityKey sw) rawConn
+        `onException` rcClose rawConn
       let matches = connPeerId conn == pid
-      muxClose (connSession conn) `catch` \(_ :: SomeException) -> pure ()
+      closeProbeConnection sw conn
       pure $ if matches
         then Right ()
         else Left "dial-back: peer identity mismatch"
+
+-- | Close an unpooled probe connection without publishing normal Switch
+-- lifecycle events or running disconnect notifiers.
+closeProbeConnection :: Switch -> Connection -> IO ()
+closeProbeConnection sw conn = do
+  shouldClose <- atomically $ do
+    state <- readTVar (connState conn)
+    if state == ConnClosed
+      then pure False
+      else do
+        writeTVar (connState conn) ConnClosed
+        releaseConnection (swResourceMgr sw) (connResourceScope conn)
+        pure True
+  when shouldClose $
+    muxClose (connSession conn) `catch` \(_ :: SomeException) -> pure ()
+
+trySync :: IO a -> IO (Either SomeException a)
+trySync action = (Right <$> action) `catch` \exception ->
+  case fromException exception :: Maybe SomeAsyncException of
+    Just _ -> throwIO exception
+    Nothing -> pure (Left exception)
 
 -- | Register the Circuit Relay v2 hop handler
 -- (/libp2p/circuit/relay/0.2.0/hop): serve RESERVE and CONNECT requests.
