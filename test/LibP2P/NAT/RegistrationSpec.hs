@@ -20,10 +20,11 @@ import LibP2P.MultistreamSelect.Negotiation
   )
 import LibP2P.NAT
   ( NATConfig (..)
+  , autoNATClientStatus
   , defaultNATConfig
   , registerNATHandlers
   )
-import LibP2P.NAT.AutoNAT (requestAutoNAT)
+import LibP2P.NAT.AutoNAT (NATStatus (..), requestAutoNAT)
 import LibP2P.NAT.AutoNAT.Message
   ( ResponseStatus (..)
   , anRespStatus
@@ -122,12 +123,14 @@ spec = do
     it "registers AutoNAT, relay hop/stop and DCUtR protocol handlers" $ do
       (pid, kp) <- mkTestIdentity
       sw <- newSwitch pid kp
-      _state <- registerNATHandlers sw defaultNATConfig
+      (_, _, autoNATService) <- registerNATHandlers sw defaultNATConfig
       mapM_
         (\proto -> do
           mHandler <- lookupStreamHandler sw proto
           (proto, isJust mHandler) `shouldBe` (proto, True))
         [autoNATProtocolId, hopProtocolId, stopProtocolId, dcutrProtocolId]
+      autoNATClientStatus autoNATService `shouldReturn` NATUnknown
+      switchClose sw
 
     it "registered NAT protocols appear in the local identify protocol list" $ do
       (pid, kp) <- mkTestIdentity
@@ -136,6 +139,7 @@ spec = do
       info <- buildLocalIdentify sw Nothing
       mapM_ (\proto -> idProtocols info `shouldContain` [proto])
         [autoNATProtocolId, hopProtocolId, stopProtocolId, dcutrProtocolId]
+      switchClose sw
 
   describe "inbound stream dispatch" $ do
     it "dispatches /libp2p/autonat/1.0.0 to the AutoNAT handler (dial-back OK)" $ do

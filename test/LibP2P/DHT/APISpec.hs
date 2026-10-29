@@ -239,6 +239,7 @@ mkMockSwitch pid = do
   notifiers <- newTVarIO []
   disconnectNotifiers <- newTVarIO []
   listeners <- newTVarIO []
+  shutdownActions <- newTVarIO []
   kp <- getDummyKeyPair
   pure Switch
     { swLocalPeerId  = pid
@@ -257,6 +258,7 @@ mkMockSwitch pid = do
     , swNotifiers    = notifiers
     , swDisconnectNotifiers = disconnectNotifiers
     , swListeners    = listeners
+    , swShutdownActions = shutdownActions
     , swConfig       = defaultSwitchConfig
     }
 
