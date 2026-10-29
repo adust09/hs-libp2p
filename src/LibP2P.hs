@@ -135,7 +135,10 @@ module LibP2P
   , BucketEntry
   , entryPeerId
   , entryAddrs
+  , DHTMaintenanceConfig (..)
+  , defaultDHTMaintenanceConfig
   , newDHTNode
+  , newDHTNodeWithConfig
   , stopDHTNode
   , registerDHTHandler
   , bootstrap
@@ -218,12 +221,15 @@ import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes, toBase58, parsePeerId, toCIDv1)
 import LibP2P.DHT
-  ( DHTMode (..)
+  ( DHTMaintenanceConfig (..)
+  , DHTMode (..)
   , DHTNode
   , ProviderEntry
   , Validator (..)
+  , defaultDHTMaintenanceConfig
   , defaultValidator
   , newDHTNode
+  , newDHTNodeWithConfig
   , peAddrs
   , peProvider
   , registerDHTHandler

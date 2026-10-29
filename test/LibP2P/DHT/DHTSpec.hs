@@ -21,6 +21,7 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import Data.Time (addUTCTime, getCurrentTime)
+import Data.Time.Format.ISO8601 (iso8601Show)
 import Data.Word (Word8)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair (..), PublicKey (..), PrivateKey (..), KeyType (..))
@@ -62,6 +63,9 @@ mkPeerId = PeerId
 -- | The local peer used for testing.
 localPid :: PeerId
 localPid = mkPeerId (BS.pack [0])
+
+recordPayload :: DHTRecord -> (BS.ByteString, BS.ByteString)
+recordPayload record = (recKey record, recValue record)
 
 -- | Remote peer for handler tests.
 remotePid :: PeerId
@@ -365,8 +369,29 @@ spec = do
 
       result <- readFramedMessage clientStream maxDHTMessageSize
       case result of
-        Right resp -> msgRecord resp `shouldBe` Just rec
+        Right resp -> fmap recordPayload (msgRecord resp)
+          `shouldBe` Just (key, recValue rec)
         Left err -> expectationFailure $ "Failed: " ++ err
+
+    it "GET_VALUE omits and deletes an expired stored record" $ do
+      node <- mkTestNode localPid
+      now <- getCurrentTime
+      let key = BS.pack [0xBA, 0xAD]
+          received = T.pack (iso8601Show (addUTCTime (-(49 * 3600)) now))
+          record = DHTRecord key (BS.pack [0xF0, 0x0D]) received
+      atomically $ modifyTVar' (dhtRecordStore node) (Map.insert key record)
+
+      (clientStream, serverStream) <- mkStreamPair
+      writeFramedMessage clientStream
+        (emptyDHTMessage { msgType = GetValue, msgKey = key })
+      streamClose clientStream
+      handleDHTRequest node serverStream remotePid testAddr
+
+      result <- readFramedMessage clientStream maxDHTMessageSize
+      case result of
+        Right response -> msgRecord response `shouldBe` Nothing
+        Left err -> expectationFailure $ "Failed: " ++ err
+      lookupRecord node key `shouldReturn` Nothing
 
     it "GET_VALUE without record returns closerPeers only" $ do
       node <- mkTestNode localPid
@@ -516,7 +541,8 @@ spec = do
         (emptyDHTMessage { msgType = GetValue, msgKey = key })
       r2 <- timeout 2000000 (readFramedMessage clientStream maxDHTMessageSize)
       case r2 of
-        Just (Right resp) -> msgRecord resp `shouldBe` Just rec
+        Just (Right resp) -> fmap recordPayload (msgRecord resp)
+          `shouldBe` Just (key, recValue rec)
         _ -> expectationFailure
                "handler did not serve a second request on the same stream"
 
@@ -619,7 +645,8 @@ spec = do
       let req2 = emptyDHTMessage { msgType = GetValue, msgKey = key }
       r2 <- timeout 2000000 (dhtSendRequest clientNode remotePid req2)
       case r2 of
-        Just (Right resp) -> msgRecord resp `shouldBe` Just rec
+        Just (Right resp) -> fmap recordPayload (msgRecord resp)
+          `shouldBe` Just (key, recValue rec)
         Just (Left err) -> expectationFailure $ "second send failed: " ++ err
         Nothing -> expectationFailure "second send timed out"
 
@@ -768,7 +795,8 @@ spec = do
           rec = DHTRecord key (BS.pack [4, 5, 6]) "2024-01-01T00:00:00Z"
       storeRecord node rec
       result <- lookupRecord node key
-      result `shouldBe` Just rec
+      fmap recordPayload result `shouldBe` Just (key, recValue rec)
+      fmap (T.null . recTimeReceived) result `shouldBe` Just False
 
     it "lookupRecord for missing key returns Nothing" $ do
       node <- mkTestNode localPid
