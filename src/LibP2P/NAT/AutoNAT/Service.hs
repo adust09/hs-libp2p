@@ -26,11 +26,14 @@ import Control.Concurrent.STM (
 import Control.Exception (
   SomeAsyncException,
   SomeException,
+  bracket,
   fromException,
   tryJust,
  )
 import Control.Monad (filterM, forever)
+import Data.List (sortOn)
 import Data.Map.Strict qualified as Map
+import Data.Set qualified as Set
 import Data.Time.Clock (UTCTime, diffUTCTime, getCurrentTime)
 import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Multiaddr (Multiaddr, isRelayedAddr)
@@ -161,12 +164,14 @@ runProbeCycle sw config recentVar = do
   now <- getCurrentTime
   connections <- connectedProbeCandidates sw
   recent <- atomically $ readTVar recentVar
-  let eligible =
+  let oldestFirst = sortOn (\conn -> Map.lookup (connPeerId conn) recent) connections
+      eligible =
         take
           (ancMaxPeers config)
-          (filter (not . throttled config now recent . connPeerId) connections)
+          (filter (not . throttled config now recent . connPeerId) oldestFirst)
       updated = foldr (\conn -> Map.insert (connPeerId conn) now) recent eligible
-  atomically $ writeTVar recentVar (pruneRecent config now updated)
+      connectedPeers = Set.fromList (map connPeerId connections)
+  atomically $ writeTVar recentVar (Map.restrictKeys updated connectedPeers)
   addrs <- switchListenAddrs sw
   results <- mapM (probePeer sw config addrs) eligible
   pure (probeNATStatusPure (ancThreshold config) results)
@@ -192,11 +197,11 @@ probePeer sw config addrs conn = do
     opened <- newStream sw conn
     case opened of
       Left err -> pure (Left (show err))
-      Right stream -> do
-        negotiated <- negotiateInitiator stream [autoNATProtocolId]
+      Right stream -> bracket (pure stream) closeQuietly $ \openedStream -> do
+        negotiated <- negotiateInitiator openedStream [autoNATProtocolId]
         case negotiated of
-          NoProtocol -> closeQuietly stream >> pure (Left "peer does not support AutoNAT v1")
-          Accepted _ -> requestAutoNAT stream (swLocalPeerId sw) addrs
+          NoProtocol -> pure (Left "peer does not support AutoNAT v1")
+          Accepted _ -> requestAutoNAT openedStream (swLocalPeerId sw) addrs
   pure $ case outcome of
     Left (err :: SomeException) -> Left (show err)
     Right Nothing -> Left "AutoNAT request timed out"
@@ -212,14 +217,6 @@ throttled config now recent peerId =
   case Map.lookup peerId recent of
     Nothing -> False
     Just probedAt -> elapsedMicros now probedAt < ancPeerThrottleMicros config
-
-pruneRecent ::
-  AutoNATClientConfig ->
-  UTCTime ->
-  Map.Map PeerId UTCTime ->
-  Map.Map PeerId UTCTime
-pruneRecent config now = Map.filter $ \probedAt ->
-  elapsedMicros now probedAt < ancPeerThrottleMicros config
 
 synchronousException :: SomeException -> Maybe SomeException
 synchronousException err = case fromException err :: Maybe SomeAsyncException of

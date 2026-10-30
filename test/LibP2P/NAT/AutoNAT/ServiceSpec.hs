@@ -120,6 +120,23 @@ withProbeNetwork statuses action = do
       Right _ -> pure server
   action client probes `finally` mapM_ switchClose (client : servers)
 
+withIndividuallyCountedProbeNetwork ::
+  Int ->
+  (Switch -> [TVar Int] -> IO a) ->
+  IO a
+withIndividuallyCountedProbeNetwork serverCount action = do
+  (client, _, _) <- newTCPNode
+  serversAndProbes <- forM [1 .. serverCount] $ \_ -> do
+    probes <- newTVarIO 0
+    (server, peerId, addr) <- newTCPNode
+    registerResponseHandler server probes EDialRefused
+    result <- dial client peerId [addr]
+    case result of
+      Left err -> fail ("dial failed: " ++ show err)
+      Right _ -> pure (server, probes)
+  let (servers, probes) = unzip serversAndProbes
+  action client probes `finally` mapM_ switchClose (client : servers)
+
 waitForProbeCount :: TVar Int -> Int -> IO ()
 waitForProbeCount probes expected = do
   result <- timeout 5000000 $ atomically $ do
@@ -178,6 +195,19 @@ spec = describe "AutoNAT client service" $ do
       waitForProbeCount probes 1
       threadDelay 100000
       atomically (readTVar probes) `shouldReturn` 1
+
+  it "rotates probes across all eligible peers" $
+    withIndividuallyCountedProbeNetwork 3 $ \client probes -> do
+      let config =
+            (fastConfig 1)
+              { ancThreshold = 0
+              , ancMaxPeers = 1
+              }
+      _ <- startAutoNATClient client config
+      result <- timeout 5000000 $ atomically $ do
+        counts <- mapM readTVar probes
+        check (all (> 0) counts)
+      result `shouldBe` Just ()
 
   it "stays unknown without connected peers and does not dial" $ do
     (client, _, _) <- newTCPNode
