@@ -1,6 +1,20 @@
+# Pin APT to the snapshot used to create the base image. The image digest alone
+# does not prevent Debian sid packages from changing between rebuilds.
+FROM debian:sid-slim@sha256:5ac67a4d7c0de96e83873e4dd8f7ea3b507ba292fb2cce60a0c3f73322df5cae AS pinned-debian
+
+RUN printf '%s\n' \
+       'Types: deb' \
+       'URIs: http://snapshot.debian.org/archive/debian/20261027T000000Z' \
+       'Suites: sid' \
+       'Components: main' \
+       'Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp' \
+       > /etc/apt/sources.list.d/debian.sources \
+    && printf 'Acquire::Check-Valid-Until "false";\n' \
+       > /etc/apt/apt.conf.d/99snapshot
+
 # Build in one layer so package caches and object files never enter an image
 # layer. This keeps unified-testing's Docker disk usage below hosted-runner limits.
-FROM debian:sid-slim@sha256:5ac67a4d7c0de96e83873e4dd8f7ea3b507ba292fb2cce60a0c3f73322df5cae AS builder
+FROM pinned-debian AS builder
 
 WORKDIR /app
 COPY hs-libp2p.cabal cabal.project Setup.hs LICENSE ./
@@ -52,7 +66,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
        zlib1g-dev \
     && rm -rf /tmp/dist-newstyle /tmp/quic /root/.cache/cabal /var/lib/apt/lists/*
 
-FROM debian:sid-slim@sha256:5ac67a4d7c0de96e83873e4dd8f7ea3b507ba292fb2cce60a0c3f73322df5cae
+FROM pinned-debian
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
