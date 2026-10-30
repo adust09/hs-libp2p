@@ -117,6 +117,7 @@ library
     LibP2P.DHT.API
     LibP2P.NAT.AutoNAT.Message
     LibP2P.NAT.AutoNAT
+    LibP2P.NAT.AutoNAT.Service
     LibP2P.Crypto.SignedEnvelope
     LibP2P.Crypto.PeerRecord
     LibP2P.Discovery.Types
@@ -310,6 +311,7 @@ test-suite hs-libp2p-test
     LibP2P.DHT.ValidatorSpec
     LibP2P.NAT.AutoNAT.MessageSpec
     LibP2P.NAT.AutoNAT.AutoNATSpec
+    LibP2P.NAT.AutoNAT.ServiceSpec
     LibP2P.Crypto.SignedEnvelopeSpec
     LibP2P.Crypto.PeerRecordSpec
     LibP2P.Discovery.RendezvousSpec

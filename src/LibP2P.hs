@@ -16,7 +16,7 @@
 --   addTransport sw tcp
 --   registerIdentifyHandlers sw
 --   registerPingHandler sw
---   (_relayState, _circuitState) <- registerNATHandlers sw defaultNATConfig
+--   (_relayState, _circuitState, autoNAT) <- registerNATHandlers sw defaultNATConfig
 --   addrs <- switchListen sw defaultConnectionGater [fromText "/ip4/127.0.0.1/tcp/0"]
 --   print addrs
 --   -- ... dial other peers, etc.
@@ -172,6 +172,13 @@ module LibP2P
     -- * NAT traversal (AutoNAT, Circuit Relay v2, DCUtR)
   , NATConfig (..)
   , defaultNATConfig
+  , NATStatus (..)
+  , AutoNATClientConfig (..)
+  , defaultAutoNATClientConfig
+  , AutoNATClientService
+  , startAutoNATClient
+  , autoNATClientStatus
+  , stopAutoNATClient
   , registerNATHandlers
   , registerAutoNATHandler
   , registerRelayHopHandler
@@ -244,14 +251,21 @@ import LibP2P.Multiaddr (Multiaddr (..), fromText, splitP2P, toText)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO (..))
 import LibP2P.NAT
-  ( NATConfig (..)
+  ( AutoNATClientConfig (..)
+  , AutoNATClientService
+  , NATConfig (..)
+  , autoNATClientStatus
+  , defaultAutoNATClientConfig
   , defaultNATConfig
   , registerAutoNATHandler
   , registerDCUtRHandler
   , registerNATHandlers
   , registerRelayHopHandler
   , registerRelayStopHandler
+  , startAutoNATClient
+  , stopAutoNATClient
   )
+import LibP2P.NAT.AutoNAT (NATStatus (..))
 import LibP2P.NAT.Relay (RelayConfig (..), RelayState, defaultRelayConfig, newRelayState)
 import LibP2P.NAT.Relay.Transport
   ( CircuitState

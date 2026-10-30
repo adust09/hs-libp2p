@@ -12,8 +12,14 @@ module LibP2P.NAT
   ( -- * Configuration
     NATConfig (..)
   , defaultNATConfig
+  , AutoNATClientConfig (..)
+  , defaultAutoNATClientConfig
+  , AutoNATClientService
+  , autoNATClientStatus
+  , stopAutoNATClient
     -- * Registration
   , registerNATHandlers
+  , startAutoNATClient
   , registerAutoNATHandler
   , registerRelayHopHandler
   , registerRelayStopHandler
@@ -51,6 +57,14 @@ import LibP2P.MultistreamSelect.Negotiation
   )
 import LibP2P.NAT.AutoNAT (AutoNATConfig (..), handleAutoNAT)
 import LibP2P.NAT.AutoNAT.Message (autoNATProtocolId)
+import LibP2P.NAT.AutoNAT.Service
+  ( AutoNATClientConfig (..)
+  , AutoNATClientService
+  , autoNATClientStatus
+  , defaultAutoNATClientConfig
+  , startAutoNATClient
+  , stopAutoNATClient
+  )
 import LibP2P.NAT.DCUtR (DCUtRConfig (..), DCUtRResult (..), handleDCUtR, initiateDCUtR)
 import LibP2P.NAT.DCUtR.Message (dcutrProtocolId)
 import LibP2P.NAT.Relay
@@ -109,6 +123,8 @@ data NATConfig = NATConfig
     -- ^ Tuning for the circuit client's reservation refresh loop
   , ncDCUtRUpgrade      :: DCUtRUpgradeConfig
     -- ^ Tuning for the DCUtR direct-connection upgrade
+  , ncAutoNATClient     :: AutoNATClientConfig
+    -- ^ Scheduling and bounds for background reachability probes
   }
 
 -- | Tuning for the DCUtR upgrade that runs on an inbound relayed
@@ -152,16 +168,20 @@ defaultNATConfig = NATConfig
   { ncRelayConfig        = defaultRelayConfig
   , ncReservationRefresh = defaultReservationRefreshConfig
   , ncDCUtRUpgrade       = defaultDCUtRUpgradeConfig
+  , ncAutoNATClient      = defaultAutoNATClientConfig
   }
 
 -- | Register the NAT protocol handlers and the circuit client transport
 -- on the Switch.
 --
 -- Returns the relay server state (so callers can inspect
--- reservations/circuits) and the circuit client state, which ties
--- 'transportListen' on a @p2p-circuit@ address to the inbound @stop@
--- streams that arrive over the connection to that relay.
-registerNATHandlers :: Switch -> NATConfig -> IO (RelayState, CircuitState)
+-- reservations/circuits), the circuit client state, and the AutoNAT client
+-- service handle used to observe reachability. The background client is also
+-- stopped automatically by 'LibP2P.Switch.switchClose'.
+registerNATHandlers
+  :: Switch
+  -> NATConfig
+  -> IO (RelayState, CircuitState, AutoNATClientService)
 registerNATHandlers sw config = do
   relayState <- newRelayState (ncRelayConfig config)
   circuitState <- newCircuitState
@@ -172,7 +192,8 @@ registerNATHandlers sw config = do
   registerDCUtRHandler sw (ncDCUtRUpgrade config)
   registerDCUtRUpgrade sw (ncDCUtRUpgrade config)
   registerReservationCleanup sw relayState
-  pure (relayState, circuitState)
+  autoNATService <- startAutoNATClient sw (ncAutoNATClient config)
+  pure (relayState, circuitState, autoNATService)
 
 -- | Drop a peer's relay reservation once its last connection to us goes
 -- away (specs/relay/circuit-v2): "the reservation remains valid until
