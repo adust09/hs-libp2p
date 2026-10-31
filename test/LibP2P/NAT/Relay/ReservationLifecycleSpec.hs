@@ -27,9 +27,7 @@ import LibP2P.MultistreamSelect.Negotiation
   )
 import LibP2P.NAT
   ( NATConfig (..)
-  , defaultDCUtRUpgradeConfig
   , defaultNATConfig
-  , defaultReservationRefreshConfig
   , registerNATHandlers
   )
 import LibP2P.NAT.Relay
@@ -77,7 +75,7 @@ newRelaySwitch config = do
   (pid, kp) <- mkTestIdentity
   sw <- newSwitch pid kp
   addTransport sw =<< newTCPTransport
-  (relayState, _circuitState, _autoNATService) <- registerNATHandlers sw config
+  (relayState, _circuitState, _natServices) <- registerNATHandlers sw config
   addrs <- switchListen sw defaultConnectionGater [loopbackAddr]
   case addrs of
     (a : _) -> pure (sw, pid, a, relayState)
@@ -141,8 +139,6 @@ spec = describe "relay reservation lifecycle" $ do
   it "frees the reservation slot for another peer without waiting for expiry" $ do
     let config = defaultNATConfig
           { ncRelayConfig = defaultRelayConfig { rcMaxReservations = 1 }
-          , ncReservationRefresh = defaultReservationRefreshConfig
-          , ncDCUtRUpgrade = defaultDCUtRUpgradeConfig
           }
     (swR, pidR, addrR, relayState) <- newRelaySwitch config
     (swC1, pidC1, _) <- newListeningSwitch
