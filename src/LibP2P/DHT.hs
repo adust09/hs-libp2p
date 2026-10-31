@@ -19,6 +19,9 @@ module LibP2P.DHT
   , pkValidator
     -- * Construction
   , newDHTNode
+  , newDHTNodeWithConfig
+  , DHTMaintenanceConfig (..)
+  , defaultDHTMaintenanceConfig
   , newPeerSession
   , stopDHTNode
   , defaultQueryTimeoutMicros
@@ -57,6 +60,16 @@ import Data.Time (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
 import Data.Time.Format.ISO8601 (iso8601Show)
 import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import LibP2P.DHT.Distance (keyToDHTKey, peerIdToKey)
+import LibP2P.DHT.Maintenance
+  ( DHTMaintenanceConfig (..)
+  , DHTMaintenanceState
+  , defaultDHTMaintenanceConfig
+  , lookupLiveRecord
+  , newDHTMaintenanceState
+  , startValueGCWorker
+  , stopDHTMaintenance
+  , storeReceivedRecord
+  )
 import LibP2P.DHT.Message
 import LibP2P.DHT.RoutingTable
   ( RoutingTable
@@ -157,6 +170,8 @@ data DHTNode = DHTNode
     -- Default 'defaultQueryTimeoutMicros' (10s, specs/kad-dht QueryTimeout).
   , dhtBootstrapWorker :: !(TVar (Maybe (Async ())))
     -- ^ Periodic bootstrap loop; cancelled by 'stopDHTNode'.
+  , dhtMaintenance :: !DHTMaintenanceState
+    -- ^ Provider republishing and value-record GC workers/configuration.
   }
 
 -- | Default query/bootstrap timeout: 10 seconds (specs/kad-dht).
@@ -173,7 +188,11 @@ newPeerSession slot =
 -- Registers a disconnect notifier so a cached session is dropped when
 -- the peer's last connection closes (#279).
 newDHTNode :: Switch -> DHTMode -> IO DHTNode
-newDHTNode sw mode = do
+newDHTNode = newDHTNodeWithConfig defaultDHTMaintenanceConfig
+
+-- | Create a DHT node with explicit maintenance scheduling and expiry limits.
+newDHTNodeWithConfig :: DHTMaintenanceConfig -> Switch -> DHTMode -> IO DHTNode
+newDHTNodeWithConfig maintenanceConfig sw mode = do
   let localPid = swLocalPeerId sw
   rt <- newTVarIO (newRoutingTable localPid)
   records <- newTVarIO Map.empty
@@ -182,6 +201,7 @@ newDHTNode sw mode = do
   hook <- newIORef Nothing
   stopped <- newTVarIO False
   worker <- newTVarIO Nothing
+  maintenance <- newDHTMaintenanceState maintenanceConfig
   let node = DHTNode
         { dhtSwitch           = sw
         , dhtRoutingTable     = rt
@@ -197,9 +217,11 @@ newDHTNode sw mode = do
         , dhtStopped          = stopped
         , dhtQueryTimeout     = defaultQueryTimeoutMicros
         , dhtBootstrapWorker  = worker
+        , dhtMaintenance      = maintenance
         }
   writeIORef hook (Just (dropCachedSession sw streams))
   atomically $ modifyTVar' (swDisconnectNotifiers sw) (runDisconnectHook hook :)
+  startValueGCWorker maintenance stopped records
   pure node
 
 -- | Stop the DHT node: drop cached sessions and deregister the disconnect
@@ -214,6 +236,7 @@ stopDHTNode node = do
     writeTVar (dhtBootstrapWorker node) Nothing
     writeTVar (dhtStreams node) Map.empty
     pure (w, Map.elems m)
+  stopDHTMaintenance (dhtMaintenance node)
   mapM_ cancel mWorker
   mapM_ invalidateHeldSession sessions
 
@@ -329,13 +352,12 @@ handleFindNode node msg = do
 handleGetValue :: DHTNode -> DHTMessage -> IO DHTMessage
 handleGetValue node msg = do
   rt <- readTVarIO (dhtRoutingTable node)
-  records <- readTVarIO (dhtRecordStore node)
   let key = msgKey msg
       -- Store lookup uses the raw key; distance uses its SHA-256.
       targetKey = keyToDHTKey key
       closest = closestPeers targetKey kValue rt
       peers = map entryToDHTPeer closest
-      rec = Map.lookup key records
+  rec <- lookupRecord node key
   pure emptyDHTMessage
     { msgType = GetValue
     , msgRecord = rec
@@ -647,12 +669,13 @@ clearSessionOwner session conn = atomically $ do
 
 -- | Store a record in the local datastore.
 storeRecord :: DHTNode -> DHTRecord -> IO ()
-storeRecord node rec = atomically $
-  modifyTVar' (dhtRecordStore node) (Map.insert (recKey rec) rec)
+storeRecord node =
+  storeReceivedRecord (dhtMaintenance node) (dhtRecordStore node)
 
--- | Look up a record by key.
+-- | Look up a record by key, lazily deleting expired or malformed entries.
 lookupRecord :: DHTNode -> ByteString -> IO (Maybe DHTRecord)
-lookupRecord node key = Map.lookup key <$> readTVarIO (dhtRecordStore node)
+lookupRecord node =
+  lookupLiveRecord (dhtMaintenance node) (dhtRecordStore node)
 
 -- | Add a provider entry for a content key.
 --
