@@ -75,7 +75,7 @@ newRelaySwitch config = do
   (pid, kp) <- mkTestIdentity
   sw <- newSwitch pid kp
   addTransport sw =<< newTCPTransport
-  (relayState, _circuitState, _autoNATV2State) <- registerNATHandlers sw config
+  (relayState, _circuitState, _natServices) <- registerNATHandlers sw config
   addrs <- switchListen sw defaultConnectionGater [loopbackAddr]
   case addrs of
     (a : _) -> pure (sw, pid, a, relayState)

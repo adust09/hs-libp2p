@@ -89,12 +89,12 @@ To listen on `/wss`, load a Web-PKI `Credential`, set
 `webSocketServerTLSParams = Just (webSocketServerParams credential)` on
 `defaultWebSocketConfig`, and use `newWebSocketTransportWithConfig`.
 
-AutoNAT v2 is registered together with the other NAT traversal protocols. Keep
-its returned state to correlate the authenticated dial-back nonce:
+AutoNAT v2 is registered together with the other NAT traversal protocols. Use
+the returned service handles to correlate the authenticated dial-back nonce:
 
 ```haskell
-(_, _, autoNATV2) <- registerNATHandlers sw defaultNATConfig
-result <- checkAutoNATV2 sw autoNATV2 connection
+(_, _, natServices) <- registerNATHandlers sw defaultNATConfig
+result <- checkAutoNATV2 sw (nsAutoNATV2State natServices) connection
   [AutoNATV2Request advertisedAddr True]
 ```
 

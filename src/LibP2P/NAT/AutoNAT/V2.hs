@@ -523,7 +523,6 @@ addressesConsistent localAddress requestedAddress =
     isIPv4 _ = False
     isIPv6 (IP6 _) = True
     isIPv6 _ = False
-    normalizedCode WSS = protocolCode WS
     normalizedCode protocol = protocolCode protocol
 
 lookupAt :: Int -> [a] -> Maybe a

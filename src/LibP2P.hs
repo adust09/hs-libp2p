@@ -16,7 +16,7 @@
 --   addTransport sw tcp
 --   registerIdentifyHandlers sw
 --   registerPingHandler sw
---   (_relayState, _circuitState) <- registerNATHandlers sw defaultNATConfig
+--   (_relayState, _circuitState, _natServices) <- registerNATHandlers sw defaultNATConfig
 --   addrs <- switchListen sw defaultConnectionGater [fromText "/ip4/127.0.0.1/tcp/0"]
 --   print addrs
 --   -- ... dial other peers, etc.
@@ -135,7 +135,10 @@ module LibP2P
   , BucketEntry
   , entryPeerId
   , entryAddrs
+  , DHTMaintenanceConfig (..)
+  , defaultDHTMaintenanceConfig
   , newDHTNode
+  , newDHTNodeWithConfig
   , stopDHTNode
   , registerDHTHandler
   , bootstrap
@@ -172,6 +175,14 @@ module LibP2P
     -- * NAT traversal (AutoNAT, Circuit Relay v2, DCUtR)
   , NATConfig (..)
   , defaultNATConfig
+  , NATStatus (..)
+  , AutoNATClientConfig (..)
+  , defaultAutoNATClientConfig
+  , AutoNATClientService
+  , NATServices (..)
+  , startAutoNATClient
+  , autoNATClientStatus
+  , stopAutoNATClient
   , registerNATHandlers
   , registerAutoNATHandler
   , registerAutoNATV2Handlers
@@ -181,7 +192,6 @@ module LibP2P
   , AutoNATV2State
   , AutoNATV2Request (..)
   , AutoNATV2Result (..)
-  , NATStatus (..)
   , autoNATV2DialProtocolId
   , autoNATV2DialBackProtocolId
   , registerRelayHopHandler
@@ -228,12 +238,15 @@ import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes, toBase58, parsePeerId, toCIDv1)
 import LibP2P.DHT
-  ( DHTMode (..)
+  ( DHTMaintenanceConfig (..)
+  , DHTMode (..)
   , DHTNode
   , ProviderEntry
   , Validator (..)
+  , defaultDHTMaintenanceConfig
   , defaultValidator
   , newDHTNode
+  , newDHTNodeWithConfig
   , peAddrs
   , peProvider
   , registerDHTHandler
@@ -254,8 +267,13 @@ import LibP2P.Multiaddr (Multiaddr (..), fromText, splitP2P, toText)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO (..))
 import LibP2P.NAT
-  ( NATConfig (..)
+  ( AutoNATClientConfig (..)
+  , AutoNATClientService
+  , NATConfig (..)
+  , NATServices (..)
+  , autoNATClientStatus
   , checkAutoNATV2
+  , defaultAutoNATClientConfig
   , defaultNATConfig
   , registerAutoNATHandler
   , registerAutoNATV2Handlers
@@ -263,6 +281,8 @@ import LibP2P.NAT
   , registerNATHandlers
   , registerRelayHopHandler
   , registerRelayStopHandler
+  , startAutoNATClient
+  , stopAutoNATClient
   )
 import LibP2P.NAT.AutoNAT (NATStatus (..))
 import LibP2P.NAT.AutoNAT.V2

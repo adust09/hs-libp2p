@@ -199,6 +199,12 @@ spec = do
         (Multiaddr [DNS4 "example.com", TCP 4001])
         `shouldBe` True
 
+    it "distinguishes secure and plaintext WebSocket transports" $ do
+      addressesConsistent
+        (Multiaddr [IP4 0x08080808, TCP 4001, WS])
+        (Multiaddr [IP4 0x08080808, TCP 4001, WSS])
+        `shouldBe` False
+
 runRawRequest
   :: AutoNATV2State
   -> AutoNATV2ServerOps
