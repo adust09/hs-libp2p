@@ -13,13 +13,14 @@ module LibP2P.Switch
   , setStreamHandler
   , removeStreamHandler
   , lookupStreamHandler
+  , registerSwitchShutdownAction
   , switchClose
   ) where
 
 import Control.Concurrent.Async (async, cancel)
 import Control.Concurrent.STM (TChan, atomically, dupTChan, newBroadcastTChanIO, newTVarIO, readTVar, writeTVar)
 import Control.Exception (SomeException, catch)
-import Control.Monad (void)
+import Control.Monad (unless, void)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
 import LibP2P.Crypto.Key (KeyPair)
@@ -75,6 +76,7 @@ newSwitchWithConfig config pid kp = do
   notifiersVar <- newTVarIO []
   disconnectNotifiersVar <- newTVarIO []
   listenersVar <- newTVarIO []
+  shutdownActionsVar <- newTVarIO []
   pure Switch
     { swLocalPeerId  = pid
     , swIdentityKey  = kp
@@ -92,6 +94,7 @@ newSwitchWithConfig config pid kp = do
     , swNotifiers    = notifiersVar
     , swDisconnectNotifiers = disconnectNotifiersVar
     , swListeners    = listenersVar
+    , swShutdownActions = shutdownActionsVar
     , swConfig       = config
     }
 
@@ -147,23 +150,39 @@ lookupStreamHandler sw proto = atomically $ do
   protos <- readTVar (swProtocols sw)
   pure $ Map.lookup proto protos
 
+-- | Register cleanup for a background service owned by the Switch.
+-- If shutdown has already begun, the action runs immediately instead.
+registerSwitchShutdownAction :: Switch -> IO () -> IO ()
+registerSwitchShutdownAction sw action = do
+  alreadyClosed <- atomically $ do
+    closed <- readTVar (swClosed sw)
+    unless closed $ do
+      actions <- readTVar (swShutdownActions sw)
+      writeTVar (swShutdownActions sw) (action : actions)
+    pure closed
+  if alreadyClosed then action else pure ()
+
 -- | Shut down the switch.
--- Cancels all accept loop threads, closes all listeners, tears down all
--- pooled connections, then sets the closed flag.
+-- Stops background services, cancels accept loops, closes listeners, and
+-- tears down all pooled connections.
 switchClose :: Switch -> IO ()
 switchClose sw = do
-  -- Read and clear listeners atomically
-  listeners <- atomically $ do
+  (actions, listeners) <- atomically $ do
+    registeredActions <- readTVar (swShutdownActions sw)
+    writeTVar (swShutdownActions sw) []
     ls <- readTVar (swListeners sw)
     writeTVar (swListeners sw) []
     writeTVar (swClosed sw) True
-    pure ls
+    pure (registeredActions, ls)
+  mapM_ runShutdownAction actions
   -- Cancel accept loops and close listeners outside STM
   mapM_ closeListener listeners
   -- Tear down every pooled connection (pool removal, resource release,
   -- muxer close, transport close)
   closeAllConnections sw
   where
+    runShutdownAction action =
+      action `catch` (\(_ :: SomeException) -> pure ())
     closeListener al = do
       cancel (alAcceptLoop al) `catch` (\(_ :: SomeException) -> pure ())
       listenerClose (alListener al) `catch` (\(_ :: SomeException) -> pure ())

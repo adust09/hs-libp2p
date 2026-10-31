@@ -114,11 +114,20 @@ library
     LibP2P.DHT.Validator
     LibP2P.DHT
     LibP2P.DHT.Lookup
+    LibP2P.DHT.Maintenance
     LibP2P.DHT.API
     LibP2P.NAT.AutoNAT.Message
     LibP2P.NAT.AutoNAT
+    LibP2P.NAT.AutoNAT.Service
+    LibP2P.NAT.AutoNAT.V2.Message
+    LibP2P.NAT.AutoNAT.V2
     LibP2P.Crypto.SignedEnvelope
     LibP2P.Crypto.PeerRecord
+    LibP2P.Discovery.Types
+    LibP2P.Discovery.Rendezvous.Message
+    LibP2P.Discovery.Rendezvous
+    LibP2P.Discovery.MDNS.Message
+    LibP2P.Discovery.MDNS
     LibP2P.NAT.Relay.Message
     LibP2P.NAT.Relay
     LibP2P.NAT.Relay.Client
@@ -302,11 +311,17 @@ test-suite hs-libp2p-test
     LibP2P.DHT.APISpec
     LibP2P.DHT.DHTSpec
     LibP2P.DHT.LookupSpec
+    LibP2P.DHT.MaintenanceSpec
     LibP2P.DHT.ValidatorSpec
     LibP2P.NAT.AutoNAT.MessageSpec
     LibP2P.NAT.AutoNAT.AutoNATSpec
+    LibP2P.NAT.AutoNAT.ServiceSpec
+    LibP2P.NAT.AutoNAT.V2.MessageSpec
+    LibP2P.NAT.AutoNAT.V2Spec
     LibP2P.Crypto.SignedEnvelopeSpec
     LibP2P.Crypto.PeerRecordSpec
+    LibP2P.Discovery.RendezvousSpec
+    LibP2P.Discovery.MDNSSpec
     LibP2P.NAT.Relay.MessageSpec
     LibP2P.NAT.Relay.RelaySpec
     LibP2P.NAT.Relay.ClientSpec
