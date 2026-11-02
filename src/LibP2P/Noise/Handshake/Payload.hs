@@ -1,13 +1,20 @@
 module LibP2P.Noise.Handshake.Payload
-  ( encodeNoisePayload 
-  , decodeNoisePayload 
+  ( -- * Noise handshake payload types
+    NoisePayload(..)
+  , NoiseExtensions(..)
+    -- * Errors
+  , PayloadDecodeError(..)
+    -- * Smart constructor
   , buildHandshakePayload
+  , buildInlinedExtensions
+    -- * Encoder and decoder
+  , encodeNoisePayload
+  , decodeNoisePayload
     -- * Static key signing
   , signStaticKey
   , verifyStaticKey
-  , NoisePayload(..)
-  , NoiseExtensions(..)
-  , PayloadDecodeError(..)
+    -- * libp2p-noise early data getters
+  , getStreamMuxers
   )
 where
 
@@ -22,6 +29,9 @@ import Proto3.Wire.Encode (MessageBuilder)
 import qualified Proto3.Wire.Encode as Encode
 import LibP2P.Crypto.Key (KeyPair(..), PrivateKey, PublicKey, sign, verify)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
+import LibP2P.MultistreamSelect.Negotiation (ProtocolId)
+import qualified Data.List.NonEmpty as NE
+import Data.List.NonEmpty (NonEmpty)
 
 -- | Noise handshake payload (protobuf-encoded in messages 2 and 3).
 data NoisePayload = NoisePayload
@@ -30,6 +40,12 @@ data NoisePayload = NoisePayload
   , npExts :: !(Maybe NoiseExtensions) -- ^ Extensions
   }
   deriving (Show, Eq)
+
+-- | Gets the supplied inlined muxer list.
+getStreamMuxers :: NoisePayload -> Maybe (NonEmpty ProtocolId)
+getStreamMuxers payload = do
+  exts <- npExts payload
+  nExtStreamMuxers exts
 
 -- | Errors that can occur when decoding the handshake payload
 data PayloadDecodeError
@@ -40,7 +56,7 @@ data PayloadDecodeError
 
 data NoiseExtensions = NoiseExtensions
   { nExtWebTransportCertHashes :: ![ByteString]
-  , nExtStreamMuxers :: ![Text]
+  , nExtStreamMuxers :: !(Maybe (NonEmpty ProtocolId))
   }
   deriving (Show, Eq)
 
@@ -68,13 +84,17 @@ verifyStaticKey pk noiseStaticPubKey sig =
   let payload = noiseStaticKeyPrefix <> noiseStaticPubKey
    in verify pk payload sig
 
--- | Build a handshake payload from an identity key pair and Noise static pubkey.
-buildHandshakePayload :: KeyPair -> ByteString -> Either String NoisePayload
-buildHandshakePayload identityKP noiseStaticPub = do
+buildInlinedExtensions :: [ProtocolId] -> Maybe NoiseExtensions
+buildInlinedExtensions [] = Nothing
+buildInlinedExtensions streamMuxers = Just $ NoiseExtensions [] (NE.nonEmpty streamMuxers)
+
+-- | Build a handshake payload from an identity key pair, Noise static pubkey, and optional list of supported muxers.
+buildHandshakePayload :: KeyPair -> ByteString -> Maybe NoiseExtensions -> Either String NoisePayload
+buildHandshakePayload identityKP noiseStaticPub exts = do
   identSig <-
     either (Left . ("buildHandshakePayload: " <>)) Right $
       signStaticKey (kpPrivate identityKP) noiseStaticPub
-  Right (NoisePayload (encodePublicKey (kpPublic identityKP)) identSig Nothing)
+  Right (NoisePayload (encodePublicKey (kpPublic identityKP)) identSig exts)
 
 --- | Encode a NoisePayload as a protobuf message.
 encodeNoisePayload :: NoisePayload -> ByteString
@@ -89,8 +109,8 @@ encodeNoisePayload (NoisePayload identKey identSig noiseExts) =
 
     extBuilder :: NoiseExtensions -> MessageBuilder
     extBuilder (NoiseExtensions certHashes muxers) =
-      repBytes 1 certHashes 
-      <> repText 2 muxers
+      repBytes 1 certHashes
+      <> repText 2 (maybe [] NE.toList muxers)
 
     optBytes :: Word -> Maybe ByteString -> MessageBuilder
     optBytes _ Nothing  = mempty
@@ -117,7 +137,7 @@ decodeNoisePayload bytes = do
 noiseExtensionsParser :: Parser RawMessage NoiseExtensions
 noiseExtensionsParser = NoiseExtensions
   <$> at (repeated byteString) (FieldNumber 1)
-  <*> at (repeated (TL.toStrict <$> text)) (FieldNumber 2)
+  <*> at (NE.nonEmpty <$> repeated (TL.toStrict <$> text)) (FieldNumber 2)
 
 --- | Parser for a NoisePayload message
 noisePayloadMessageParser :: Parser RawMessage NoisePayloadMessage
