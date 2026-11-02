@@ -8,6 +8,7 @@ module LibP2P.Noise.Handshake
   ( -- * Handshake types
     HandshakeResult (..)
   , HandshakeState (..)
+  , InlinedNegotiationResult (..)
     -- * Handshake lifecycle
   , initHandshakeInitiator
   , initHandshakeResponder
@@ -58,6 +59,7 @@ import LibP2P.Noise.Handshake.Payload
   , encodeNoisePayload
   , verifyStaticKey
   )
+import LibP2P.MultistreamSelect.Negotiation (ProtocolId)
 
 -- | Type alias for the Noise state with our fixed cipher suite.
 type CacophonyState = NoiseState ChaChaPoly1305 Curve25519 SHA256
@@ -71,7 +73,14 @@ newtype HandshakeState = HandshakeState
 data HandshakeResult = HandshakeResult
   { hrRemotePeerId :: !PeerId
   , hrRemotePublicKey :: !PublicKey
+  , hrNegotiatedMuxer :: !InlinedNegotiationResult
   }
+  deriving (Show, Eq)
+
+data InlinedNegotiationResult
+  = Selected !ProtocolId
+  | Fallback
+  | NoOverlap
   deriving (Show, Eq)
 
 -- | Initialize a handshake state for the initiator role.
@@ -149,7 +158,7 @@ performFullHandshake aliceIdentity bobIdentity = do
     (_payload1, bobState1) <- readHandshakeMsg bobInit msg1
 
     -- Message 2: Bob → Alice (Bob's identity payload)
-    bobPayload <- encodeNoisePayload <$> buildHandshakePayload bobIdentity bobNoiseStaticPub
+    bobPayload <- encodeNoisePayload <$> buildHandshakePayload bobIdentity bobNoiseStaticPub Nothing
     (msg2, bobState2) <- writeHandshakeMsg bobState1 bobPayload
     (payload2, aliceState2) <- readHandshakeMsg aliceState1 msg2
 
@@ -170,7 +179,7 @@ performFullHandshake aliceIdentity bobIdentity = do
           else Right ()
 
     -- Message 3: Alice → Bob (Alice's identity payload)
-    alicePayload <- encodeNoisePayload <$> buildHandshakePayload aliceIdentity aliceNoiseStaticPub
+    alicePayload <- encodeNoisePayload <$> buildHandshakePayload aliceIdentity aliceNoiseStaticPub Nothing
     (msg3, _aliceFinal) <- writeHandshakeMsg aliceState2 alicePayload
     (payload3, bobFinal) <- readHandshakeMsg bobState2 msg3
 
@@ -203,7 +212,7 @@ performFullHandshakeWithSessions aliceIdentity bobIdentity = do
     (_payload1, bobState1) <- readHandshakeMsg bobInit msg1
 
     -- Message 2: Bob → Alice (Bob's identity payload)
-    bobPayload <- encodeNoisePayload <$> buildHandshakePayload bobIdentity bobNoiseStaticPub
+    bobPayload <- encodeNoisePayload <$> buildHandshakePayload bobIdentity bobNoiseStaticPub Nothing
     (msg2, bobState2) <- writeHandshakeMsg bobState1 bobPayload
     (payload2, aliceState2) <- readHandshakeMsg aliceState1 msg2
 
@@ -221,7 +230,7 @@ performFullHandshakeWithSessions aliceIdentity bobIdentity = do
           else Right ()
 
     -- Message 3: Alice → Bob (Alice's identity payload)
-    alicePayload <- encodeNoisePayload <$> buildHandshakePayload aliceIdentity aliceNoiseStaticPub
+    alicePayload <- encodeNoisePayload <$> buildHandshakePayload aliceIdentity aliceNoiseStaticPub Nothing
     (msg3, aliceFinal) <- writeHandshakeMsg aliceState2 alicePayload
     (payload3, bobFinal) <- readHandshakeMsg bobState2 msg3
 
