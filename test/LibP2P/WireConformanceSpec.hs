@@ -13,6 +13,7 @@ module LibP2P.WireConformanceSpec (spec) where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.List.NonEmpty as NE
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import LibP2P.DHT.Message
   ( DHTMessage (..)
@@ -263,8 +264,8 @@ spec = do
             { npIdentityKey = "IDKEY"
             , npIdentitySig = "IDSIG"
             , npExts = Just $ NoiseExtensions
-                [BS.replicate 8 0x22, BS.replicate 8 0x33]
-                ["/yamux/1.0.0", "/mplex/6.7.0"]
+                [BS.replicate 8 0x22, BS.replicate 8 0x33] $
+                NE.nonEmpty ["/yamux/1.0.0", "/mplex/6.7.0"]
             }
           expected = BS.concat
             [ BS.pack [0x0a, 0x05], "IDKEY"                   -- field 1

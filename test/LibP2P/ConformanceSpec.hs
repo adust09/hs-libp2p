@@ -159,7 +159,7 @@ spec = do
       (pidA, kpA) <- mkTestIdentity
       (pidB, kpB) <- mkTestIdentity
       done <- timeout 10000000 $ concurrently
-        (performStreamHandshake kpA Outbound initSide)
+        (performStreamHandshake kpA Nothing Outbound initSide)
         (runForeignResponderCapturingMsg1 kpB foreignSide)
       case done of
         Nothing -> expectationFailure "handshake against the foreign responder hung"
@@ -189,7 +189,7 @@ runForeignResponderCapturingMsg1 kp stream = do
 
   -- Message 2: -> e, ee, s, es with our identity payload.
   payload <- either fail pure $
-    encodeNoisePayload <$> buildHandshakePayload kp staticPub
+    encodeNoisePayload <$> buildHandshakePayload kp staticPub Nothing
   (msg2, st2) <- either fail pure $ writeHandshakeMsg st1 payload
   writeFramedMessage stream msg2
 
