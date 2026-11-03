@@ -17,9 +17,6 @@ import LibP2P.MultistreamSelect.Negotiation
   )
 import LibP2P.Noise.Framing (maxNoisePlaintextSize)
 import LibP2P.Noise.Handshake (HandshakeResult (..), InlinedNegotiationResult(..))
-import LibP2P.Switch.Types (Connection (..), Direction (..), MuxerSession (..))
-import LibP2P.Switch.Upgrade
-import LibP2P.Transport (ConnectionEndpoint (..), RawConnection (..))
 import LibP2P.Yamux.Frame
   ( FrameType (..)
   , Flags (..)
@@ -30,6 +27,17 @@ import LibP2P.Yamux.Frame
   , headerSize
   )
 import System.Timeout (timeout)
+import LibP2P.Security.TLS (tlsProtocolId)
+import LibP2P.Switch.ResourceManager
+  ( DefaultLimits (..)
+  , newResourceManager
+  , noLimits
+  , unlimitedMemoryAccount
+  )
+import LibP2P.Switch.Types (Connection (..), Direction (..), MuxerSession (..))
+import LibP2P.Switch.Upgrade hiding (upgradeInbound, upgradeOutbound)
+import qualified LibP2P.Switch.Upgrade as Upgrade
+import LibP2P.Transport (ConnectionEndpoint (..), RawConnection (..), RelayCircuitLimit (..))
 import Test.Hspec
 import Control.Monad (forM_)
 import Data.List (isInfixOf)
@@ -43,6 +51,24 @@ mkTestIdentity = do
   let pid = fromPublicKey (publicKey kp)
   pure (pid, kp)
 
+upgradeOutbound :: KeyPair -> RawConnection -> IO Connection
+upgradeOutbound kp raw = do
+  rm <- newResourceManager (DefaultLimits noLimits noLimits noLimits noLimits)
+  Upgrade.upgradeOutbound rm kp raw
+
+upgradeInbound :: KeyPair -> RawConnection -> IO Connection
+upgradeInbound kp raw = do
+  rm <- newResourceManager (DefaultLimits noLimits noLimits noLimits noLimits)
+  Upgrade.upgradeInbound rm kp raw
+
+upgradeWithTLS :: Direction -> KeyPair -> RawConnection -> IO Connection
+upgradeWithTLS direction kp raw = do
+  rm <- newResourceManager (DefaultLimits noLimits noLimits noLimits noLimits)
+  Upgrade.upgradeAsWithSecurityProtocols rm [tlsProtocolId] direction kp raw
+
+openMuxStream :: Connection -> IO StreamIO
+openMuxStream conn = muxOpenStream (connSession conn) unlimitedMemoryAccount
+
 -- | Create a mock RawConnection from a StreamIO and addresses.
 mkMockRawConn :: StreamIO -> Multiaddr -> Multiaddr -> IO RawConnection
 mkMockRawConn sio local remote = pure RawConnection
@@ -50,6 +76,7 @@ mkMockRawConn sio local remote = pure RawConnection
   , rcLocalAddr  = local
   , rcRemoteAddr = remote
   , rcClose      = pure ()
+  , rcRelayLimit = Nothing
   }
 
 localAddr :: Multiaddr
@@ -268,7 +295,7 @@ spec = do
       -- Open stream from A (client), accept on B (server)
       (streamA, streamB) <-
         concurrently
-          (muxOpenStream (connSession connA))
+          (openMuxStream connA)
           (muxAcceptStream (connSession connB))
       -- Exchange data
       streamWrite streamA "ping"
@@ -278,6 +305,50 @@ spec = do
       received2 <- readExact streamA 4
       received2 `shouldBe` "pong"
       -- Cleanup
+      muxClose (connSession connA)
+      muxClose (connSession connB)
+
+    it "falls back from Noise to TLS 1.3 with ALPN-inlined Yamux" $ do
+      (pidA, kpA) <- mkTestIdentity
+      (pidB, kpB) <- mkTestIdentity
+      (rawA, rawB) <- mkMemoryStreamPair
+      rawConnA <- mkMockRawConn rawA localAddr remoteAddr
+      rawConnB <- mkMockRawConn rawB remoteAddr localAddr
+      (connA, connB) <- concurrently
+        (upgradeOutbound kpA rawConnA)
+        (upgradeWithTLS Inbound kpB rawConnB)
+      connPeerId connA `shouldBe` pidB
+      connPeerId connB `shouldBe` pidA
+      connSecurity connA `shouldBe` tlsProtocolId
+      connSecurity connB `shouldBe` tlsProtocolId
+      connMuxer connA `shouldBe` "/yamux/1.0.0"
+      connMuxer connB `shouldBe` "/yamux/1.0.0"
+      (streamA, streamB) <- concurrently
+        (openMuxStream connA)
+        (muxAcceptStream (connSession connB))
+      streamWrite streamA "tls ping"
+      readExact streamB 8 `shouldReturn` "tls ping"
+      muxClose (connSession connA)
+      muxClose (connSession connB)
+
+    it "keeps accounting active for a response after the requester half-closes" $ do
+      (_pidA, kpA) <- mkTestIdentity
+      (_pidB, kpB) <- mkTestIdentity
+      (rawA, rawB) <- mkMemoryStreamPair
+      rawConnA <- mkMockRawConn rawA localAddr remoteAddr
+      rawConnB <- mkMockRawConn rawB remoteAddr localAddr
+      (connA, connB) <- concurrently
+        (upgradeOutbound kpA rawConnA)
+        (upgradeInbound kpB rawConnB)
+      (streamA, streamB) <- concurrently
+        (openMuxStream connA)
+        (muxAcceptStream (connSession connB))
+      streamWrite streamA "request"
+      streamClose streamA
+      readExact streamB 7 `shouldReturn` "request"
+      streamWrite streamB "response"
+      readExact streamA 8 `shouldReturn` "response"
+      streamClose streamB
       muxClose (connSession connA)
       muxClose (connSession connB)
 
@@ -296,6 +367,24 @@ spec = do
       connPeerId connB `shouldBe` pidA
       connSecurity connA `shouldBe` "/noise"
       connMuxer connA `shouldBe` "/yamux/1.0.0"
+      connRelayLimit connA `shouldBe` Nothing
+      connRelayLimit connB `shouldBe` Nothing
+      muxClose (connSession connA)
+      muxClose (connSession connB)
+
+    it "retains a relay circuit budget through upgrade" $ do
+      (_pidA, kpA) <- mkTestIdentity
+      (_pidB, kpB) <- mkTestIdentity
+      (rawA, rawB) <- mkMemoryStreamPair
+      rawConnA <- mkMockRawConn rawA localAddr remoteAddr
+      rawConnB <- mkMockRawConn rawB remoteAddr localAddr
+      let budget = Just (RelayCircuitLimit (Just 120) (Just 131072))
+          withBudget raw = raw { rcRelayLimit = budget }
+      (connA, connB) <- concurrently
+        (upgradeOutbound kpA (withBudget rawConnA))
+        (upgradeInbound kpB (withBudget rawConnB))
+      connRelayLimit connA `shouldBe` budget
+      connRelayLimit connB `shouldBe` budget
       muxClose (connSession connA)
       muxClose (connSession connB)
 
@@ -312,11 +401,11 @@ spec = do
       -- Open two streams from A
       (stream1A, stream1B) <-
         concurrently
-          (muxOpenStream (connSession connA))
+          (openMuxStream connA)
           (muxAcceptStream (connSession connB))
       (stream2A, stream2B) <-
         concurrently
-          (muxOpenStream (connSession connA))
+          (openMuxStream connA)
           (muxAcceptStream (connSession connB))
       -- Exchange data on both streams independently
       streamWrite stream1A "stream-1"
@@ -340,7 +429,7 @@ spec = do
           (upgradeInbound kpB rawConnB)
       (streamA, streamB) <-
         concurrently
-          (muxOpenStream (connSession connA))
+          (openMuxStream connA)
           (muxAcceptStream (connSession connB))
       -- Larger than the yamux flow-control window, so the writer only
       -- makes progress while the reader drains — the perf download

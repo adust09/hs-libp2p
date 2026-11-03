@@ -10,7 +10,11 @@ module LibP2P.Switch.Types
   , Connection (..)
   , SwitchEvent (..)
   , StreamHandler
+  , ConnectionGater (..)
+  , defaultConnectionGater
   , Switch (..)
+  , SwitchConfig (..)
+  , defaultSwitchConfig
   , DialError (..)
   , BackoffEntry (..)
   , ResourceError (..)
@@ -27,8 +31,15 @@ import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Multiaddr (Multiaddr)
 import LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO)
 import LibP2P.Protocol.Identify.Message (IdentifyInfo)
-import LibP2P.Switch.ResourceManager (Direction (..), ResourceError (..), ResourceManager)
-import LibP2P.Transport (Listener, Transport)
+import LibP2P.Switch.ResourceManager
+  ( Direction (..)
+  , MemoryAccount
+  , ResourceError (..)
+  , ResourceManager
+  , ResourceScope
+  )
+import LibP2P.Transport (Listener, RelayCircuitLimit, Transport)
+import LibP2P.Yamux.Types (YamuxConfig, defaultYamuxConfig)
 
 -- | Connection state machine.
 --
@@ -45,9 +56,10 @@ data ConnState
 -- Decouples Switch from a specific muxer (Yamux, mplex, etc.).
 -- Each muxer implementation provides a MuxerSession adapter.
 data MuxerSession = MuxerSession
-  { muxOpenStream   :: !(IO StreamIO)   -- ^ Open a new outbound stream
-  , muxAcceptStream :: !(IO StreamIO)   -- ^ Accept an inbound stream (blocks)
-  , muxClose        :: !(IO ())         -- ^ Close the muxer session
+  { muxOpenStream :: !(MemoryAccount -> IO StreamIO)
+    -- ^ Open an outbound stream and close the account at terminal teardown
+  , muxAcceptStream :: !(IO StreamIO) -- ^ Accept an already-accounted inbound stream
+  , muxClose :: !(IO ()) -- ^ Close the muxer session
   }
 
 -- | An upgraded (secure + multiplexed) connection to a remote peer.
@@ -56,10 +68,16 @@ data Connection = Connection
   , connDirection  :: !Direction        -- ^ Inbound or outbound
   , connLocalAddr  :: !Multiaddr       -- ^ Local multiaddr
   , connRemoteAddr :: !Multiaddr       -- ^ Remote multiaddr
-  , connSecurity   :: !ProtocolId      -- ^ Negotiated security protocol (e.g. "/noise")
+  , connSecurity   :: !ProtocolId      -- ^ Negotiated security protocol (e.g. "/noise" or "/tls/1.0.0")
   , connMuxer      :: !ProtocolId      -- ^ Negotiated muxer protocol (e.g. "/yamux/1.0.0")
   , connSession    :: !MuxerSession    -- ^ Muxer session for opening/accepting streams
   , connState      :: !(TVar ConnState) -- ^ Mutable connection state
+  , connResourceScope :: !ResourceScope -- ^ Resource scope owned by this connection
+  , connRelayLimit :: !(Maybe RelayCircuitLimit)
+    -- ^ Relay-advertised circuit budget. 'Nothing' unless this connection
+    -- is the byte stream of a relayed circuit. A non-zero component makes
+    -- 'LibP2P.Switch.Connection.newStream' refuse the connection unless
+    -- the caller opts in.
   }
 
 -- | A protocol stream handler.
@@ -83,11 +101,28 @@ data SwitchEvent
   | Disconnected !PeerId !Direction !Multiaddr  -- ^ Connection closed
   deriving (Show, Eq)
 
+-- | Policy hooks applied to inbound and outbound connection establishment.
+data ConnectionGater = ConnectionGater
+  { gateAccept   :: !(Multiaddr -> IO Bool) -- ^ Check an inbound address before upgrade
+  , gateDialAddr :: !(Multiaddr -> IO Bool) -- ^ Check an outbound address before transport dial
+  , gateSecured  :: !(PeerId -> IO Bool)    -- ^ Check the authenticated remote peer
+  }
+
+-- | Default gater that allows all connections.
+defaultConnectionGater :: ConnectionGater
+defaultConnectionGater = ConnectionGater
+  { gateAccept = \_ -> pure True
+  , gateDialAddr = \_ -> pure True
+  , gateSecured = \_ -> pure True
+  }
+
 -- | Errors that can occur during a dial operation.
 data DialError
   = DialBackoff               -- ^ Peer is in backoff period (recently failed)
   | DialNoAddresses           -- ^ No addresses provided for dialing
   | DialNoTransport !Multiaddr -- ^ No registered transport can handle this address
+  | DialGatedAddress !Multiaddr -- ^ Outbound policy rejected this address
+  | DialGatedPeer !PeerId     -- ^ Outbound policy rejected the authenticated peer
   | DialAllFailed ![String]   -- ^ All dial attempts failed
   | DialUpgradeFailed !String -- ^ Connection upgrade pipeline failed
   | DialSwitchClosed          -- ^ Switch has been shut down
@@ -111,6 +146,21 @@ data ActiveListener = ActiveListener
   , alAddress    :: !Multiaddr     -- ^ Actual bound address (port 0 resolved)
   }
 
+-- | Switch-wide settings, fixed when the Switch is created.
+data SwitchConfig = SwitchConfig
+  { scYamuxConfig :: !YamuxConfig -- ^ Applied to every Yamux session the Switch upgrades (dial, listen, NAT probes)
+  , scSecurityProtocols :: ![ProtocolId]
+  -- ^ Secure channels offered, in preference order. The default is Noise,
+  -- then TLS 1.3 ("/tls/1.0.0").
+  }
+  deriving (Show, Eq)
+
+defaultSwitchConfig :: SwitchConfig
+defaultSwitchConfig = SwitchConfig
+  { scYamuxConfig = defaultYamuxConfig
+  , scSecurityProtocols = ["/noise", "/tls/1.0.0"]
+  }
+
 -- | The Switch: central coordinator of the libp2p networking stack.
 --
 -- Manages transports, connection pool, protocol handlers, and events.
@@ -125,10 +175,13 @@ data Switch = Switch
   , swClosed       :: !(TVar Bool)                                       -- ^ Whether the switch is shut down
   , swDialBackoffs :: !(TVar (Map PeerId BackoffEntry))                  -- ^ Per-peer dial backoff state
   , swPendingDials :: !(TVar (Map PeerId (TMVar (Either DialError Connection)))) -- ^ In-flight dials for dedup
+  , swConnectionGater :: !(TVar ConnectionGater)                         -- ^ Connection admission policy
   , swResourceMgr  :: !ResourceManager                                   -- ^ Hierarchical resource manager
   , swPeerStore    :: !(TVar (Map PeerId IdentifyInfo))                  -- ^ Identify info per peer
   , swCertifiedRecords :: !(TVar (Map PeerId CertifiedRecord))           -- ^ Accepted RFC 0003 records per peer
   , swNotifiers    :: !(TVar [Connection -> IO ()])                      -- ^ Callbacks on new connection
   , swDisconnectNotifiers :: !(TVar [Connection -> IO ()])               -- ^ Callbacks on connection teardown
   , swListeners    :: !(TVar [ActiveListener])                           -- ^ Active listeners
+  , swShutdownActions :: !(TVar [IO ()])                                 -- ^ Background service cleanup actions
+  , swConfig       :: !SwitchConfig                                      -- ^ Settings given at creation
   }

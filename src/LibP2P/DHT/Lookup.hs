@@ -42,6 +42,7 @@ import LibP2P.DHT
   , Validator (..)
   , addPeerToTable
   , decodePeerAddrs
+  , lookupRecord
   )
 import LibP2P.DHT.Distance (keyToDHTKey, peerIdToKey, sortByDistance)
 import LibP2P.DHT.Message
@@ -188,11 +189,23 @@ queryPeer node wireKey queryType entry = do
 -- Same as FIND_NODE but also tracks the best value found and which peers
 -- returned it. On completion, sends PUT_VALUE to peers with outdated values.
 iterativeGetValue :: DHTNode -> Validator -> ByteString -> IO (Either String DHTRecord)
-iterativeGetValue node validator key =
-  withQueryTimeout node (Left "query timed out") (getValueUncapped node validator key)
+iterativeGetValue node validator key = do
+  stored <- lookupRecord node key
+  let local = stored >>= validRecord
+      timeoutResult = maybe (Left "query timed out") Right local
+  withQueryTimeout node timeoutResult (getValueUncapped node validator key local)
+  where
+    validRecord record = case valValidate validator key (recValue record) of
+      Left _ -> Nothing
+      Right () -> Just record
 
-getValueUncapped :: DHTNode -> Validator -> ByteString -> IO (Either String DHTRecord)
-getValueUncapped node validator key = do
+getValueUncapped
+  :: DHTNode
+  -> Validator
+  -> ByteString
+  -> Maybe DHTRecord
+  -> IO (Either String DHTRecord)
+getValueUncapped node validator key local = do
   rt <- readTVarIO (dhtRoutingTable node)
   -- The raw record key goes on the wire; distance uses its SHA-256.
   let targetKey = keyToDHTKey key
@@ -202,7 +215,7 @@ getValueUncapped node validator key = do
   candidatesVar <- newTVarIO (sortByDistance targetKey seeds)
   queriedVar    <- newTVarIO Set.empty
   knownVar      <- newTVarIO (Set.fromList (map entryPeerId seeds))
-  bestVar       <- newTVarIO (Nothing :: Maybe DHTRecord)
+  bestVar       <- newTVarIO local
   bestPeersVar  <- newTVarIO (Set.empty :: Set PeerId)
   outdatedVar   <- newTVarIO (Set.empty :: Set PeerId)
 

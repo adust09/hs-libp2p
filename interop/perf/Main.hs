@@ -16,7 +16,7 @@
 --   REDIS_ADDR          - Redis host:port (default: "redis:6379")
 --   TEST_KEY            - hex key namespacing Redis coordination keys
 --   TRANSPORT           - must be "tcp"
---   SECURE_CHANNEL      - must be "noise"
+--   SECURE_CHANNEL      - "noise" or "tls"
 --   MUXER               - must be "yamux"
 --   LISTENER_IP         - bind address (default: "0.0.0.0")
 --   DEBUG               - accepted but ignored; all logging goes to stderr
@@ -49,7 +49,9 @@ import LibP2P
   , fromPublicKey
   , fromText
   , generateKeyPair
-  , newSwitch
+  , newSwitchWithConfig
+  , defaultSwitchConfig
+  , SwitchConfig (..)
   , newTCPTransport
   , peerIdBytes
   , registerPerfHandler
@@ -112,7 +114,7 @@ main = do
       let pid = fromPublicKey (publicKey kp)
       logInfo $ "PeerId: " ++ T.unpack (toBase58 pid)
 
-      sw <- newSwitch pid kp
+      sw <- newSwitchWithConfig (switchConfigFor security) pid kp
       tcp <- newTCPTransport
       addTransport sw tcp
       registerPerfHandler sw
@@ -243,12 +245,21 @@ validateProtocols transport security muxer = do
     other -> Left $ "transport " ++ other ++ " not supported (only tcp)"
   case security of
     Just "noise" -> pure ()
-    Just other -> Left $ "secure channel " ++ other ++ " not supported (only noise)"
+    Just "tls" -> pure ()
+    Just other -> Left $ "secure channel " ++ other ++ " not supported (expected noise or tls)"
     Nothing -> Left "SECURE_CHANNEL not set (required for tcp)"
   case muxer of
     Just "yamux" -> pure ()
     Just other -> Left $ "muxer " ++ other ++ " not supported (only yamux)"
     Nothing -> Left "MUXER not set (required for tcp)"
+
+-- | Restrict the upgrade to the secure channel selected by the harness.
+switchConfigFor :: Maybe String -> SwitchConfig
+switchConfigFor (Just "noise") =
+  defaultSwitchConfig {scSecurityProtocols = ["/noise"]}
+switchConfigFor (Just "tls") =
+  defaultSwitchConfig {scSecurityProtocols = ["/tls/1.0.0"]}
+switchConfigFor _ = defaultSwitchConfig
 
 -- | Parse "host:port" string.
 parseHostPort :: String -> (String, Int)

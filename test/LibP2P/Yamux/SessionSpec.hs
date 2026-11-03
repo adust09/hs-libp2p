@@ -3,13 +3,38 @@ module LibP2P.Yamux.SessionSpec (spec) where
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, concurrently, concurrently_, poll, wait, withAsync)
 import Control.Concurrent.STM
+import Control.Monad (replicateM_)
 import qualified Data.ByteString as BS
-import Data.Maybe (isNothing)
+import Data.Maybe (fromMaybe, isNothing)
+import Data.Word (Word32)
 import System.Timeout (timeout)
+import LibP2P.Crypto.PeerId (PeerId (..))
+import LibP2P.Switch.ResourceManager
+  ( DefaultLimits (..)
+  , Direction (..)
+  , MemoryAccount (..)
+  , ResourceError
+  , ResourceLimits (..)
+  , ResourceManager
+  , ResourceScope
+  , ResourceUsage (..)
+  , newResourceManager
+  , noLimits
+  , reserveConnection
+  , reserveStream
+  , rsUsage
+  , scopeMemoryAccount
+  )
 import LibP2P.Yamux.Frame
 import LibP2P.Yamux.HostilePeer
 import LibP2P.Yamux.Session
-import LibP2P.Yamux.Stream (streamClose, streamRead, streamReset, streamWrite)
+import LibP2P.Yamux.Stream
+  ( streamClose
+  , streamRead
+  , streamReadRetained
+  , streamReset
+  , streamWrite
+  )
 import LibP2P.Yamux.Types
 import Test.Hspec
 
@@ -25,6 +50,18 @@ mkMemoryTransportPair = do
   let writeTo q bs = mapM_ (atomically . writeTQueue q) (BS.unpack bs)
       readFrom q n = BS.pack <$> mapM (const (atomically (readTQueue q))) [1 .. n]
   pure ((writeTo qAtoB, readFrom qBtoA), (writeTo qBtoA, readFrom qAtoB))
+
+reserveTestConnection
+  :: ResourceManager -> PeerId -> Direction -> IO ResourceScope
+reserveTestConnection rm pid direction =
+  atomically (reserveConnection rm pid direction) >>= either (fail . show) pure
+
+newAccount
+  :: ResourceManager -> ResourceScope -> Direction
+  -> STM (Either ResourceError MemoryAccount)
+newAccount rm connection direction = do
+  reserved <- reserveStream rm connection direction
+  pure $ scopeMemoryAccount rm <$> reserved
 
 -- | Create a session pair and run action with all background loops running.
 withSessionPair :: ((YamuxSession, YamuxSession) -> IO a) -> IO a
@@ -121,6 +158,119 @@ spec = do
         Right received <- streamRead serverStream
         received `shouldBe` "early"
 
+  describe "Resource memory accounting" $ do
+    it "should account queued payload bytes until the application reads them" $ do
+      let memoryLimits = noLimits {rlMaxMemory = Just 4096}
+          defaults = DefaultLimits
+            { dlSystemLimits = memoryLimits
+            , dlPeerLimits = memoryLimits
+            , dlConnectionLimits = memoryLimits
+            , dlStreamLimits = memoryLimits
+            }
+      rm <- newResourceManager defaults
+      clientConn <- reserveTestConnection rm (PeerId "yamux-client") Outbound
+      serverConn <- reserveTestConnection rm (PeerId "yamux-server") Inbound
+      ((writeA, readA), (writeB, readB)) <- mkMemoryTransportPair
+      client <- newManagedSession RoleClient
+        (scopeMemoryAccount rm clientConn)
+        (newAccount rm clientConn Inbound)
+        (newAccount rm clientConn Outbound)
+        writeA readA
+      server <- newManagedSession RoleServer
+        (scopeMemoryAccount rm serverConn)
+        (newAccount rm serverConn Inbound)
+        (newAccount rm serverConn Outbound)
+        writeB readB
+      withAsync (sendLoop client) $ \_ ->
+        withAsync (recvLoop client) $ \_ ->
+          withAsync (sendLoop server) $ \_ ->
+            withAsync (recvLoop server) $ \_ -> do
+              (clientResult, serverResult) <- concurrently
+                (openStream client) (acceptStream server)
+              clientStream <- either (fail . show) pure clientResult
+              serverStream <- either (fail . show) pure serverResult
+              let payload = BS.replicate 128 0x5a
+              streamWrite clientStream payload `shouldReturn` Right ()
+              queued <- timeout 1000000 $ atomically $ do
+                usage <- readTVar (rsUsage serverConn)
+                check (ruMemory usage == BS.length payload)
+              queued `shouldBe` Just ()
+              streamRead serverStream `shouldReturn` Right payload
+              ruMemory <$> atomically (readTVar (rsUsage serverConn))
+                `shouldReturn` 0
+
+    it "should retain payload accounting after both sides half-close" $ do
+      let limits = noLimits {rlMaxMemory = Just 4096}
+          defaults = DefaultLimits limits limits limits limits
+      rm <- newResourceManager defaults
+      clientConn <- reserveTestConnection rm (PeerId "closing-client") Outbound
+      serverConn <- reserveTestConnection rm (PeerId "closing-server") Inbound
+      ((writeA, readA), (writeB, readB)) <- mkMemoryTransportPair
+      client <- newManagedSession RoleClient
+        (scopeMemoryAccount rm clientConn)
+        (newAccount rm clientConn Inbound)
+        (newAccount rm clientConn Outbound)
+        writeA readA
+      server <- newManagedSession RoleServer
+        (scopeMemoryAccount rm serverConn)
+        (newAccount rm serverConn Inbound)
+        (newAccount rm serverConn Outbound)
+        writeB readB
+      withAsync (sendLoop client) $ \_ ->
+        withAsync (recvLoop client) $ \_ ->
+          withAsync (sendLoop server) $ \_ ->
+            withAsync (recvLoop server) $ \_ -> do
+              (Right clientStream, Right serverStream) <- concurrently
+                (openStream client) (acceptStream server)
+              streamClose clientStream `shouldReturn` Right ()
+              atomically $ readTVar (ysState serverStream) >>= check . (== StreamRemoteClose)
+              let payload = BS.replicate 128 0x5a
+              streamWrite serverStream payload `shouldReturn` Right ()
+              streamClose serverStream `shouldReturn` Right ()
+              atomically $ readTVar (ysState clientStream) >>= check . (== StreamClosed)
+
+              streamReadRetained clientStream `shouldReturn` Right payload
+              ruMemory <$> atomically (readTVar (rsUsage clientConn))
+                `shouldReturn` BS.length payload
+              atomically $ maRelease (ysMemoryAccount clientStream) (BS.length payload)
+              ruMemory <$> atomically (readTVar (rsUsage clientConn))
+                `shouldReturn` 0
+
+    it "should terminate the session without buffering when a payload exceeds the memory limit" $ do
+      let parentLimits = noLimits {rlMaxMemory = Just 4096}
+          defaults = DefaultLimits
+            { dlSystemLimits = parentLimits
+            , dlPeerLimits = parentLimits
+            , dlConnectionLimits = parentLimits
+            , dlStreamLimits = noLimits {rlMaxMemory = Just 64}
+            }
+      rm <- newResourceManager defaults
+      serverConn <- reserveTestConnection rm (PeerId "limited-server") Inbound
+      ((writeA, readA), (writeB, readB)) <- mkMemoryTransportPair
+      client <- newSession RoleClient writeA readA
+      server <- newManagedSession RoleServer
+        (scopeMemoryAccount rm serverConn)
+        (newAccount rm serverConn Inbound)
+        (newAccount rm serverConn Outbound)
+        writeB readB
+      withAsync (sendLoop client) $ \_ ->
+        withAsync (recvLoop client) $ \_ ->
+          withAsync (sendLoop server) $ \_ ->
+            withAsync (recvLoop server) $ \_ -> do
+              (clientResult, serverResult) <- concurrently
+                (openStream client) (acceptStream server)
+              clientStream <- either (fail . show) pure clientResult
+              serverStream <- either (fail . show) pure serverResult
+              streamWrite clientStream (BS.replicate 128 0x5a)
+                `shouldReturn` Right ()
+              stopped <- timeout 1000000 $ atomically $ do
+                shutdown <- readTVar (ysessShutdown server)
+                check shutdown
+              stopped `shouldBe` Just ()
+              streamRead serverStream `shouldReturn` Left YamuxStreamReset
+              ruMemory <$> atomically (readTVar (rsUsage serverConn))
+                `shouldReturn` 0
+
   describe "Stream rejection" $ do
     it "RST response to SYN -> streamWrite returns Reset" $ do
       withSessionPair $ \(client, server) -> do
@@ -207,6 +357,112 @@ spec = do
         (ack, _) <- expectFrame hp
         yhType ack `shouldBe` FramePing
         yhLength ack `shouldBe` 7
+
+    it "fails with YamuxPingTimeout when no ACK arrives in time, and drops the waiter" $
+      withHostilePeerWithConfig (pingTimeoutConfig 100000) RoleClient $ \hp -> do
+        result <- timeout 1000000 (ping (hpSession hp))
+        result `shouldBe` Just (Left YamuxPingTimeout)
+        waiters <- readTVarIO (ysessPings (hpSession hp))
+        null waiters `shouldBe` True
+
+    it "fails with YamuxPingTimeout when the SYN cannot be written in time" $ do
+      -- The transport write never returns, so sendLoop never finishes
+      -- writing the SYN
+      gate <- newEmptyTMVarIO :: IO (TMVar ())
+      sess <-
+        newSessionWithConfig (pingTimeoutConfig 100000) RoleClient
+          (\_ -> atomically (takeTMVar gate)) (\_ -> pure BS.empty)
+      withAsync (sendLoop sess) $ \_ -> do
+        result <- timeout 1000000 (ping sess)
+        result `shouldBe` Just (Left YamuxPingTimeout)
+        waiters <- readTVarIO (ysessPings sess)
+        null waiters `shouldBe` True
+
+  describe "Keepalive" $ do
+    it "sends a Ping only after an interval with no frame received" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp ->
+        withAsync (keepaliveLoop (hpSession hp)) $ \_ -> do
+          -- Feed a frame every half interval for longer than a full
+          -- interval: the peer is never silent, so no Ping goes out. An
+          -- unsolicited Ping ACK is ignored by the session, so it draws
+          -- no reply of its own.
+          replicateM_ 3 $ do
+            injectFrame hp (pingAck 99) BS.empty
+            noFrame <- timeout 50000 (hpNextFrame hp)
+            fmap fst noFrame `shouldBe` Nothing
+          -- Stop feeding: a Ping follows once a full interval passes
+          -- with nothing received
+          (syn, _) <- expectFrame hp
+          yhType syn `shouldBe` FramePing
+          flagSYN (yhFlags syn) `shouldBe` True
+          yhStreamId syn `shouldBe` 0
+
+    it "keeps pinging while the Pings are answered" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp ->
+        withAsync (keepaliveLoop (hpSession hp)) $ \_ -> do
+          (first, _) <- expectFrame hp
+          yhType first `shouldBe` FramePing
+          injectFrame hp (pingAck (yhLength first)) BS.empty
+          (second, _) <- expectFrame hp
+          yhType second `shouldBe` FramePing
+          yhLength second `shouldNotBe` yhLength first
+
+    it "stops without pinging once closeSession sent a GoAway" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp ->
+        withAsync (keepaliveLoop (hpSession hp)) $ \keepaliveA -> do
+          closeSession (hpSession hp)
+          keepaliveRes <- timeout 500000 (wait keepaliveA)
+          keepaliveRes `shouldBe` Just (Right ())
+          (goAway, _) <- expectFrame hp
+          yhType goAway `shouldBe` FrameGoAway
+          expectNoFrame hp
+
+    it "stops without pinging once the peer sent a GoAway" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp -> do
+        injectFrame hp (YamuxHeader 0 FrameGoAway defaultFlags 0 0) BS.empty
+        awaitRemoteGoAway (hpSession hp) GoAwayNormal
+        withAsync (keepaliveLoop (hpSession hp)) $ \keepaliveA -> do
+          keepaliveRes <- timeout 500000 (wait keepaliveA)
+          keepaliveRes `shouldBe` Just (Right ())
+          expectNoFrame hp
+
+    -- A GoAway landing while a Ping is in flight must stop the loop
+    -- cleanly: the peer may never ACK, and a YamuxPingTimeout would
+    -- make the caller tear down streams that should be left to drain.
+    -- The wait is shorter than ycPingTimeout, so the loop has to
+    -- stop on the GoAway itself rather than on the ping timing out.
+    it "stops cleanly when the peer sends a GoAway after the Ping SYN" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp ->
+        withAsync (keepaliveLoop (hpSession hp)) $ \keepaliveA -> do
+          (syn, _) <- expectFrame hp
+          yhType syn `shouldBe` FramePing
+          flagSYN (yhFlags syn) `shouldBe` True
+          -- Never ACK the Ping
+          injectFrame hp (YamuxHeader 0 FrameGoAway defaultFlags 0 0) BS.empty
+          awaitRemoteGoAway (hpSession hp) GoAwayNormal
+          keepaliveRes <- timeout 200000 (wait keepaliveA)
+          keepaliveRes `shouldBe` Just (Right ())
+          expectNoFrame hp
+
+    it "stops cleanly when closeSession sends a GoAway after the Ping SYN" $
+      withHostilePeerWithConfig keepaliveConfig RoleClient $ \hp ->
+        withAsync (keepaliveLoop (hpSession hp)) $ \keepaliveA -> do
+          (syn, _) <- expectFrame hp
+          yhType syn `shouldBe` FramePing
+          flagSYN (yhFlags syn) `shouldBe` True
+          -- Never ACK the Ping
+          closeSession (hpSession hp)
+          keepaliveRes <- timeout 200000 (wait keepaliveA)
+          keepaliveRes `shouldBe` Just (Right ())
+          (goAway, _) <- expectFrame hp
+          yhType goAway `shouldBe` FrameGoAway
+          expectNoFrame hp
+
+    it "does nothing when keepalive is disabled" $
+      withHostilePeerWithConfig keepaliveConfig {ycKeepAlive = Nothing} RoleClient $ \hp -> do
+        keepaliveRes <- timeout 1000000 (keepaliveLoop (hpSession hp))
+        keepaliveRes `shouldBe` Just (Right ())
+        expectNoFrame hp
 
   describe "Frame counters" $ do
     it "numbers queued frames consecutively from 1, including unnumbered enqueues" $ do
@@ -614,3 +870,29 @@ shouldBeLeft :: (Show e, Eq e) => e -> Either e a -> Expectation
 shouldBeLeft expected (Left actual) = actual `shouldBe` expected
 shouldBeLeft expected (Right _) =
   expectationFailure $ "Expected Left " <> show expected <> " but got Right"
+
+-- | A Ping ACK echoing the given opaque value.
+pingAck :: Word32 -> YamuxHeader
+pingAck = YamuxHeader 0 FramePing (defaultFlags {flagACK = True}) 0
+
+-- | The default configuration with a different ping timeout.
+pingTimeoutConfig :: Int -> YamuxConfig
+pingTimeoutConfig us = defaultYamuxConfig {ycPingTimeout = micros us}
+
+-- | A test duration; the literals used here are all positive.
+micros :: Int -> Micros
+micros us = fromMaybe (error ("micros: not positive: " <> show us)) (mkMicros us)
+
+-- | Short keepalive timings so the tests finish well within a second.
+keepaliveConfig :: YamuxConfig
+keepaliveConfig =
+  defaultYamuxConfig
+    { ycKeepAlive = Just (micros 100000) -- 100ms
+    , ycPingTimeout = micros 350000 -- 350ms
+    }
+
+-- | Assert the session writes nothing for three keepalive intervals.
+expectNoFrame :: HostilePeer -> Expectation
+expectNoFrame hp = do
+  mFrame <- timeout 300000 (hpNextFrame hp)
+  fmap fst mFrame `shouldBe` Nothing

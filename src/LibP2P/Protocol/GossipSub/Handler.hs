@@ -1,7 +1,7 @@
 -- | GossipSub Switch integration handler (Phase 10b).
 --
 -- Bridges the GossipSub Router with the Switch by:
--- 1. Registering a StreamHandler for inbound /meshsub/1.1.0 streams
+-- 1. Registering StreamHandlers for inbound GossipSub protocol versions
 -- 2. Providing a sendRPC callback that opens/reuses outbound streams
 -- 3. Managing lifecycle (heartbeat start/stop)
 --
@@ -20,11 +20,15 @@ module LibP2P.Protocol.GossipSub.Handler
   , startGossipSub
   , stopGossipSub
     -- * Convenience API
+  , enablePartialMessages
   , gossipJoin
+  , gossipJoinPartial
   , gossipLeave
   , gossipPublish
     -- * Constants
   , gossipSubProtocolId
+  , gossipSubProtocolIdV12
+  , gossipSubProtocolIdV11
   , gossipSubProtocolIdV10
   , floodSubProtocolId
   ) where
@@ -37,6 +41,7 @@ import Control.Concurrent.STM
   , atomically
   , newTVarIO
   , readTVar
+  , readTVarIO
   , writeTVar
   , modifyTVar'
   )
@@ -45,7 +50,7 @@ import Control.Monad (void, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (isNothing)
+import Data.Maybe (isJust, isNothing)
 import Data.Time.Clock (getCurrentTime)
 import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.MultistreamSelect.Negotiation
@@ -55,7 +60,19 @@ import LibP2P.MultistreamSelect.Negotiation
   , closeQuietly
   , negotiateInitiator
   )
+import LibP2P.Protocol.GossipSub.DirectConnect
+  ( DirectDialSlots
+  , cancelDirectDials
+  , newDirectDialSlots
+  , reconnectDirectPeer
+  , runDirectConnectLoop
+  )
+import LibP2P.Protocol.GossipSub.Extensions
+  ( attachExtensionsToHello
+  , markExtensionAdvertisementSent
+  )
 import LibP2P.Protocol.GossipSub.Heartbeat (runHeartbeat)
+import LibP2P.Protocol.GossipSub.PeerExchange (installPeerExchange)
 import LibP2P.Protocol.GossipSub.Message (readRPCMessage, writeRPCMessage)
 import LibP2P.Core.Binary (word32BE)
 import LibP2P.Multiaddr (protocols)
@@ -64,6 +81,7 @@ import LibP2P.Protocol.GossipSub.Router
   ( addPeer
   , handleRPC
   , join
+  , joinPartial
   , leave
   , newRouter
   , publish
@@ -71,11 +89,18 @@ import LibP2P.Protocol.GossipSub.Router
   , setPeerIP
   , setSignedPeerRecord
   )
+import LibP2P.Protocol.GossipSub.PartialMessages
+  ( PartialMessagesError (..)
+  , PartialMessagesExtension
+  )
+import qualified LibP2P.Protocol.GossipSub.PartialMessages as PartialMessages
 import LibP2P.Protocol.Identify.Message (IdentifyInfo (..))
 import qualified Data.Set as Set
+import qualified LibP2P.Protocol.GossipSub.Types as Types
 import LibP2P.Protocol.GossipSub.Types
   ( GossipSubParams
   , GossipSubRouter (..)
+  , PartialTopicMode
   , PeerProtocol (..)
   , RPC (..)
   , SubOpts (..)
@@ -92,29 +117,44 @@ import LibP2P.Switch.Types
   , Switch (..)
   )
 
--- | GossipSub v1.1 protocol ID (preferred).
+-- | GossipSub v1.3 protocol ID (preferred).
 gossipSubProtocolId :: ProtocolId
-gossipSubProtocolId = "/meshsub/1.1.0"
+gossipSubProtocolId = Types.gossipSubProtocolId
 
--- | GossipSub v1.0 protocol ID, advertised alongside v1.1 so that
--- v1.0-only peers still get a pubsub stream (#157).
+-- | GossipSub v1.2 protocol ID, retained for backwards compatibility.
+gossipSubProtocolIdV12 :: ProtocolId
+gossipSubProtocolIdV12 = Types.gossipSubProtocolIdV12
+
+-- | GossipSub v1.1 protocol ID, retained for backwards compatibility.
+gossipSubProtocolIdV11 :: ProtocolId
+gossipSubProtocolIdV11 = Types.gossipSubProtocolIdV11
+
+-- | GossipSub v1.0 protocol ID, retained for backwards compatibility.
 gossipSubProtocolIdV10 :: ProtocolId
-gossipSubProtocolIdV10 = "/meshsub/1.0.0"
+gossipSubProtocolIdV10 = Types.gossipSubProtocolIdV10
 
 -- | FloodSub protocol ID, advertised alongside the meshsub protocols so
 -- that floodsub-only peers still get a pubsub stream (#157,
 -- gossipsub-v1.0.md "Compatibility with FloodSub").
 floodSubProtocolId :: ProtocolId
-floodSubProtocolId = "/floodsub/1.0.0"
+floodSubProtocolId = Types.floodSubProtocolId
 
 -- | All protocol IDs we register and offer, preferred first.
 gossipSubProtocolIds :: [ProtocolId]
 gossipSubProtocolIds =
-  [gossipSubProtocolId, gossipSubProtocolIdV10, floodSubProtocolId]
+  [ gossipSubProtocolId
+  , gossipSubProtocolIdV12
+  , gossipSubProtocolIdV11
+  , gossipSubProtocolIdV10
+  , floodSubProtocolId
+  ]
 
 -- | Map a negotiated protocol ID to the peer's protocol version.
 protocolFor :: ProtocolId -> PeerProtocol
 protocolFor proto
+  | proto == gossipSubProtocolId    = GossipSubV13Peer
+  | proto == gossipSubProtocolIdV12 = GossipSubV12Peer
+  | proto == gossipSubProtocolIdV11 = GossipSubPeer
   | proto == gossipSubProtocolIdV10 = GossipSubV10Peer
   | proto == floodSubProtocolId     = FloodSubPeer
   | otherwise                       = GossipSubPeer
@@ -143,12 +183,17 @@ data GossipSubNode = GossipSubNode
     -- ^ True between a successful start and stop.
   , gsnLifecycleLock :: !(MVar ())
     -- ^ Serializes start and stop so heartbeat ownership cannot race.
+  , gsnDirectSlots :: !DirectDialSlots
+    -- ^ In-flight dials of configured direct peers (#259).
+  , gsnDirectConnect :: !(TVar (Maybe (Async ())))
+    -- ^ Connectivity checker. Cancelled by 'stopGossipSub'.
   }
 
 -- | Create a new GossipSub node with a Router wired to the Switch.
 --
 -- The Router's gsSendRPC callback opens/reuses outbound streams to peers
--- via the Switch's connection pool.
+-- via the Switch's connection pool. Accepted peer-exchange records are
+-- stored and dialed through the same Switch (#247).
 newGossipSubNode :: Switch -> GossipSubParams -> IO GossipSubNode
 newGossipSubNode sw params = do
   streamsVar <- newTVarIO Map.empty
@@ -159,10 +204,14 @@ newGossipSubNode sw params = do
   installed <- newTVarIO False
   started <- newTVarIO False
   lifecycleLock <- newMVar ()
+  directSlots <- newDirectDialSlots
+  directConnect <- newTVarIO Nothing
+  routerRef <- newIORef Nothing
   -- Create router with real sendRPC that uses the Switch
   let localPid = swLocalPeerId sw
   router <- newRouter params localPid
-    (sendRPCviaSwitch sw started streamsVar streamMetaVar) getCurrentTime
+    (sendRPCviaSwitch sw started streamsVar streamMetaVar routerRef) getCurrentTime
+  writeIORef routerRef (Just router)
   let node = GossipSubNode
         { gsnRouter    = router
         , gsnSwitch    = sw
@@ -174,7 +223,10 @@ newGossipSubNode sw params = do
         , gsnNotifierInstalled = installed
         , gsnStarted = started
         , gsnLifecycleLock = lifecycleLock
+        , gsnDirectSlots = directSlots
+        , gsnDirectConnect = directConnect
         }
+  installPeerExchange sw router
   atomically $ modifyTVar' (swDisconnectNotifiers sw)
     (runGossipDisconnect disconnectHook :)
   pure node
@@ -185,10 +237,11 @@ sendRPCviaSwitch
   -> TVar Bool
   -> TVar (Map.Map PeerId StreamIO)
   -> TVar (Map.Map PeerId GossipStreamMeta)
+  -> IORef (Maybe GossipSubRouter)
   -> PeerId
   -> RPC
   -> IO ()
-sendRPCviaSwitch sw startedVar streamsVar metaVar pid rpc = do
+sendRPCviaSwitch sw startedVar streamsVar metaVar routerRef pid rpc = do
   mCached <- atomically $ lookupCachedStream streamsVar metaVar pid
   case mCached of
     Just (stream, token) -> do
@@ -197,8 +250,8 @@ sendRPCviaSwitch sw startedVar streamsVar metaVar pid rpc = do
         Right () -> pure ()
         Left () -> do
           evictCachedStream streamsVar metaVar pid token stream
-          openAndSend sw startedVar streamsVar metaVar pid rpc
-    Nothing -> openAndSend sw startedVar streamsVar metaVar pid rpc
+          openAndSend sw startedVar streamsVar metaVar routerRef pid rpc
+    Nothing -> openAndSend sw startedVar streamsVar metaVar routerRef pid rpc
 
 -- | Open a new outbound stream to a peer and send an RPC.
 openAndSend
@@ -206,26 +259,34 @@ openAndSend
   -> TVar Bool
   -> TVar (Map.Map PeerId StreamIO)
   -> TVar (Map.Map PeerId GossipStreamMeta)
+  -> IORef (Maybe GossipSubRouter)
   -> PeerId
   -> RPC
   -> IO ()
-openAndSend sw startedVar streamsVar metaVar pid rpc = do
+openAndSend sw startedVar streamsVar metaVar routerRef pid rpc = do
   started <- atomically $ readTVar startedVar
   mOpened <- if started then openStreamToPeer sw pid else pure Nothing
   case mOpened of
     Nothing -> pure ()
-    Just (conn, stream) -> do
+    Just (conn, stream, proto) -> do
       mToken <- cacheGossipStream startedVar streamsVar metaVar pid conn stream
       case mToken of
         Nothing -> pure ()
         Just token -> do
-          sent <- trySend stream rpc
+          mRouter <- readIORef routerRef
+          helloSent <- case mRouter of
+            Nothing -> pure True
+            Just router -> do
+              now <- getCurrentTime
+              addPeer router pid proto True now
+              sendHelloChecked router pid stream proto
+          sent <- if helloSent then trySend stream rpc else pure (Left ())
           case sent of
             Right () -> pure ()
             Left () -> evictCachedStream streamsVar metaVar pid (Just token) stream
 
 -- | Open a new mux stream to a peer and negotiate GossipSub protocol.
-openStreamToPeer :: Switch -> PeerId -> IO (Maybe (Connection, StreamIO))
+openStreamToPeer :: Switch -> PeerId -> IO (Maybe (Connection, StreamIO, PeerProtocol))
 openStreamToPeer sw pid = do
   mConn <- atomically $ lookupConn (swConnPool sw) pid
   case mConn of
@@ -235,7 +296,7 @@ openStreamToPeer sw pid = do
                   (\(_ :: SomeException) -> pure (Left ()))
       case result of
         Left () -> pure Nothing
-        Right mStream -> pure $ (\(stream, _) -> (conn, stream)) <$> mStream
+        Right mStream -> pure $ (\(stream, proto) -> (conn, stream, proto)) <$> mStream
 
 -- | Read a cached stream together with its identity token, when managed.
 lookupCachedStream
@@ -310,7 +371,7 @@ evictCachedStream streamsVar metaVar pid expectedToken stream = mask_ $ do
   closeQuietly stream
 
 -- | Open a mux stream and negotiate a GossipSub protocol, preferring
--- /meshsub/1.1.0 and falling back to /meshsub/1.0.0 (#157).
+-- v1.3 and falling back through v1.2, v1.1, v1.0, and FloodSub.
 openAndNegotiate :: Switch -> Connection -> IO (Maybe (StreamIO, PeerProtocol))
 openAndNegotiate sw conn = do
   opened <- newStream sw conn
@@ -395,11 +456,12 @@ activateGossipSub :: GossipSubNode -> IO ()
 activateGossipSub node = do
   writeIORef (gsnConnectHook node) (Just (onNewConnection node))
   writeIORef (gsnDisconnectHook node)
-    (Just (dropCachedGossipStream node))
+    (Just (onGossipDisconnect node))
   installConnectNotifier node
   registerHandlers node
   hbAsync <- runHeartbeat (gsnRouter node)
   atomically $ writeTVar (gsnHeartbeat node) (Just hbAsync)
+  startDirectMaintenance node
 
 -- | Restore the stopped state if activation fails partway through.
 rollbackGossipSubStart :: GossipSubNode -> IO ()
@@ -409,6 +471,7 @@ rollbackGossipSubStart node = do
   atomically $ writeTVar (gsnStarted node) False
   mapM_ (removeStreamHandler (gsnSwitch node)) gossipSubProtocolIds
   closeCachedStreams node
+  stopDirectMaintenance node
 
 -- | Claim the start so two concurrent or repeated starts share one heartbeat.
 claimStart :: GossipSubNode -> IO Bool
@@ -470,7 +533,7 @@ onNewConnection node conn = do
           addPeer (gsnRouter node) pid proto True now
           mapM_ (setPeerIP (gsnRouter node) pid) (remoteIPBytes conn)
           syncSignedPeerRecord node pid
-          sent <- sendCurrentSubscriptionsChecked node stream
+          sent <- sendHelloChecked (gsnRouter node) pid stream proto
           if sent
             then void $ async $ outboundReadLoop node stream pid token
             else evictCachedStream
@@ -487,17 +550,46 @@ sendCurrentSubscriptions node stream =
 -- | Send subscriptions and report whether the stream stayed writable.
 sendCurrentSubscriptionsChecked :: GossipSubNode -> StreamIO -> IO Bool
 sendCurrentSubscriptionsChecked node stream = do
-  let router = gsnRouter node
-  -- Read the subscription set, not mesh keys: a topic joined before any
-  -- peer was known has no mesh entry but must still be announced (#155).
-  subs <- atomically $ readTVar (gsSubscriptions router)
-  let topics = Set.toList subs
-  if null topics
+  rpc <- currentSubscriptionsRPC (gsnRouter node)
+  if null (rpcSubscriptions rpc)
+    then pure True
+    else either (const False) (const True) <$> trySend stream rpc
+
+sendHelloChecked :: GossipSubRouter -> PeerId -> StreamIO -> PeerProtocol -> IO Bool
+sendHelloChecked router pid stream proto = do
+  subscriptions <- currentSubscriptionsRPC router
+  hello <- attachExtensionsToHello router proto subscriptions
+  if hello == emptyRPC
     then pure True
     else do
-      let subRPC = emptyRPC
-            { rpcSubscriptions = map (\t -> SubOpts True t) topics }
-      either (const False) (const True) <$> trySend stream subRPC
+      result <- trySend stream hello
+      case result of
+        Left () -> pure False
+        Right () -> do
+          when (hasExtensionAdvertisement hello) $
+            markExtensionAdvertisementSent router pid
+          pure True
+
+hasExtensionAdvertisement :: RPC -> Bool
+hasExtensionAdvertisement rpc =
+  maybe False (isJust . Types.ctrlExtensions) (rpcControl rpc)
+
+currentSubscriptionsRPC :: GossipSubRouter -> IO RPC
+currentSubscriptionsRPC router = do
+  (subs, partialTopics) <- atomically $
+    (,) <$> readTVar (gsSubscriptions router) <*> readTVar (gsPartialTopics router)
+  pure emptyRPC
+    { rpcSubscriptions = map (subscriptionOption partialTopics) (Set.toList subs) }
+
+subscriptionOption :: Map.Map Topic PartialTopicMode -> Topic -> SubOpts
+subscriptionOption partialTopics topic = SubOpts
+  { subSubscribe = True
+  , subTopicId = topic
+  , subRequestsPartial = mode == Just Types.RequestsPartialMessages
+  , subSupportsSendingPartial = isJust mode
+  }
+ where
+  mode = Map.lookup topic partialTopics
 
 -- | Read loop on the outbound stream.
 -- Handles RPCs sent back by the remote peer on the same yamux stream
@@ -535,6 +627,7 @@ stopGossipSub node = withMVar (gsnLifecycleLock node) $ \_ -> do
     Nothing -> pure ()
   mapM_ (removeStreamHandler (gsnSwitch node)) gossipSubProtocolIds
   closeCachedStreams node
+  stopDirectMaintenance node
 
 -- | Close every cached outbound stream, releasing its resource slot.
 closeCachedStreams :: GossipSubNode -> IO ()
@@ -566,9 +659,63 @@ dropCachedGossipStream node conn = do
       else pure Nothing
   mapM_ closeQuietly mStream
 
+-- | Start the direct-peer checker. The first pass runs immediately.
+startDirectMaintenance :: GossipSubNode -> IO ()
+startDirectMaintenance node = do
+  worker <- async $
+    runDirectConnectLoop (gsnSwitch node) (gsnRouter node)
+      (gsnStarted node) (gsnDirectSlots node)
+  atomically $ writeTVar (gsnDirectConnect node) (Just worker)
+
+-- | Cancel the checker and any dial it has claimed.
+stopDirectMaintenance :: GossipSubNode -> IO ()
+stopDirectMaintenance node = do
+  worker <- atomically $ do
+    current <- readTVar (gsnDirectConnect node)
+    writeTVar (gsnDirectConnect node) Nothing
+    pure current
+  mapM_ cancelQuiet worker
+  cancelDirectDials (gsnDirectSlots node)
+
+-- | Drop the cached stream, then redial if this was a direct peer.
+onGossipDisconnect :: GossipSubNode -> Connection -> IO ()
+onGossipDisconnect node conn = do
+  dropCachedGossipStream node conn
+  started <- readTVarIO (gsnStarted node)
+  when started $ reconnectDirectPeer (gsnSwitch node) (gsnRouter node)
+    (gsnDirectSlots node) (connPeerId conn)
+
+cancelQuiet :: Async () -> IO ()
+cancelQuiet worker =
+  cancel worker `catch` \(_ :: SomeException) -> pure ()
+
+-- | Enable partial messages before starting the node.
+enablePartialMessages
+  :: GossipSubNode
+  -> PartialMessagesExtension state
+  -> IO (Either PartialMessagesError ())
+enablePartialMessages node extension =
+  withMVar (gsnLifecycleLock node) $ \_ -> do
+    started <- readTVarIO (gsnStarted node)
+    if started
+      then pure (Left PartialMessagesNodeStarted)
+      else PartialMessages.installPartialMessages (gsnRouter node) extension
+
 -- | Subscribe to a topic.
 gossipJoin :: GossipSubNode -> Topic -> IO ()
 gossipJoin node topic = join (gsnRouter node) topic
+
+-- | Subscribe while supporting or requesting partial messages.
+gossipJoinPartial
+  :: GossipSubNode
+  -> Topic
+  -> PartialTopicMode
+  -> IO (Either PartialMessagesError ())
+gossipJoinPartial node topic mode = do
+  installed <- isJust <$> readTVarIO (gsPartialMessagesHooks (gsnRouter node))
+  if installed
+    then joinPartial (gsnRouter node) topic mode >> pure (Right ())
+    else pure (Left PartialMessagesNotInstalled)
 
 -- | Unsubscribe from a topic.
 gossipLeave :: GossipSubNode -> Topic -> IO ()

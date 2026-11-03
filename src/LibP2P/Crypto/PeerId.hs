@@ -20,8 +20,7 @@ import Data.ByteArray.Encoding (Base (Base32), convertFromBase, convertToBase)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Data.Char (toLower, toUpper)
-import Data.Word (Word64)
+import Data.Word (Word8, Word64)
 import LibP2P.Core.Multihash (HashFunction (..), encodeMultihash, validateMultihash)
 import LibP2P.Core.Varint (encodeUvarint, decodeUvarint)
 import LibP2P.Crypto.Key (PublicKey)
@@ -62,13 +61,15 @@ fromBase58 t = case B58.decode (TE.encodeUtf8 t) of
 peerIdBytes :: PeerId -> ByteString
 peerIdBytes (PeerId bs) = bs
 
--- | Parse a Peer ID from text, accepting both base58btc and CIDv1 (base32lower) formats.
--- CIDv1 format: 'b' prefix + base32lower(0x01 || 0x72 || multihash)
+-- | Parse a Peer ID from either a legacy base58btc multihash or CIDv1.
+-- Legacy strings start with @1@ or @Qm@. CIDv1 strings use a supported
+-- multibase prefix: @b@ (base32lower), @B@ (base32upper), or @z@ (base58btc).
 parsePeerId :: Text -> Either String PeerId
 parsePeerId t
   | T.null t = Left "parsePeerId: empty input"
-  | T.head t == 'b' = fromCIDv1 t
-  | otherwise = fromBase58 t
+  | "1" `T.isPrefixOf` t || "Qm" `T.isPrefixOf` t = fromBase58 t
+  | T.head t `elem` ['b', 'B', 'z'] = fromCIDv1 t
+  | otherwise = Left "parsePeerId: unsupported peer ID representation"
 
 -- | Encode a Peer ID as CIDv1 text (base32lower, no padding).
 -- Format: 'b' + base32lower(varint(1) + varint(0x72) + multihash_bytes)
@@ -83,33 +84,67 @@ toCIDv1 (PeerId mhBytes) =
       base32Lower = BS.map (\w -> if w >= 0x41 && w <= 0x5A then w + 32 else w) base32NoPad
   in "b" <> TE.decodeUtf8 base32Lower
 
--- | Decode a Peer ID from CIDv1 text.
+-- | Decode a multibase-encoded CIDv1 Peer ID.
 fromCIDv1 :: Text -> Either String PeerId
-fromCIDv1 t
-  | T.null t = Left "fromCIDv1: empty input"
-  | T.head t /= 'b' = Left "fromCIDv1: expected 'b' multibase prefix"
-  | otherwise = do
-      let base32Text = T.drop 1 t  -- strip 'b' prefix
-          -- Convert to uppercase for standard Base32 decoding, add padding
-          upperText = T.map toUpper base32Text
-          padLen = case T.length upperText `mod` 8 of
-                     0 -> 0
-                     n -> 8 - n
-          paddedText = upperText <> T.replicate padLen "="
-      cidBytes <- case convertFromBase Base32 (TE.encodeUtf8 paddedText) :: Either String ByteString of
-        Left err -> Left $ "fromCIDv1: base32 decode error: " <> err
-        Right bs -> Right bs
-      -- Parse CID: version + codec + multihash
-      (version, rest1) <- decodeUvarint cidBytes
-      if version /= (1 :: Word64)
-        then Left $ "fromCIDv1: expected CID version 1, got " <> show version
+fromCIDv1 t = do
+  cidBytes <- decodeMultibase t
+  (version, rest1) <- decodeUvarint cidBytes
+  if version /= (1 :: Word64)
+    then Left $ "fromCIDv1: expected CID version 1, got " <> show version
+    else do
+      (codec, multihash) <- decodeUvarint rest1
+      if codec /= (0x72 :: Word64)
+        then Left $ "fromCIDv1: expected libp2p-key codec 0x72, got 0x" <> showHexW64 codec
         else do
-          (codec, rest2) <- decodeUvarint rest1
-          if codec /= (0x72 :: Word64)
-            then Left $ "fromCIDv1: expected libp2p-key codec 0x72, got 0x" <> showHexW64 codec
-            else do
-              _ <- validateMultihash rest2
-              Right (PeerId rest2)
+          _ <- validateMultihash multihash
+          Right (PeerId multihash)
+
+-- | Decode the multibase encodings recognized for Peer ID CIDs.
+decodeMultibase :: Text -> Either String ByteString
+decodeMultibase t
+  | T.null t = Left "decodeMultibase: empty input"
+  | T.null payload = Left "decodeMultibase: empty payload"
+  | prefix == 'b' = decodeBase32 True payloadBytes
+  | prefix == 'B' = decodeBase32 False payloadBytes
+  | prefix == 'z' = decodeBase58Btc payloadBytes
+  | otherwise = Left "decodeMultibase: unsupported prefix"
+  where
+    prefix = T.head t
+    payload = T.tail t
+    payloadBytes = TE.encodeUtf8 payload
+
+-- | Decode unpadded RFC 4648 base32 and require its canonical letter case.
+decodeBase32 :: Bool -> ByteString -> Either String ByteString
+decodeBase32 lowercase encoded = do
+  let upper = BS.map asciiToUpper encoded
+      paddingLength = (8 - BS.length upper `mod` 8) `mod` 8
+      padded = upper <> BS.replicate paddingLength 0x3d
+  decoded <- case convertFromBase Base32 padded of
+    Left _ -> Left "decodeMultibase: invalid base32 encoding"
+    Right bytes -> Right bytes
+  let canonicalUpper = BS.filter (/= 0x3d) (convertToBase Base32 decoded)
+      canonical = if lowercase then BS.map asciiToLower canonicalUpper else canonicalUpper
+  if canonical == encoded
+    then Right decoded
+    else Left "decodeMultibase: non-canonical base32 encoding"
+
+-- | Decode canonical base58btc.
+decodeBase58Btc :: ByteString -> Either String ByteString
+decodeBase58Btc encoded = case B58.decode encoded of
+  Nothing -> Left "decodeMultibase: invalid base58btc encoding"
+  Just decoded
+    | B58.encode decoded == encoded -> Right decoded
+    | otherwise -> Left "decodeMultibase: non-canonical base58btc encoding"
+
+asciiToUpper :: Word8 -> Word8
+asciiToUpper byte
+  | byte >= 0x61 && byte <= 0x7a = byte - 0x20
+  | otherwise = byte
+
+asciiToLower :: Word8 -> Word8
+asciiToLower byte
+  | byte >= 0x41 && byte <= 0x5a = byte + 0x20
+  | otherwise = byte
 
 -- | Show a Word64 as hex.
 showHexW64 :: Word64 -> String

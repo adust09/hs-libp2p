@@ -25,6 +25,7 @@ mkPeerState :: Map.Map Topic TopicPeerState -> PeerState
 mkPeerState topicState = PeerState
   { psProtocol        = GossipSubPeer
   , psTopics          = Map.keysSet topicState
+  , psPartialTopics   = Map.empty
   , psIsOutbound      = False
   , psConnectedAt     = fixedTime
   , psTopicState      = topicState

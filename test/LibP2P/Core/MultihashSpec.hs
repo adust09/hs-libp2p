@@ -45,6 +45,16 @@ spec = do
       -- varint(200) = 0xc8 0x01
       encodeMultihash Identity input `shouldBe` BS.pack [0x00, 0xc8, 0x01] <> input
 
+  describe "encodeMultihashDigest" $ do
+    it "wraps an existing SHA-256 digest without hashing it again" $ do
+      let digest = BS.pack [0 .. 31]
+      encodeMultihashDigest SHA256 digest
+        `shouldBe` Right (BS.pack [0x12, 0x20] <> digest)
+
+    it "rejects a SHA-256 digest with the wrong length" $ do
+      encodeMultihashDigest SHA256 (BS.replicate 31 0)
+        `shouldSatisfy` isLeft
+
   describe "decodeMultihash" $ do
     it "decodes identity multihash" $ do
       let encoded = BS.pack [0x00, 0x03, 0xAA, 0xBB, 0xCC]

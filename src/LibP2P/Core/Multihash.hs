@@ -5,6 +5,7 @@
 module LibP2P.Core.Multihash
   ( HashFunction (..)
   , encodeMultihash
+  , encodeMultihashDigest
   , decodeMultihash
   , validateMultihash
   ) where
@@ -41,9 +42,26 @@ encodeMultihash hf input =
   let digest = case hf of
         Identity -> input
         SHA256 -> convert (hash input :: Digest SHA256)
-   in encodeUvarint (hashCode hf)
-        <> encodeUvarint (fromIntegral (BS.length digest))
-        <> digest
+   in encodeDigest hf digest
+
+-- | Encode a digest that was computed by an external protocol.
+encodeMultihashDigest :: HashFunction -> ByteString -> Either String ByteString
+encodeMultihashDigest hf digest = do
+  case hf of
+    SHA256
+      | BS.length digest /= 32 ->
+          Left $ "encodeMultihashDigest: SHA-256 digest must be 32 bytes, got " <> show (BS.length digest)
+    Identity
+      | BS.length digest > 42 ->
+          Left $ "encodeMultihashDigest: Identity digest must be ≤42 bytes, got " <> show (BS.length digest)
+    _ -> Right ()
+  pure (encodeDigest hf digest)
+
+encodeDigest :: HashFunction -> ByteString -> ByteString
+encodeDigest hf digest =
+  encodeUvarint (hashCode hf)
+    <> encodeUvarint (fromIntegral (BS.length digest))
+    <> digest
 
 -- | Decode a multihash into its hash function and digest/data.
 -- Note: does not reject trailing bytes after the digest.

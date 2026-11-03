@@ -117,10 +117,10 @@ spec = describe "circuit relay reservation refresh" $ do
     -- Relay grants a short-lived reservation so the test doesn't have to
     -- wait anywhere near a real-world expiry to see a refresh happen.
     let relayConfig = defaultRelayConfig { rcReservationDuration = 2 }
-        natConfig = NATConfig
-          { ncRelayConfig        = relayConfig
+        natConfig = defaultNATConfig
+          { ncRelayConfig = relayConfig
           , ncReservationRefresh = fastRefreshConfig
-              , ncDCUtRUpgrade = defaultDCUtRUpgradeConfig
+          , ncDCUtRUpgrade = defaultDCUtRUpgradeConfig
           }
     -- Relay R
     (pidR, kpR) <- mkTestIdentity
@@ -229,7 +229,7 @@ spec = describe "circuit relay reservation refresh" $ do
     -- connection whose peer is the relay.
     transport <- newTCPTransport
     rawConn <- transportDial transport addrB
-    _second <- upgradeOutbound (swIdentityKey swR) rawConn
+    _second <- upgradeOutbound (swResourceMgr swR) (swIdentityKey swR) rawConn
     bConns <- waitForConns swB pidR 2
     case bConns of
       (first' : rest@(_ : _)) -> do

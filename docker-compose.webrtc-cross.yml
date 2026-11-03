@@ -1,0 +1,35 @@
+# WebRTC Direct override for docker-compose.cross.yml.
+x-webrtc-hs-env: &webrtc-hs-env
+  TRANSPORT: webrtc-direct
+  SECURE_CHANNEL: null
+  MUXER: null
+
+x-webrtc-go-env: &webrtc-go-env
+  transport: webrtc-direct
+  security: ""
+  muxer: ""
+
+services:
+  go-listener:
+    environment:
+      <<: *webrtc-go-env
+
+  go-dialer:
+    environment:
+      <<: *webrtc-go-env
+
+  hs-listener:
+    build:
+      context: .
+      dockerfile: interop/transport/WebRTCDockerfile
+    image: hs-libp2p-webrtc-interop:latest
+    environment:
+      <<: *webrtc-hs-env
+
+  hs-dialer:
+    build:
+      context: .
+      dockerfile: interop/transport/WebRTCDockerfile
+    image: hs-libp2p-webrtc-interop:latest
+    environment:
+      <<: *webrtc-hs-env

@@ -11,7 +11,13 @@ module LibP2P.Yamux.Types
   , YamuxStream (..)
   , YamuxSession (..)
   , PingWaiter
+  , Micros
+  , mkMicros
+  , microsToInt
+  , YamuxConfig (..)
+  , defaultYamuxConfig
   , enqueueFrame
+  , enqueueDataFrame
   , enqueueFrameNumbered
   , awaitFrameWritten
   ) where
@@ -19,13 +25,46 @@ module LibP2P.Yamux.Types
 import Control.Concurrent.STM (STM, TBQueue, TMVar, TQueue, TVar, check, readTVar, writeTQueue, writeTVar)
 import Control.Monad (void)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Word (Word32, Word64)
+import LibP2P.Switch.ResourceManager
+  ( MemoryAccount (..)
+  , ResourceError
+  )
 import LibP2P.Yamux.Frame (GoAwayCode, YamuxHeader)
 
 -- | Result delivered to a pending ping waiter: Right on a matching ACK,
 -- Left when the session dies before the ACK arrives.
 type PingWaiter = TMVar (Either YamuxError ())
+
+-- | A strictly positive duration in microseconds.
+newtype Micros = Micros Int
+  deriving (Show, Eq, Ord)
+
+-- | Accept a positive number of microseconds, reject anything else.
+mkMicros :: Int -> Maybe Micros
+mkMicros n
+  | n > 0 = Just (Micros n)
+  | otherwise = Nothing
+
+-- | The duration in microseconds, as System.Timeout.timeout takes it.
+microsToInt :: Micros -> Int
+microsToInt (Micros n) = n
+
+-- | Session tunables that spec.md leaves to the implementation.
+data YamuxConfig = YamuxConfig
+  { ycKeepAlive :: !(Maybe Micros) -- ^ Time without a received frame before a keepalive Ping; Nothing disables keepalive
+  , ycPingTimeout :: !Micros -- ^ Limit for writing a Ping SYN, and again for its ACK
+  }
+  deriving (Show, Eq)
+
+defaultYamuxConfig :: YamuxConfig
+defaultYamuxConfig =
+  YamuxConfig
+    { ycKeepAlive = Just (Micros 30000000) -- 30s
+    , ycPingTimeout = Micros 10000000 -- 10s
+    }
 
 -- | SessionRole determines stream ID parity (spec.md §Stream Identification).
 -- Client uses odd IDs (1, 3, 5, ...), Server uses even IDs (2, 4, 6, ...).
@@ -52,6 +91,8 @@ data YamuxError
   | YamuxStreamReset -- ^ RST received
   | YamuxSessionShutdown -- ^ GoAway received or session closed
   | YamuxGoAway !GoAwayCode -- ^ Remote sent GoAway with specific code
+  | YamuxPingTimeout -- ^ Ping SYN not written, or its ACK not received, in time
+  | YamuxResourceLimit !ResourceError -- ^ Stream buffer reservation failed
   deriving (Show, Eq)
 
 -- | Per-stream state (spec.md §Flow Control: per-stream windows only).
@@ -62,16 +103,21 @@ data YamuxStream = YamuxStream
   , ysRecvWindow :: !(TVar Word32) -- ^ Starts at 262144 (256 KiB)
   , ysRecvBuf :: !(TQueue ByteString) -- ^ Incoming data frames
   , ysSendNotify :: !(TMVar ()) -- ^ Wakeup blocked writers on WindowUpdate
+  , ysMemoryAccount :: !MemoryAccount -- ^ Buffer ownership for this stream
   , ysSession :: !YamuxSession -- ^ Back-reference for frame sending
   }
 
 -- | Session state.
 data YamuxSession = YamuxSession
-  { ysessRole :: !SessionRole
+  { ysessConfig :: !YamuxConfig
+  , ysessRole :: !SessionRole
   , ysessNextStreamId :: !(TVar Word32) -- ^ Next ID to allocate
   , ysessStreams :: !(TVar (Map.Map Word32 YamuxStream)) -- ^ Active streams
   , ysessAcceptCh :: !(TBQueue YamuxStream) -- ^ Inbound streams, bounded to acceptBacklog (256); excess SYNs are reset
-  , ysessSendCh :: !(TQueue (YamuxHeader, ByteString)) -- ^ Outbound frame queue
+  , ysessSendCh :: !(TQueue (YamuxHeader, ByteString, Maybe MemoryAccount)) -- ^ Outbound frame queue
+  , ysessConnectionMemory :: !MemoryAccount -- ^ Memory used outside a known stream
+  , ysessInboundMemory :: !(STM (Either ResourceError MemoryAccount)) -- ^ Account factory for inbound streams
+  , ysessOutboundMemory :: !(STM (Either ResourceError MemoryAccount)) -- ^ Account factory for outbound streams
   , ysessShutdown :: !(TVar Bool) -- ^ Local GoAway sent
   , ysessRemoteGoAway :: !(TVar (Maybe GoAwayCode)) -- ^ Code of the remote GoAway, if one was received
   , ysessPings :: !(TVar (Map.Map Word32 PingWaiter)) -- ^ Pending ping responses
@@ -98,7 +144,23 @@ enqueueFrame sess hdr payload = void (enqueueFrameNumbered sess hdr payload)
 -- years at 10M frames/s), so frame numbers are compared directly.
 enqueueFrameNumbered :: YamuxSession -> YamuxHeader -> ByteString -> STM Word64
 enqueueFrameNumbered sess hdr payload = do
-  writeTQueue (ysessSendCh sess) (hdr, payload)
+  writeTQueue (ysessSendCh sess) (hdr, payload, Nothing)
+  numberQueuedFrame sess
+
+-- | Reserve a payload while it waits in the outbound queue.
+enqueueDataFrame
+  :: YamuxSession -> MemoryAccount -> YamuxHeader -> ByteString
+  -> STM (Either ResourceError Word64)
+enqueueDataFrame sess account hdr payload = do
+  reserved <- maReserve account (BS.length payload)
+  case reserved of
+    Left err -> pure (Left err)
+    Right () -> do
+      writeTQueue (ysessSendCh sess) (hdr, payload, Just account)
+      Right <$> numberQueuedFrame sess
+
+numberQueuedFrame :: YamuxSession -> STM Word64
+numberQueuedFrame sess = do
   n <- (+ 1) <$> readTVar (ysessQueuedCount sess)
   writeTVar (ysessQueuedCount sess) n
   pure n

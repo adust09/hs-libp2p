@@ -65,8 +65,10 @@ import LibP2P.MultistreamSelect.Negotiation
   , negotiateInitiator
   )
 import LibP2P.NAT.Relay.Client (connectViaRelay, makeReservation)
+import LibP2P.NAT.Relay.Limit (enforceRelayCircuitLimit, toRelayCircuitLimit)
 import LibP2P.NAT.Relay.Message
   ( HopMessage (..)
+  , RelayLimit
   , RelayStatus (..)
   , Reservation (..)
   , hopProtocolId
@@ -192,11 +194,13 @@ dialCircuit sw addr = do
   resp <- connectViaRelay stream target >>= either (failClosing stream) pure
   unless (hopStatus resp == Just RelayOK) $
     failClosing stream ("relay refused CONNECT: " ++ show (hopStatus resp))
+  limited <- limitedStream (hopLimit resp) stream
   pure RawConnection
-    { rcEndpoint   = ByteStreamEndpoint stream
+    { rcEndpoint   = ByteStreamEndpoint limited
     , rcLocalAddr  = connLocalAddr relayConn
     , rcRemoteAddr = circuitAddrOf (caRelayAddr circuit) (caRelayId circuit) (Just target)
-    , rcClose      = closeQuietly stream
+    , rcClose      = closeQuietly limited
+    , rcRelayLimit = fmap toRelayCircuitLimit (hopLimit resp)
     }
 
 -- Inbound
@@ -317,8 +321,18 @@ registerRelayLossNotifier sw relayConn listenAddr =
 --
 -- The stream is closed when no listener is registered for that relay:
 -- without a reservation we have nothing to accept the circuit into.
-acceptStopStream :: CircuitState -> Connection -> PeerId -> StreamIO -> IO ()
-acceptStopStream (CircuitState var) relayConn source stream = do
+acceptStopStream
+  :: CircuitState -> Connection -> PeerId -> Maybe RelayLimit -> StreamIO -> IO ()
+acceptStopStream (CircuitState var) relayConn source mLimit stream = do
+  limited <- limitedStream mLimit stream
+  let rawConn = RawConnection
+        { rcEndpoint   = ByteStreamEndpoint limited
+        , rcLocalAddr  = connLocalAddr relayConn
+        , rcRemoteAddr =
+            circuitAddrOf (connRemoteAddr relayConn) (connPeerId relayConn) (Just source)
+        , rcClose      = closeQuietly limited
+        , rcRelayLimit = fmap toRelayCircuitLimit mLimit
+        }
   enqueued <- atomically $ do
     queues <- readTVar var
     case Map.lookup (connPeerId relayConn) queues of
@@ -330,15 +344,7 @@ acceptStopStream (CircuitState var) relayConn source stream = do
           else do
             writeTQueue (iqQueue q) rawConn
             pure True
-  unless enqueued (closeQuietly stream)
-  where
-    rawConn = RawConnection
-      { rcEndpoint   = ByteStreamEndpoint stream
-      , rcLocalAddr  = connLocalAddr relayConn
-      , rcRemoteAddr =
-          circuitAddrOf (connRemoteAddr relayConn) (connPeerId relayConn) (Just source)
-      , rcClose      = closeQuietly stream
-      }
+  unless enqueued (closeQuietly limited)
 
 -- Helpers
 
@@ -400,6 +406,13 @@ acceptFrom q = do
       then pure Nothing
       else Just <$> readTQueue (iqQueue q)
   maybe (fail "circuit listener closed") pure result
+
+-- | Charge a relayed stream against the advertised budget. An inactive
+-- budget is returned unchanged; the clock starts here, once hop or stop
+-- has completed and the stream is the circuit.
+limitedStream :: Maybe RelayLimit -> StreamIO -> IO StreamIO
+limitedStream mLimit =
+  enforceRelayCircuitLimit (fmap toRelayCircuitLimit mLimit)
 
 -- | Close a stream, ignoring failures from an already-dead session.
 closeQuietly :: StreamIO -> IO ()

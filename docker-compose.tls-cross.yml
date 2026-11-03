@@ -1,0 +1,17 @@
+# Override the TCP cross-implementation test to require TLS 1.3 instead of Noise.
+services:
+  go-listener:
+    environment:
+      security: tls
+
+  hs-dialer:
+    environment:
+      SECURE_CHANNEL: tls
+
+  hs-listener:
+    environment:
+      SECURE_CHANNEL: tls
+
+  go-dialer:
+    environment:
+      security: tls

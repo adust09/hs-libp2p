@@ -14,7 +14,13 @@ module LibP2P.DHT.API
   ) where
 
 import Control.Concurrent.Async (mapConcurrently)
-import Control.Exception (SomeException, catch)
+import Control.Exception
+  ( SomeAsyncException
+  , SomeException
+  , catch
+  , fromException
+  , tryJust
+  )
 import Control.Monad (void)
 import Data.ByteString (ByteString)
 import Data.Time (getCurrentTime)
@@ -29,6 +35,11 @@ import LibP2P.DHT
   , storeRecord
   )
 import LibP2P.DHT.Lookup (iterativeFindNode, iterativeGetProviders, iterativeGetValue)
+import LibP2P.DHT.Maintenance
+  ( ensureProviderWorker
+  , nextLocalProviderBatch
+  , rememberLocalProvider
+  )
 import LibP2P.DHT.Message
 import LibP2P.DHT.Types (BucketEntry (..), ConnectionType (..), entryPeerId, kValue)
 import LibP2P.Multiaddr (Multiaddr, toBytes)
@@ -40,10 +51,30 @@ import LibP2P.Multiaddr (Multiaddr, toBytes)
 -- listen addresses are included so remote peers can dial back.
 provide :: DHTNode -> [Multiaddr] -> ByteString -> IO ()
 provide node addrs key = do
-  -- Find the k closest peers to this content key via iterative lookup
-  closest <- iterativeFindNode node (PeerId key)
+  rememberLocalProvider (dhtMaintenance node) key addrs
+  ensureProviderWorker
+    (dhtMaintenance node)
+    (dhtStopped node)
+    (republishProviderBatch node)
+  announceProvider node addrs key
 
-  -- Send ADD_PROVIDER to each of the k closest
+-- | Reannounce one bounded, rotating batch of locally provided keys.
+republishProviderBatch :: DHTNode -> IO Int
+republishProviderBatch node = do
+  batch <- nextLocalProviderBatch (dhtMaintenance node)
+  void $ mapConcurrently republish batch
+  pure (length batch)
+  where
+    republish (key, addrs) = void $
+      tryJust synchronousException (announceProvider node addrs key)
+
+-- | Run the normal provide lookup and announcement without registering the
+-- key again. Value records are deliberately not auto-republished here: like
+-- go-libp2p core, the DHT cannot infer application ownership of value keys;
+-- applications must republish values before their configured maximum age.
+announceProvider :: DHTNode -> [Multiaddr] -> ByteString -> IO ()
+announceProvider node addrs key = do
+  closest <- iterativeFindNode node (PeerId key)
   let providerPeer = DHTPeer (peerIdBytes (dhtLocalPeerId node))
                              (map toBytes addrs)
                              Connected
@@ -52,20 +83,23 @@ provide node addrs key = do
         , msgKey  = key
         , msgProviderPeers = [providerPeer]
         }
-
-  void $ mapConcurrently (\entry ->
-    (dhtSendRequest node) (entryPeerId entry) providerMsg
-      `catch` (\(_ :: SomeException) -> pure (Left "send failed"))
-    ) (take kValue closest)
-
-  -- Also store locally
+  void $ mapConcurrently (sendProvider providerMsg) (take kValue closest)
   now <- getCurrentTime
-  addProvider node key
-    ProviderEntry
-      { peProvider  = dhtLocalPeerId node
-      , peAddrs     = addrs
-      , peTimestamp = now
-      }
+  addProvider node key ProviderEntry
+    { peProvider  = dhtLocalPeerId node
+    , peAddrs     = addrs
+    , peTimestamp = now
+    }
+  where
+    sendProvider providerMsg entry = void $
+      tryJust synchronousException
+        (dhtSendRequest node (entryPeerId entry) providerMsg)
+
+synchronousException :: SomeException -> Maybe SomeException
+synchronousException exception =
+  case fromException exception :: Maybe SomeAsyncException of
+    Just _ -> Nothing
+    Nothing -> Just exception
 
 -- | Store a value in the DHT under the given key.
 --

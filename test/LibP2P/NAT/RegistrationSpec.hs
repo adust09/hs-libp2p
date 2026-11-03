@@ -1,6 +1,6 @@
 -- | Tests for NAT protocol handler registration on the Switch (issue #152).
 --
--- Verifies that registerNATHandlers registers the AutoNAT, Circuit Relay v2
+-- Verifies that registerNATHandlers registers AutoNAT v1/v2, Circuit Relay v2
 -- hop/stop, and DCUtR protocol handlers, and that an inbound stream for each
 -- protocol is dispatched to the right handler over a real TCP connection.
 module LibP2P.NAT.RegistrationSpec (spec) where
@@ -20,14 +20,28 @@ import LibP2P.MultistreamSelect.Negotiation
   )
 import LibP2P.NAT
   ( NATConfig (..)
+  , NATServices (..)
+  , autoNATClientStatus
+  , checkAutoNATV2
   , defaultNATConfig
   , registerNATHandlers
   )
-import LibP2P.NAT.AutoNAT (requestAutoNAT)
+import LibP2P.NAT.AutoNAT (NATStatus (..), requestAutoNAT)
 import LibP2P.NAT.AutoNAT.Message
   ( ResponseStatus (..)
   , anRespStatus
   , autoNATProtocolId
+  )
+import LibP2P.NAT.AutoNAT.V2
+  ( AutoNATV2Config (..)
+  , AutoNATV2Request (..)
+  , AutoNATV2Result (..)
+  , AutoNATV2State
+  , defaultAutoNATV2Config
+  )
+import LibP2P.NAT.AutoNAT.V2.Message
+  ( autoNATV2DialBackProtocolId
+  , autoNATV2DialProtocolId
   )
 import LibP2P.NAT.DCUtR.Message
   ( HolePunchMessage (..)
@@ -77,7 +91,7 @@ loopbackAddr = Multiaddr [IP4 0x7f000001, TCP 0]
 -- peer id and listen addrs, B's switch and peer id, and A's connection to B.
 withNATPair
   :: NATConfig
-  -> ((Switch, PeerId, [Multiaddr]) -> (Switch, PeerId) -> Connection -> IO a)
+  -> ((Switch, PeerId, [Multiaddr], AutoNATV2State) -> (Switch, PeerId) -> Connection -> IO a)
   -> IO a
 withNATPair config action = do
   -- Node B: NAT server
@@ -90,8 +104,13 @@ withNATPair config action = do
   (pidA, kpA) <- mkTestIdentity
   swA <- newSwitch pidA kpA
   addTransport swA =<< newTCPTransport
+  (_, _, natServicesA) <- registerNATHandlers swA config
+  let autoNATV2StateA = nsAutoNATV2State natServicesA
   addrsA <- switchListen swA defaultConnectionGater [loopbackAddr]
-  dialResult <- dial swA pidB [head addrsB]
+  addrB <- case addrsB of
+    address : _ -> pure address
+    [] -> fail "withNATPair: server did not bind a listen address"
+  dialResult <- dial swA pidB [addrB]
   case dialResult of
     Left err -> do
       switchClose swA
@@ -99,7 +118,7 @@ withNATPair config action = do
       fail $ "withNATPair: dial failed: " ++ show err
     Right conn -> do
       threadDelay 300000
-      result <- action (swA, pidA, addrsA) (swB, pidB) conn
+      result <- action (swA, pidA, addrsA, autoNATV2StateA) (swB, pidB) conn
       switchClose swA
       switchClose swB
       pure result
@@ -119,15 +138,23 @@ openProtoStream sw conn proto = do
 spec :: Spec
 spec = do
   describe "registerNATHandlers" $ do
-    it "registers AutoNAT, relay hop/stop and DCUtR protocol handlers" $ do
+    it "registers AutoNAT v1/v2, relay hop/stop and DCUtR handlers" $ do
       (pid, kp) <- mkTestIdentity
       sw <- newSwitch pid kp
-      _state <- registerNATHandlers sw defaultNATConfig
+      (_, _, natServices) <- registerNATHandlers sw defaultNATConfig
       mapM_
         (\proto -> do
           mHandler <- lookupStreamHandler sw proto
           (proto, isJust mHandler) `shouldBe` (proto, True))
-        [autoNATProtocolId, hopProtocolId, stopProtocolId, dcutrProtocolId]
+        [ autoNATProtocolId
+        , autoNATV2DialProtocolId
+        , autoNATV2DialBackProtocolId
+        , hopProtocolId
+        , stopProtocolId
+        , dcutrProtocolId
+        ]
+      autoNATClientStatus (nsAutoNATClient natServices) `shouldReturn` NATUnknown
+      switchClose sw
 
     it "registered NAT protocols appear in the local identify protocol list" $ do
       (pid, kp) <- mkTestIdentity
@@ -135,11 +162,18 @@ spec = do
       _state <- registerNATHandlers sw defaultNATConfig
       info <- buildLocalIdentify sw Nothing
       mapM_ (\proto -> idProtocols info `shouldContain` [proto])
-        [autoNATProtocolId, hopProtocolId, stopProtocolId, dcutrProtocolId]
+        [ autoNATProtocolId
+        , autoNATV2DialProtocolId
+        , autoNATV2DialBackProtocolId
+        , hopProtocolId
+        , stopProtocolId
+        , dcutrProtocolId
+        ]
+      switchClose sw
 
   describe "inbound stream dispatch" $ do
     it "dispatches /libp2p/autonat/1.0.0 to the AutoNAT handler (dial-back OK)" $ do
-      withNATPair defaultNATConfig $ \(swA, pidA, addrsA) _nodeB conn -> do
+      withNATPair defaultNATConfig $ \(swA, pidA, addrsA, _v2State) _nodeB conn -> do
         result <- timeout 10000000 $ do
           stream <- openProtoStream swA conn autoNATProtocolId
           requestAutoNAT stream pidA addrsA
@@ -148,8 +182,28 @@ spec = do
           Just (Left err) -> expectationFailure $ "autonat request failed: " ++ err
           Just (Right resp) -> anRespStatus resp `shouldBe` Just StatusOK
 
+    it "dispatches AutoNAT v2 request and dial-back protocols over TCP" $ do
+      let v2Config = defaultAutoNATV2Config
+            { an2AllowPrivateAddrs = True
+            , an2MaxDialWaitMicros = 0
+            }
+          config = defaultNATConfig { ncAutoNATV2Config = v2Config }
+      withNATPair config $ \(swA, _pidA, addrsA, v2State) _nodeB conn -> do
+        addrA <- case addrsA of
+          address : _ -> pure address
+          [] -> fail "AutoNAT v2 client did not bind a listen address"
+        result <- timeout 10000000 $
+          checkAutoNATV2 swA v2State conn
+            [AutoNATV2Request addrA True]
+        case result of
+          Nothing -> expectationFailure "AutoNAT v2 request timed out"
+          Just (Left err) -> expectationFailure $ "AutoNAT v2 request failed: " ++ err
+          Just (Right response) -> do
+            an2ResultAddr response `shouldBe` Just addrA
+            an2ResultReachability response `shouldBe` NATPublic
+
     it "dispatches /libp2p/circuit/relay/0.2.0/hop to the relay hop handler" $ do
-      withNATPair defaultNATConfig $ \(swA, _pidA, _addrsA) _nodeB conn -> do
+      withNATPair defaultNATConfig $ \(swA, _pidA, _addrsA, _v2State) _nodeB conn -> do
         result <- timeout 10000000 $ do
           stream <- openProtoStream swA conn hopProtocolId
           makeReservation stream
@@ -163,7 +217,7 @@ spec = do
       -- connection and is handed to the circuit transport. With no
       -- reservation held here there is no listener to accept it, so the
       -- observable evidence that the handler ran is the OK status.
-      withNATPair defaultNATConfig $ \(swA, pidA, _addrsA) _nodeB conn -> do
+      withNATPair defaultNATConfig $ \(swA, pidA, _addrsA, _v2State) _nodeB conn -> do
         result <- timeout 10000000 $ do
           stream <- openProtoStream swA conn stopProtocolId
           writeStopMessage stream StopMessage
@@ -179,7 +233,7 @@ spec = do
           Just (Right resp) -> stopStatus resp `shouldBe` Just RelayOK
 
     it "dispatches /libp2p/dcutr to the DCUtR handler" $ do
-      withNATPair defaultNATConfig $ \(swA, _pidA, addrsA) _nodeB conn -> do
+      withNATPair defaultNATConfig $ \(swA, _pidA, addrsA, _v2State) _nodeB conn -> do
         result <- timeout 10000000 $ do
           stream <- openProtoStream swA conn dcutrProtocolId
           writeHolePunchMessage stream HolePunchMessage

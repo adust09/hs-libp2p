@@ -1,0 +1,46 @@
+# WebRTC-enabled interop image. The default project image intentionally does
+# not require Rust because WebRTC Direct is an optional Cabal feature.
+FROM haskell:9.10-slim-bookworm AS builder
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       build-essential \
+       ca-certificates \
+       cmake \
+       curl \
+       perl \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+       | sh -s -- -y --profile minimal --default-toolchain 1.85.1
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+COPY hs-libp2p.cabal cabal.project Setup.hs LICENSE ./
+
+RUN cabal update \
+    && cabal build --disable-tests --only-dependencies exe:libp2p-interop
+
+COPY ffi/ ffi/
+COPY src/ src/
+COPY test/ test/
+COPY interop/ interop/
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/app/ffi/webrtc/target \
+    cabal build -fwebrtc --disable-tests exe:libp2p-interop \
+    && cp "$(find dist-newstyle -type f -path '*/build/libp2p-interop/libp2p-interop' | head -1)" /app/libp2p-interop \
+    && strip /app/libp2p-interop
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       libgcc-s1 \
+       libgmp10 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/libp2p-interop /usr/local/bin/libp2p-interop
+
+ENTRYPOINT ["libp2p-interop"]

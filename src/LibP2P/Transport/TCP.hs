@@ -6,6 +6,7 @@ module LibP2P.Transport.TCP
   ( newTCPTransport
   , multiaddrToHostPort
   , socketToStreamIO
+  , sockAddrToMultiaddr
   ) where
 
 import Control.Exception (onException)
@@ -126,6 +127,7 @@ mkRawConnection sock remoteAddr = do
     , rcLocalAddr = localAddr
     , rcRemoteAddr = remoteAddr
     , rcClose = NS.close sock
+    , rcRelayLimit = Nothing
     }
 
 -- | Listen on a TCP address.

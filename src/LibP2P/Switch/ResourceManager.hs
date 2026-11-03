@@ -1,330 +1,473 @@
 -- | Hierarchical resource management for the Switch.
 --
--- Implements a scope tree (System → Peer → Connection → Stream) with
--- STM-based reserve/release that atomically walks leaf→root to enforce
--- per-scope limits. If any scope exceeds its limit, the entire
--- transaction rolls back.
+-- Resources are owned by a System -> Peer -> Connection -> Stream scope tree.
+-- Reservations walk from the owning scope to the system scope in one STM
+-- transaction, so a failed ancestor check never leaves partial usage behind.
 module LibP2P.Switch.ResourceManager
-  ( -- * Direction
-    Direction (..)
-    -- * Resource tracking
+  ( Direction (..)
   , ResourceUsage (..)
   , emptyUsage
-    -- * Limits configuration
   , ResourceLimits (..)
   , noLimits
   , DefaultLimits (..)
   , defaultSystemLimits
   , defaultPeerLimits
-    -- * Scope hierarchy
+  , defaultConnectionLimits
+  , defaultStreamLimits
   , ResourceScope (..)
   , ScopeName (..)
   , ResourceError (..)
-    -- * Resource manager
+  , MemoryAccount (..)
   , ResourceManager (..)
   , newResourceManager
-    -- * Scope management
   , getOrCreatePeerScope
-    -- * Reserve / release
   , reserveConnection
   , releaseConnection
   , reserveStream
   , releaseStream
-  , reservePeerStream
-  , releasePeerStream
-    -- * Bracket patterns
+  , reserveMemory
+  , releaseMemory
+  , scopeMemoryAccount
+  , unlimitedMemoryAccount
   , withConnection
   , withStream
   ) where
 
-import Control.Concurrent.STM (STM, TVar, newTVar, readTVar, writeTVar)
-import Control.Exception (bracket_)
-import Control.Concurrent.STM (atomically)
+import Control.Concurrent.STM
+  ( STM
+  , TVar
+  , atomically
+  , modifyTVar'
+  , newTVar
+  , readTVar
+  , writeTVar
+  )
+import Control.Exception (Exception, bracket)
+import Control.Monad (unless)
 import qualified Data.Map.Strict as Map
 import LibP2P.Crypto.PeerId (PeerId)
 
--- | Direction of a connection relative to this node.
--- Defined here to avoid circular dependency with Switch.Types.
-data Direction
-  = Inbound   -- ^ Remote peer initiated the connection
-  | Outbound  -- ^ Local node initiated the connection
+-- | Direction of a resource relative to this node.
+data Direction = Inbound | Outbound
   deriving (Show, Eq)
 
--- | Tracked resource usage at a single scope.
+-- | Tracked usage aggregated at a scope.
 data ResourceUsage = ResourceUsage
-  { ruConnsInbound   :: !Int
-  , ruConnsOutbound  :: !Int
-  , ruStreamsInbound  :: !Int
+  { ruConnsInbound :: !Int
+  , ruConnsOutbound :: !Int
+  , ruStreamsInbound :: !Int
   , ruStreamsOutbound :: !Int
-  , ruMemory         :: !Int
+  , ruMemory :: !Int
   } deriving (Show, Eq)
 
--- | Zero usage.
 emptyUsage :: ResourceUsage
 emptyUsage = ResourceUsage 0 0 0 0 0
 
--- | Configurable limits per scope. Nothing = unlimited.
+-- | Configurable limits per scope. 'Nothing' means unlimited.
 data ResourceLimits = ResourceLimits
-  { rlMaxConnsInbound   :: !(Maybe Int)
-  , rlMaxConnsOutbound  :: !(Maybe Int)
-  , rlMaxConnsTotal     :: !(Maybe Int)
-  , rlMaxStreamsInbound  :: !(Maybe Int)
+  { rlMaxConnsInbound :: !(Maybe Int)
+  , rlMaxConnsOutbound :: !(Maybe Int)
+  , rlMaxConnsTotal :: !(Maybe Int)
+  , rlMaxStreamsInbound :: !(Maybe Int)
   , rlMaxStreamsOutbound :: !(Maybe Int)
-  , rlMaxStreamsTotal    :: !(Maybe Int)
-  , rlMaxMemory         :: !(Maybe Int)
+  , rlMaxStreamsTotal :: !(Maybe Int)
+  , rlMaxMemory :: !(Maybe Int)
   } deriving (Show, Eq)
 
--- | No limits (all Nothing).
 noLimits :: ResourceLimits
 noLimits = ResourceLimits Nothing Nothing Nothing Nothing Nothing Nothing Nothing
 
--- | A node in the scope hierarchy.
-data ResourceScope = ResourceScope
-  { rsName   :: !ScopeName
-  , rsUsage  :: !(TVar ResourceUsage)
-  , rsLimits :: !ResourceLimits
-  , rsParent :: !(Maybe ResourceScope)
-  }
-
--- | Scope name for debugging and identification.
+-- | Stable names make sibling connection and stream scopes distinguishable.
 data ScopeName
   = SystemScope
   | PeerScope !PeerId
-  | ConnectionScope
-  | StreamScope
-  deriving (Show, Eq)
+  | ConnectionScope !Int
+  | StreamScope !Int
+  deriving (Show, Eq, Ord)
 
--- | Resource limit violation error.
+-- | A node in the resource ownership tree.
+data ResourceScope = ResourceScope
+  { rsName :: !ScopeName
+  , rsUsage :: !(TVar ResourceUsage)
+  , rsLimits :: !ResourceLimits
+  , rsParent :: !(Maybe ResourceScope)
+  , rsChildren :: !(TVar (Map.Map Int ResourceScope))
+  , rsClosed :: !(TVar Bool)
+  }
+
+-- | Resource reservation failures.
 data ResourceError
   = ResourceLimitExceeded !ScopeName !String
+  | ResourceScopeClosed !ScopeName
+  | InvalidMemoryReservation !Int
+  | InvalidParentScope !ScopeName
   deriving (Show, Eq)
 
--- | Default limits for auto-created scopes.
+instance Exception ResourceError
+
+-- | Generic memory hooks used by buffering layers without exposing the tree.
+data MemoryAccount = MemoryAccount
+  { maReserve :: !(Int -> STM (Either ResourceError ()))
+  , maRelease :: !(Int -> STM ())
+  , maClose :: !(STM ())
+  }
+
+-- | Limits used for automatically-created scopes.
 data DefaultLimits = DefaultLimits
   { dlSystemLimits :: !ResourceLimits
-  , dlPeerLimits   :: !ResourceLimits
+  , dlPeerLimits :: !ResourceLimits
+  , dlConnectionLimits :: !ResourceLimits
+  , dlStreamLimits :: !ResourceLimits
   } deriving (Show, Eq)
 
--- | Sensible default system limits.
 defaultSystemLimits :: ResourceLimits
-defaultSystemLimits = ResourceLimits
-  { rlMaxConnsInbound   = Just 256
-  , rlMaxConnsOutbound  = Just 256
-  , rlMaxConnsTotal     = Just 512
-  , rlMaxStreamsInbound  = Just 4096
+defaultSystemLimits = noLimits
+  { rlMaxConnsInbound = Just 256
+  , rlMaxConnsOutbound = Just 256
+  , rlMaxConnsTotal = Just 512
+  , rlMaxStreamsInbound = Just 4096
   , rlMaxStreamsOutbound = Just 4096
-  , rlMaxStreamsTotal    = Just 8192
-  , rlMaxMemory         = Just (256 * 1024 * 1024)  -- 256 MiB
+  , rlMaxStreamsTotal = Just 8192
+  , rlMaxMemory = Just (256 * 1024 * 1024)
   }
 
--- | Sensible default per-peer limits.
 defaultPeerLimits :: ResourceLimits
-defaultPeerLimits = ResourceLimits
-  { rlMaxConnsInbound   = Just 4
-  , rlMaxConnsOutbound  = Just 4
-  , rlMaxConnsTotal     = Just 8
-  , rlMaxStreamsInbound  = Just 256
+defaultPeerLimits = noLimits
+  { rlMaxConnsInbound = Just 4
+  , rlMaxConnsOutbound = Just 4
+  , rlMaxConnsTotal = Just 8
+  , rlMaxStreamsInbound = Just 256
   , rlMaxStreamsOutbound = Just 256
-  , rlMaxStreamsTotal    = Just 512
-  , rlMaxMemory         = Just (16 * 1024 * 1024)  -- 16 MiB
+  , rlMaxStreamsTotal = Just 512
+  , rlMaxMemory = Just (16 * 1024 * 1024)
   }
 
--- | Top-level resource manager.
+defaultConnectionLimits :: ResourceLimits
+defaultConnectionLimits = noLimits
+
+defaultStreamLimits :: ResourceLimits
+defaultStreamLimits = noLimits
+
 data ResourceManager = ResourceManager
   { rmSystemScope :: !ResourceScope
-  , rmDefaults    :: !DefaultLimits
-  , rmPeerScopes  :: !(TVar (Map.Map PeerId ResourceScope))
+  , rmDefaults :: !DefaultLimits
+  , rmPeerScopes :: !(TVar (Map.Map PeerId ResourceScope))
+  , rmNextScopeId :: !(TVar Int)
   }
 
--- | Create a new resource manager with the given default limits.
 newResourceManager :: DefaultLimits -> IO ResourceManager
-newResourceManager defaults = do
-  usageVar <- atomically $ newTVar emptyUsage
-  peersVar <- atomically $ newTVar Map.empty
-  let systemScope = ResourceScope
-        { rsName   = SystemScope
-        , rsUsage  = usageVar
-        , rsLimits = dlSystemLimits defaults
-        , rsParent = Nothing
-        }
+newResourceManager defaults = atomically $ do
+  systemScope <- newScope SystemScope (dlSystemLimits defaults) Nothing
+  peers <- newTVar Map.empty
+  nextId <- newTVar 1
   pure ResourceManager
     { rmSystemScope = systemScope
-    , rmDefaults    = defaults
-    , rmPeerScopes  = peersVar
+    , rmDefaults = defaults
+    , rmPeerScopes = peers
+    , rmNextScopeId = nextId
     }
 
--- | Get or create a peer scope under the system scope.
+newScope :: ScopeName -> ResourceLimits -> Maybe ResourceScope -> STM ResourceScope
+newScope name limits parent = do
+  usage <- newTVar emptyUsage
+  children <- newTVar Map.empty
+  closed <- newTVar False
+  pure ResourceScope
+    { rsName = name
+    , rsUsage = usage
+    , rsLimits = limits
+    , rsParent = parent
+    , rsChildren = children
+    , rsClosed = closed
+    }
+
+nextScopeId :: ResourceManager -> STM Int
+nextScopeId rm = do
+  scopeId <- readTVar (rmNextScopeId rm)
+  writeTVar (rmNextScopeId rm) (scopeId + 1)
+  pure scopeId
+
 getOrCreatePeerScope :: ResourceManager -> PeerId -> STM ResourceScope
 getOrCreatePeerScope rm pid = do
   peers <- readTVar (rmPeerScopes rm)
   case Map.lookup pid peers of
     Just scope -> pure scope
     Nothing -> do
-      usageVar <- newTVar emptyUsage
-      let scope = ResourceScope
-            { rsName   = PeerScope pid
-            , rsUsage  = usageVar
-            , rsLimits = dlPeerLimits (rmDefaults rm)
-            , rsParent = Just (rmSystemScope rm)
-            }
+      scope <- newScope (PeerScope pid) (dlPeerLimits (rmDefaults rm))
+        (Just (rmSystemScope rm))
       writeTVar (rmPeerScopes rm) (Map.insert pid scope peers)
       pure scope
 
--- | Reserve a connection in the hierarchy (peer scope → system scope).
--- Returns Left on limit violation (STM auto-rolls back all increments).
-reserveConnection :: ResourceManager -> PeerId -> Direction -> STM (Either ResourceError ())
-reserveConnection rm pid dir = do
-  peerScope <- getOrCreatePeerScope rm pid
-  reserveConnInScope peerScope dir
+-- | Create and reserve one connection scope.
+reserveConnection
+  :: ResourceManager -> PeerId -> Direction
+  -> STM (Either ResourceError ResourceScope)
+reserveConnection rm pid direction = do
+  peer <- getOrCreatePeerScope rm pid
+  scopeId <- nextScopeId rm
+  scope <- newScope (ConnectionScope scopeId)
+    (dlConnectionLimits (rmDefaults rm)) (Just peer)
+  result <- reserveUsage scope (incrementConnection direction)
+  case result of
+    Left err -> dropPeerIfUnused rm peer >> pure (Left err)
+    Right () -> attachChild peer scopeId scope >> pure (Right scope)
 
--- | Release a connection in the hierarchy (peer scope → system scope).
-releaseConnection :: ResourceManager -> PeerId -> Direction -> STM ()
-releaseConnection rm pid dir = do
-  peers <- readTVar (rmPeerScopes rm)
-  case Map.lookup pid peers of
-    Nothing -> pure ()
-    Just peerScope -> releaseConnInScope peerScope dir
+-- | Close a connection and every stream it owns. Idempotent.
+releaseConnection :: ResourceManager -> ResourceScope -> STM ()
+releaseConnection rm scope = case rsName scope of
+  ConnectionScope _ -> closeOwnedScope rm scope
+  _ -> pure ()
 
--- | Reserve a stream in the given scope (walks up to parent).
-reserveStream :: ResourceScope -> Direction -> STM (Either ResourceError ())
-reserveStream scope dir = reserveStreamInScope scope dir
+-- | Create and reserve one stream below a connection scope.
+reserveStream
+  :: ResourceManager -> ResourceScope -> Direction
+  -> STM (Either ResourceError ResourceScope)
+reserveStream rm connection direction = case rsName connection of
+  ConnectionScope _ -> do
+    scopeId <- nextScopeId rm
+    scope <- newScope (StreamScope scopeId)
+      (dlStreamLimits (rmDefaults rm)) (Just connection)
+    result <- reserveUsage scope (incrementStream direction)
+    case result of
+      Left err -> pure (Left err)
+      Right () -> attachChild connection scopeId scope >> pure (Right scope)
+  name -> pure (Left (InvalidParentScope name))
 
--- | Release a stream in the given scope (walks up to parent).
-releaseStream :: ResourceScope -> Direction -> STM ()
-releaseStream scope dir = releaseStreamInScope scope dir
+-- | Close a stream and release all usage it still owns. Idempotent.
+releaseStream :: ResourceManager -> ResourceScope -> STM ()
+releaseStream rm scope = case rsName scope of
+  StreamScope _ -> closeOwnedScope rm scope
+  _ -> pure ()
 
--- | Reserve a stream against a peer's scope (peer scope → system scope).
-reservePeerStream :: ResourceManager -> PeerId -> Direction -> STM (Either ResourceError ())
-reservePeerStream rm pid dir = do
-  peerScope <- getOrCreatePeerScope rm pid
-  reserveStream peerScope dir
+reserveMemory :: ResourceScope -> Int -> STM (Either ResourceError ())
+reserveMemory _ bytes | bytes <= 0 = pure (Left (InvalidMemoryReservation bytes))
+reserveMemory scope bytes = reserveUsage scope $ \usage ->
+  usage {ruMemory = ruMemory usage + bytes}
 
--- | Release a stream against a peer's scope (peer scope → system scope).
-releasePeerStream :: ResourceManager -> PeerId -> Direction -> STM ()
-releasePeerStream rm pid dir = do
-  peers <- readTVar (rmPeerScopes rm)
-  case Map.lookup pid peers of
-    Nothing -> pure ()
-    Just peerScope -> releaseStream peerScope dir
+releaseMemory :: ResourceScope -> Int -> STM ()
+releaseMemory _ bytes | bytes <= 0 = pure ()
+releaseMemory scope bytes = do
+  usage <- readTVar (rsUsage scope)
+  let released = min bytes (ruMemory usage)
+  subtractMemoryFromChain scope released
 
--- | Bracket: reserve connection, run action, release on exit (even on exception).
-withConnection :: ResourceManager -> PeerId -> Direction -> IO a -> IO a
-withConnection rm pid dir action =
-  bracket_
-    (atomically (reserveConnection rm pid dir) >>= either (fail . show) pure)
-    (atomically (releaseConnection rm pid dir))
-    action
+scopeMemoryAccount :: ResourceManager -> ResourceScope -> MemoryAccount
+scopeMemoryAccount rm scope = MemoryAccount
+  { maReserve = reserveMemory scope
+  , maRelease = releaseAccountMemory rm scope
+  , maClose = closeOwnedScope rm scope
+  }
 
--- | Bracket: reserve stream, run action, release on exit (even on exception).
-withStream :: ResourceScope -> Direction -> IO a -> IO a
-withStream scope dir action =
-  bracket_
-    (atomically (reserveStream scope dir) >>= either (fail . show) pure)
-    (atomically (releaseStream scope dir))
-    action
+releaseAccountMemory :: ResourceManager -> ResourceScope -> Int -> STM ()
+releaseAccountMemory rm scope bytes = do
+  releaseMemory scope bytes
+  finalizeDrainedStream rm scope
 
--- Internal: two-phase reserve for connections.
--- Phase 1: Walk leaf→root, compute new usages and check limits.
--- Phase 2: If all checks pass, commit all writes atomically.
--- This prevents phantom usage when a parent scope blocks.
-reserveConnInScope :: ResourceScope -> Direction -> STM (Either ResourceError ())
-reserveConnInScope scope dir = do
-  proposed <- collectConnUpdates scope dir
+-- | An account for standalone protocol use where no manager is installed.
+unlimitedMemoryAccount :: MemoryAccount
+unlimitedMemoryAccount = MemoryAccount
+  { maReserve = \bytes -> if bytes > 0
+      then pure (Right ())
+      else pure (Left (InvalidMemoryReservation bytes))
+  , maRelease = const (pure ())
+  , maClose = pure ()
+  }
+
+withConnection
+  :: ResourceManager -> PeerId -> Direction
+  -> (ResourceScope -> IO a) -> IO a
+withConnection rm pid direction = bracket acquire release
+  where
+    acquire = atomically (reserveConnection rm pid direction)
+      >>= either (fail . show) pure
+    release = atomically . releaseConnection rm
+
+withStream
+  :: ResourceManager -> ResourceScope -> Direction
+  -> (ResourceScope -> IO a) -> IO a
+withStream rm connection direction = bracket acquire release
+  where
+    acquire = atomically (reserveStream rm connection direction)
+      >>= either (fail . show) pure
+    release = atomically . releaseStream rm
+
+attachChild :: ResourceScope -> Int -> ResourceScope -> STM ()
+attachChild parent scopeId child =
+  modifyTVar' (rsChildren parent) (Map.insert scopeId child)
+
+reserveUsage
+  :: ResourceScope -> (ResourceUsage -> ResourceUsage)
+  -> STM (Either ResourceError ())
+reserveUsage scope update = do
+  proposed <- collectUpdates scope update
   case proposed of
     Left err -> pure (Left err)
     Right updates -> do
-      mapM_ (\(s, u) -> writeTVar (rsUsage s) u) updates
+      mapM_ (uncurry writeScopeUsage) updates
       pure (Right ())
 
--- Collect proposed (scope, newUsage) pairs from leaf to root.
--- Returns Left if any scope exceeds its limit.
-collectConnUpdates :: ResourceScope -> Direction -> STM (Either ResourceError [(ResourceScope, ResourceUsage)])
-collectConnUpdates scope dir = do
-  usage <- readTVar (rsUsage scope)
-  let (newUsage, checkField, dirName) = case dir of
-        Inbound  -> (usage { ruConnsInbound = ruConnsInbound usage + 1 },
-                     ruConnsInbound, "inbound connections")
-        Outbound -> (usage { ruConnsOutbound = ruConnsOutbound usage + 1 },
-                     ruConnsOutbound, "outbound connections")
-      totalConns = ruConnsInbound newUsage + ruConnsOutbound newUsage
-      limits = rsLimits scope
-  case connDirLimit dir limits of
-    Just lim | checkField newUsage > lim ->
-      pure (Left (ResourceLimitExceeded (rsName scope) dirName))
-    _ ->
-      case rlMaxConnsTotal limits of
-        Just lim | totalConns > lim ->
-          pure (Left (ResourceLimitExceeded (rsName scope) "total connections"))
-        _ -> case rsParent scope of
-          Nothing -> pure (Right [(scope, newUsage)])
-          Just parent -> do
-            parentResult <- collectConnUpdates parent dir
-            case parentResult of
-              Left err -> pure (Left err)
-              Right parentUpdates -> pure (Right ((scope, newUsage) : parentUpdates))
-  where
-    connDirLimit Inbound  = rlMaxConnsInbound
-    connDirLimit Outbound = rlMaxConnsOutbound
+writeScopeUsage :: ResourceScope -> ResourceUsage -> STM ()
+writeScopeUsage = writeTVar . rsUsage
 
--- Internal: release a connection at this scope and walk up to parent.
-releaseConnInScope :: ResourceScope -> Direction -> STM ()
-releaseConnInScope scope dir = do
-  usage <- readTVar (rsUsage scope)
-  let newUsage = case dir of
-        Inbound  -> usage { ruConnsInbound = max 0 (ruConnsInbound usage - 1) }
-        Outbound -> usage { ruConnsOutbound = max 0 (ruConnsOutbound usage - 1) }
-  writeTVar (rsUsage scope) newUsage
+collectUpdates
+  :: ResourceScope -> (ResourceUsage -> ResourceUsage)
+  -> STM (Either ResourceError [(ResourceScope, ResourceUsage)])
+collectUpdates scope update = do
+  closed <- readTVar (rsClosed scope)
+  if closed
+    then pure (Left (ResourceScopeClosed (rsName scope)))
+    else do
+      proposed <- update <$> readTVar (rsUsage scope)
+      case checkLimits scope proposed of
+        Left err -> pure (Left err)
+        Right () -> collectParentUpdates scope update proposed
+
+collectParentUpdates
+  :: ResourceScope -> (ResourceUsage -> ResourceUsage) -> ResourceUsage
+  -> STM (Either ResourceError [(ResourceScope, ResourceUsage)])
+collectParentUpdates scope update proposed = case rsParent scope of
+  Nothing -> pure (Right [(scope, proposed)])
+  Just parent -> do
+    parentResult <- collectUpdates parent update
+    pure $ ((scope, proposed) :) <$> parentResult
+
+checkLimits :: ResourceScope -> ResourceUsage -> Either ResourceError ()
+checkLimits scope usage = firstExceeded checks
+  where
+    limits = rsLimits scope
+    checks =
+      [ (rlMaxConnsInbound limits, ruConnsInbound usage, "inbound connections")
+      , (rlMaxConnsOutbound limits, ruConnsOutbound usage, "outbound connections")
+      , (rlMaxConnsTotal limits, totalConnections usage, "total connections")
+      , (rlMaxStreamsInbound limits, ruStreamsInbound usage, "inbound streams")
+      , (rlMaxStreamsOutbound limits, ruStreamsOutbound usage, "outbound streams")
+      , (rlMaxStreamsTotal limits, totalStreams usage, "total streams")
+      , (rlMaxMemory limits, ruMemory usage, "memory")
+      ]
+    firstExceeded [] = Right ()
+    firstExceeded ((Just limit, actual, label) : rest)
+      | actual > limit = Left (ResourceLimitExceeded (rsName scope) label)
+      | otherwise = firstExceeded rest
+    firstExceeded ((Nothing, _, _) : rest) = firstExceeded rest
+
+incrementConnection :: Direction -> ResourceUsage -> ResourceUsage
+incrementConnection Inbound usage =
+  usage {ruConnsInbound = ruConnsInbound usage + 1}
+incrementConnection Outbound usage =
+  usage {ruConnsOutbound = ruConnsOutbound usage + 1}
+
+incrementStream :: Direction -> ResourceUsage -> ResourceUsage
+incrementStream Inbound usage =
+  usage {ruStreamsInbound = ruStreamsInbound usage + 1}
+incrementStream Outbound usage =
+  usage {ruStreamsOutbound = ruStreamsOutbound usage + 1}
+
+totalConnections :: ResourceUsage -> Int
+totalConnections usage = ruConnsInbound usage + ruConnsOutbound usage
+
+totalStreams :: ResourceUsage -> Int
+totalStreams usage = ruStreamsInbound usage + ruStreamsOutbound usage
+
+closeOwnedScope :: ResourceManager -> ResourceScope -> STM ()
+closeOwnedScope rm scope = case rsName scope of
+  StreamScope _ -> closeStreamScope rm scope
+  _ -> closeScopeImmediately rm scope
+
+-- Keep a closing stream charged while queued payloads still own memory.
+-- Their final release completes the close without permitting new reserves.
+closeStreamScope :: ResourceManager -> ResourceScope -> STM ()
+closeStreamScope rm scope = do
+  writeTVar (rsClosed scope) True
+  finalizeDrainedStream rm scope
+
+finalizeDrainedStream :: ResourceManager -> ResourceScope -> STM ()
+finalizeDrainedStream rm scope = case rsName scope of
+  StreamScope _ -> do
+    closed <- readTVar (rsClosed scope)
+    usage <- readTVar (rsUsage scope)
+    if closed && ruMemory usage == 0 && usage /= emptyUsage
+      then finalizeScope rm scope usage
+      else pure ()
+  _ -> pure ()
+
+closeScopeImmediately :: ResourceManager -> ResourceScope -> STM ()
+closeScopeImmediately rm scope = do
+  closed <- readTVar (rsClosed scope)
+  unless closed $ do
+    usage <- readTVar (rsUsage scope)
+    markSubtreeClosed scope
+    finalizeScope rm scope usage
+
+finalizeScope :: ResourceManager -> ResourceScope -> ResourceUsage -> STM ()
+finalizeScope rm scope usage = do
+  writeTVar (rsUsage scope) emptyUsage
+  subtractUsageFromParents (rsParent scope) usage
+  detachFromParent scope
+  maybeDropOwningPeer rm scope
+
+markSubtreeClosed :: ResourceScope -> STM ()
+markSubtreeClosed scope = do
+  writeTVar (rsClosed scope) True
+  writeTVar (rsUsage scope) emptyUsage
+  children <- readTVar (rsChildren scope)
+  mapM_ markSubtreeClosed (Map.elems children)
+  writeTVar (rsChildren scope) Map.empty
+
+subtractUsageFromParents :: Maybe ResourceScope -> ResourceUsage -> STM ()
+subtractUsageFromParents Nothing _ = pure ()
+subtractUsageFromParents (Just scope) usage = do
+  modifyTVar' (rsUsage scope) (`minusUsage` usage)
+  subtractUsageFromParents (rsParent scope) usage
+
+subtractMemoryFromChain :: ResourceScope -> Int -> STM ()
+subtractMemoryFromChain _ 0 = pure ()
+subtractMemoryFromChain scope bytes = do
+  modifyTVar' (rsUsage scope) $ \usage ->
+    usage {ruMemory = max 0 (ruMemory usage - bytes)}
   case rsParent scope of
     Nothing -> pure ()
-    Just parent -> releaseConnInScope parent dir
+    Just parent -> subtractMemoryFromChain parent bytes
 
--- Internal: two-phase reserve for streams (same pattern as connections).
-reserveStreamInScope :: ResourceScope -> Direction -> STM (Either ResourceError ())
-reserveStreamInScope scope dir = do
-  proposed <- collectStreamUpdates scope dir
-  case proposed of
-    Left err -> pure (Left err)
-    Right updates -> do
-      mapM_ (\(s, u) -> writeTVar (rsUsage s) u) updates
-      pure (Right ())
-
--- Collect proposed stream updates from leaf to root.
-collectStreamUpdates :: ResourceScope -> Direction -> STM (Either ResourceError [(ResourceScope, ResourceUsage)])
-collectStreamUpdates scope dir = do
-  usage <- readTVar (rsUsage scope)
-  let (newUsage, checkField, dirName) = case dir of
-        Inbound  -> (usage { ruStreamsInbound = ruStreamsInbound usage + 1 },
-                     ruStreamsInbound, "inbound streams")
-        Outbound -> (usage { ruStreamsOutbound = ruStreamsOutbound usage + 1 },
-                     ruStreamsOutbound, "outbound streams")
-      totalStreams = ruStreamsInbound newUsage + ruStreamsOutbound newUsage
-      limits = rsLimits scope
-  case streamDirLimit dir limits of
-    Just lim | checkField newUsage > lim ->
-      pure (Left (ResourceLimitExceeded (rsName scope) dirName))
-    _ ->
-      case rlMaxStreamsTotal limits of
-        Just lim | totalStreams > lim ->
-          pure (Left (ResourceLimitExceeded (rsName scope) "total streams"))
-        _ -> case rsParent scope of
-          Nothing -> pure (Right [(scope, newUsage)])
-          Just parent -> do
-            parentResult <- collectStreamUpdates parent dir
-            case parentResult of
-              Left err -> pure (Left err)
-              Right parentUpdates -> pure (Right ((scope, newUsage) : parentUpdates))
+minusUsage :: ResourceUsage -> ResourceUsage -> ResourceUsage
+minusUsage current released = ResourceUsage
+  { ruConnsInbound = difference (ruConnsInbound current) (ruConnsInbound released)
+  , ruConnsOutbound = difference (ruConnsOutbound current) (ruConnsOutbound released)
+  , ruStreamsInbound = difference (ruStreamsInbound current) (ruStreamsInbound released)
+  , ruStreamsOutbound = difference (ruStreamsOutbound current) (ruStreamsOutbound released)
+  , ruMemory = difference (ruMemory current) (ruMemory released)
+  }
   where
-    streamDirLimit Inbound  = rlMaxStreamsInbound
-    streamDirLimit Outbound = rlMaxStreamsOutbound
+    difference a b = max 0 (a - b)
 
--- Internal: release a stream at this scope and walk up to parent.
-releaseStreamInScope :: ResourceScope -> Direction -> STM ()
-releaseStreamInScope scope dir = do
-  usage <- readTVar (rsUsage scope)
-  let newUsage = case dir of
-        Inbound  -> usage { ruStreamsInbound = max 0 (ruStreamsInbound usage - 1) }
-        Outbound -> usage { ruStreamsOutbound = max 0 (ruStreamsOutbound usage - 1) }
-  writeTVar (rsUsage scope) newUsage
-  case rsParent scope of
-    Nothing -> pure ()
-    Just parent -> releaseStreamInScope parent dir
+detachFromParent :: ResourceScope -> STM ()
+detachFromParent scope = case (scopeIdOf (rsName scope), rsParent scope) of
+  (Just scopeId, Just parent) ->
+    modifyTVar' (rsChildren parent) (Map.delete scopeId)
+  _ -> pure ()
+
+scopeIdOf :: ScopeName -> Maybe Int
+scopeIdOf (ConnectionScope scopeId) = Just scopeId
+scopeIdOf (StreamScope scopeId) = Just scopeId
+scopeIdOf _ = Nothing
+
+maybeDropOwningPeer :: ResourceManager -> ResourceScope -> STM ()
+maybeDropOwningPeer rm scope = case owningPeer scope of
+  Nothing -> pure ()
+  Just peer -> dropPeerIfUnused rm peer
+
+owningPeer :: ResourceScope -> Maybe ResourceScope
+owningPeer scope = case rsName scope of
+  PeerScope _ -> Just scope
+  _ -> rsParent scope >>= owningPeer
+
+dropPeerIfUnused :: ResourceManager -> ResourceScope -> STM ()
+dropPeerIfUnused rm peer = case rsName peer of
+  PeerScope pid -> do
+    usage <- readTVar (rsUsage peer)
+    children <- readTVar (rsChildren peer)
+    if usage == emptyUsage && Map.null children
+      then do
+        modifyTVar' (rmPeerScopes rm) (Map.delete pid)
+        writeTVar (rsClosed peer) True
+      else pure ()
+  _ -> pure ()

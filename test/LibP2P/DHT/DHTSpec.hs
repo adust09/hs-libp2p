@@ -11,6 +11,7 @@ import Control.Concurrent (ThreadId, myThreadId, threadDelay)
 import Control.Concurrent.Async (async, concurrently, wait)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
+import Control.Exception (finally)
 import Control.Monad (when)
 import Crypto.Hash (Digest, SHA256, hash)
 import Data.ByteArray (convert)
@@ -20,6 +21,7 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
 import Data.Time (addUTCTime, getCurrentTime)
+import Data.Time.Format.ISO8601 (iso8601Show)
 import Data.Word (Word8)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair (..), PublicKey (..), PrivateKey (..), KeyType (..))
@@ -41,8 +43,17 @@ import LibP2P.Switch.Types
   , Direction (..)
   , MuxerSession (..)
   , Switch (..)
+  , defaultConnectionGater
+  , defaultSwitchConfig
   )
-import LibP2P.Switch.ResourceManager (ResourceManager, newResourceManager, DefaultLimits (..), noLimits)
+import LibP2P.Switch.ResourceManager
+  ( DefaultLimits (..)
+  , MemoryAccount (..)
+  , ResourceManager
+  , newResourceManager
+  , noLimits
+  , reserveConnection
+  )
 import System.Timeout (timeout)
 
 -- | Helper: create a PeerId from raw bytes.
@@ -52,6 +63,9 @@ mkPeerId = PeerId
 -- | The local peer used for testing.
 localPid :: PeerId
 localPid = mkPeerId (BS.pack [0])
+
+recordPayload :: DHTRecord -> (BS.ByteString, BS.ByteString)
+recordPayload record = (recKey record, recValue record)
 
 -- | Remote peer for handler tests.
 remotePid :: PeerId
@@ -73,12 +87,14 @@ mkMockSwitch pid = do
   closed <- newTVarIO False
   backoffs <- newTVarIO Map.empty
   pendingDials <- newTVarIO Map.empty
+  connectionGater <- newTVarIO defaultConnectionGater
   resMgr <- mkMockResourceMgr
   peerStore <- newTVarIO Map.empty
   certifiedRecords <- newTVarIO Map.empty
   notifiers <- newTVarIO []
   disconnectNotifiers <- newTVarIO []
   listeners <- newTVarIO []
+  shutdownActions <- newTVarIO []
   pure Switch
     { swLocalPeerId  = pid
     , swIdentityKey  = dummyKeyPair
@@ -89,17 +105,21 @@ mkMockSwitch pid = do
     , swClosed       = closed
     , swDialBackoffs = backoffs
     , swPendingDials = pendingDials
+    , swConnectionGater = connectionGater
     , swResourceMgr  = resMgr
     , swPeerStore    = peerStore
     , swCertifiedRecords = certifiedRecords
     , swNotifiers    = notifiers
     , swDisconnectNotifiers = disconnectNotifiers
     , swListeners    = listeners
+    , swShutdownActions = shutdownActions
+    , swConfig       = defaultSwitchConfig
     }
 
 -- | Create a mock resource manager with no limits (tests don't need resource enforcement).
 mkMockResourceMgr :: IO ResourceManager
-mkMockResourceMgr = newResourceManager (DefaultLimits noLimits noLimits)
+mkMockResourceMgr = newResourceManager
+  (DefaultLimits noLimits noLimits noLimits noLimits)
 
 -- | Independent SHA-256 (not via DHT.Distance) for asserting the spec metric.
 sha256 :: BS.ByteString -> BS.ByteString
@@ -172,9 +192,11 @@ mkStreamPair = do
 -- | A mock Connection that hands out the given stream on the first
 -- muxOpenStream call and counts opens; later opens fail so tests can
 -- assert that the sender reuses one stream per peer.
-mkMockConnection :: PeerId -> StreamIO -> TVar Int -> IO Connection
-mkMockConnection pid stream openCountVar = do
+mkMockConnection :: Switch -> PeerId -> StreamIO -> TVar Int -> IO Connection
+mkMockConnection sw pid stream openCountVar = do
   stateVar <- newTVarIO ConnOpen
+  connScope <- atomically (reserveConnection (swResourceMgr sw) pid Outbound)
+    >>= either (fail . show) pure
   handedOut <- newTVarIO False
   let openOnce = do
         first <- atomically $ do
@@ -194,11 +216,18 @@ mkMockConnection pid stream openCountVar = do
     , connSecurity   = "/noise"
     , connMuxer      = "/yamux/1.0.0"
     , connSession    = MuxerSession
-        { muxOpenStream   = openOnce
+        { muxOpenStream = \account -> do
+            opened <- openOnce
+            pure opened
+              { streamClose = streamClose opened
+                  `finally` atomically (maClose account)
+              }
         , muxAcceptStream = fail "mock: no inbound streams"
         , muxClose        = pure ()
         }
     , connState      = stateVar
+    , connResourceScope = connScope
+    , connRelayLimit = Nothing
     }
 
 spec :: Spec
@@ -342,8 +371,29 @@ spec = do
 
       result <- readFramedMessage clientStream maxDHTMessageSize
       case result of
-        Right resp -> msgRecord resp `shouldBe` Just rec
+        Right resp -> fmap recordPayload (msgRecord resp)
+          `shouldBe` Just (key, recValue rec)
         Left err -> expectationFailure $ "Failed: " ++ err
+
+    it "GET_VALUE omits and deletes an expired stored record" $ do
+      node <- mkTestNode localPid
+      now <- getCurrentTime
+      let key = BS.pack [0xBA, 0xAD]
+          received = T.pack (iso8601Show (addUTCTime (-(49 * 3600)) now))
+          record = DHTRecord key (BS.pack [0xF0, 0x0D]) received
+      atomically $ modifyTVar' (dhtRecordStore node) (Map.insert key record)
+
+      (clientStream, serverStream) <- mkStreamPair
+      writeFramedMessage clientStream
+        (emptyDHTMessage { msgType = GetValue, msgKey = key })
+      streamClose clientStream
+      handleDHTRequest node serverStream remotePid testAddr
+
+      result <- readFramedMessage clientStream maxDHTMessageSize
+      case result of
+        Right response -> msgRecord response `shouldBe` Nothing
+        Left err -> expectationFailure $ "Failed: " ++ err
+      lookupRecord node key `shouldReturn` Nothing
 
     it "GET_VALUE without record returns closerPeers only" $ do
       node <- mkTestNode localPid
@@ -493,7 +543,8 @@ spec = do
         (emptyDHTMessage { msgType = GetValue, msgKey = key })
       r2 <- timeout 2000000 (readFramedMessage clientStream maxDHTMessageSize)
       case r2 of
-        Just (Right resp) -> msgRecord resp `shouldBe` Just rec
+        Just (Right resp) -> fmap recordPayload (msgRecord resp)
+          `shouldBe` Just (key, recValue rec)
         _ -> expectationFailure
                "handler did not serve a second request on the same stream"
 
@@ -573,7 +624,7 @@ spec = do
       serverNode <- mkTestNode remotePid
       (clientEnd, serverEnd) <- mkStreamPair
       openCountVar <- newTVarIO (0 :: Int)
-      conn <- mkMockConnection remotePid clientEnd openCountVar
+      conn <- mkMockConnection (dhtSwitch clientNode) remotePid clientEnd openCountVar
       atomically $ addConn (swConnPool (dhtSwitch clientNode)) conn
 
       -- Remote side: multistream-select responder, then the DHT handler.
@@ -596,7 +647,8 @@ spec = do
       let req2 = emptyDHTMessage { msgType = GetValue, msgKey = key }
       r2 <- timeout 2000000 (dhtSendRequest clientNode remotePid req2)
       case r2 of
-        Just (Right resp) -> msgRecord resp `shouldBe` Just rec
+        Just (Right resp) -> fmap recordPayload (msgRecord resp)
+          `shouldBe` Just (key, recValue rec)
         Just (Left err) -> expectationFailure $ "second send failed: " ++ err
         Nothing -> expectationFailure "second send timed out"
 
@@ -666,7 +718,7 @@ spec = do
       session <- newPeerSession (Just tracked)
       atomically $ writeTVar (dhtStreams node) (Map.singleton remotePid session)
       openCountVar <- newTVarIO (0 :: Int)
-      conn <- mkMockConnection remotePid tracked openCountVar
+      conn <- mkMockConnection (dhtSwitch node) remotePid tracked openCountVar
       atomically $ addConn (swConnPool (dhtSwitch node)) conn
       closeConnection (dhtSwitch node) conn
       sessions <- readTVarIO (dhtStreams node)
@@ -681,8 +733,8 @@ spec = do
       session <- newPeerSession (Just tracked)
       atomically $ writeTVar (dhtStreams node) (Map.singleton remotePid session)
       openCountVar <- newTVarIO (0 :: Int)
-      conn1 <- mkMockConnection remotePid tracked openCountVar
-      conn2 <- mkMockConnection remotePid tracked openCountVar
+      conn1 <- mkMockConnection (dhtSwitch node) remotePid tracked openCountVar
+      conn2 <- mkMockConnection (dhtSwitch node) remotePid tracked openCountVar
       atomically $ do
         addConn (swConnPool (dhtSwitch node)) conn1
         addConn (swConnPool (dhtSwitch node)) conn2
@@ -707,7 +759,7 @@ spec = do
       session <- newPeerSession (Just tracked)
       atomically $ writeTVar (dhtStreams node) (Map.singleton remotePid session)
       openCountVar <- newTVarIO (0 :: Int)
-      conn <- mkMockConnection remotePid tracked openCountVar
+      conn <- mkMockConnection (dhtSwitch node) remotePid tracked openCountVar
       let conn' = conn { connSession = (connSession conn) { muxClose = killSession } }
       atomically $ addConn (swConnPool (dhtSwitch node)) conn'
       started <- newEmptyMVar
@@ -732,7 +784,7 @@ spec = do
       session <- newPeerSession (Just stream)
       atomically $ writeTVar (dhtStreams node) (Map.singleton remotePid session)
       openCountVar <- newTVarIO (0 :: Int)
-      conn <- mkMockConnection remotePid stream openCountVar
+      conn <- mkMockConnection (dhtSwitch node) remotePid stream openCountVar
       atomically $ addConn (swConnPool (dhtSwitch node)) conn
       closeConnection (dhtSwitch node) conn
       sessions <- readTVarIO (dhtStreams node)
@@ -745,7 +797,8 @@ spec = do
           rec = DHTRecord key (BS.pack [4, 5, 6]) "2024-01-01T00:00:00Z"
       storeRecord node rec
       result <- lookupRecord node key
-      result `shouldBe` Just rec
+      fmap recordPayload result `shouldBe` Just (key, recValue rec)
+      fmap (T.null . recTimeReceived) result `shouldBe` Just False
 
     it "lookupRecord for missing key returns Nothing" $ do
       node <- mkTestNode localPid

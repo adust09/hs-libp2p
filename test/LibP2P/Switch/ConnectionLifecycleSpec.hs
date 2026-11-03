@@ -8,11 +8,11 @@ module LibP2P.Switch.ConnectionLifecycleSpec (spec) where
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (TChan, atomically, newTVarIO, readTChan, readTVar, tryReadTChan)
-import Control.Exception (SomeException, bracket, try)
+import Control.Concurrent.STM (TChan, TVar, atomically, newTVarIO, readTChan, readTVar, readTVarIO, retry, tryReadTChan, writeTVar)
+import Control.Exception (SomeException, bracket, finally, try)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
-import Data.Maybe (isJust, isNothing)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import qualified LibP2P as Public
@@ -54,13 +54,17 @@ import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (defaultConnectionGater, dispatchStream, switchListen)
 import LibP2P.Switch.ResourceManager
   ( DefaultLimits (..)
+  , MemoryAccount (..)
   , ResourceLimits (..)
   , ResourceManager (..)
   , ResourceScope (..)
   , ResourceUsage (..)
+  , defaultConnectionLimits
   , defaultPeerLimits
+  , defaultStreamLimits
   , defaultSystemLimits
   , newResourceManager
+  , reserveConnection
   )
 import LibP2P.Switch.Types
   ( ConnState (..)
@@ -108,19 +112,31 @@ peerUsage sw pid = atomically $ do
     Nothing -> pure Nothing
     Just scope -> Just <$> readTVar (rsUsage scope)
 
+newTestResourceManager :: IO ResourceManager
+newTestResourceManager = newResourceManager DefaultLimits
+  { dlSystemLimits = defaultSystemLimits
+  , dlPeerLimits = defaultPeerLimits
+  , dlConnectionLimits = defaultConnectionLimits
+  , dlStreamLimits = defaultStreamLimits
+  }
+
 -- | A switch that refuses every outbound stream reservation.
 tightOutbound :: Switch -> IO Switch
 tightOutbound sw = do
   mgr <- newResourceManager DefaultLimits
     { dlSystemLimits = defaultSystemLimits { rlMaxStreamsOutbound = Just 0 }
     , dlPeerLimits = defaultPeerLimits { rlMaxStreamsOutbound = Just 0 }
+    , dlConnectionLimits = defaultConnectionLimits
+    , dlStreamLimits = defaultStreamLimits
     }
   pure sw { swResourceMgr = mgr }
 
 -- | A dummy connection whose muxer serves in-memory streams.
-mkDummyConnection :: PeerId -> IO StreamIO -> IO Connection
-mkDummyConnection pid openAction = do
+mkDummyConnection :: Switch -> PeerId -> IO StreamIO -> IO Connection
+mkDummyConnection sw pid openAction = do
   stateVar <- newTVarIO ConnOpen
+  connScope <- atomically (reserveConnection (swResourceMgr sw) pid Outbound)
+    >>= either (fail . show) pure
   pure Connection
     { connPeerId     = pid
     , connDirection  = Outbound
@@ -129,11 +145,18 @@ mkDummyConnection pid openAction = do
     , connSecurity   = "/noise"
     , connMuxer      = "/yamux/1.0.0"
     , connSession    = MuxerSession
-        { muxOpenStream   = openAction
+        { muxOpenStream = \account -> do
+            stream <- openAction
+            pure stream
+              { streamClose = streamClose stream
+                  `finally` atomically (maClose account)
+              }
         , muxAcceptStream = fail "dummy: no inbound streams"
         , muxClose        = pure ()
         }
     , connState      = stateVar
+    , connResourceScope = connScope
+    , connRelayLimit = Nothing
     }
 
 -- | Mock transport whose dialed connection records rcClose calls in an IORef.
@@ -154,15 +177,18 @@ mkClosableMockTransport responderKP closedRef = pure Transport
             , rcLocalAddr  = addr
             , rcRemoteAddr = Multiaddr [IP4 0x7f000001, TCP 0]
             , rcClose      = pure ()
+            , rcRelayLimit = Nothing
             }
       _ <- async $ do
-        _ <- upgradeInbound responderKP rawConnB
+        rm <- newTestResourceManager
+        _ <- upgradeInbound rm responderKP rawConnB
         pure ()
       pure RawConnection
         { rcEndpoint   = ByteStreamEndpoint streamA
         , rcLocalAddr  = Multiaddr [IP4 0x7f000001, TCP 0]
         , rcRemoteAddr = addr
         , rcClose      = writeIORef closedRef True
+        , rcRelayLimit = Nothing
         }
 
 -- | Build a TCP node with Switch.
@@ -200,6 +226,66 @@ dialEventConnection sw pid addr = do
 
 readSwitchEvent :: TChan Public.SwitchEvent -> IO Public.SwitchEvent
 readSwitchEvent events = withinEventTest "read event" $ atomically $ readTChan events
+
+-- | Wrap a transport so its dialed connections can be silently frozen:
+-- while the flag is set, writes are swallowed and reads never return,
+-- but nothing is closed. This models a peer that vanished without a
+-- FIN (cable pulled, process stopped with SIGSTOP).
+mkFreezableTransport :: TVar Bool -> Transport -> Transport
+mkFreezableTransport frozen inner = inner
+  { transportDial = fmap freeze . transportDial inner
+  , transportDialFrom = \from addr -> freeze <$> transportDialFrom inner from addr
+  }
+  where
+    freeze raw = case rcEndpoint raw of
+      ByteStreamEndpoint io -> raw { rcEndpoint = ByteStreamEndpoint (gate io) }
+      NativeMuxerEndpoint _ -> raw
+    gate io = io
+      { streamWrite = \bs -> do
+          isFrozen <- readTVarIO frozen
+          if isFrozen then pure () else streamWrite io bs
+      , streamReadByte = streamReadByte io >>= held
+      , streamReadChunk = \n -> streamReadChunk io n >>= held
+      }
+    held x = atomically $ do
+      isFrozen <- readTVar frozen
+      if isFrozen then retry else pure x
+
+-- | Keepalive short enough for a silent peer to be detected well inside
+-- the test's deadline (the 30s default would outlast it).
+fastKeepAliveConfig :: Public.SwitchConfig
+fastKeepAliveConfig = Public.defaultSwitchConfig
+  { Public.scYamuxConfig = Public.defaultYamuxConfig
+      { Public.ycKeepAlive = Public.mkMicros 100000
+      , Public.ycPingTimeout = fromMaybe (error "positive literal") (Public.mkMicros 350000)
+      }
+  }
+
+-- | Run with a dialer A whose TCP connections can be frozen and a plain
+-- TCP listener B. The flag is cleared before teardown so cleanup never
+-- waits on a frozen read.
+withFreezablePeers
+  :: (TVar Bool -> Switch -> Switch -> PeerId -> PeerId -> Multiaddr -> IO ())
+  -> IO ()
+withFreezablePeers action = do
+  frozen <- newTVarIO False
+  bracket (mkFreezableNode frozen) closeNode $ \(swA, pidA) ->
+    bracket mkTCPNode closeNode $ \(swB, pidB) -> do
+      addrs <- withinEventTest "listen" $
+        Public.switchListen swB Public.defaultConnectionGater [loopbackAddr]
+      case addrs of
+        addr : _ ->
+          action frozen swA swB pidA pidB addr
+            `finally` atomically (writeTVar frozen False)
+        [] -> expectationFailure "listen returned no addresses"
+  where
+    mkFreezableNode frozen = do
+      (pid, kp) <- mkTestIdentity
+      sw <- Public.newSwitchWithConfig fastKeepAliveConfig pid kp
+      tcp <- newTCPTransport
+      addTransport sw (mkFreezableTransport frozen tcp)
+      pure (sw, pid)
+    closeNode (sw, _) = withinEventTest "cleanup" $ Public.switchClose sw
 
 spec :: Spec
 spec = do
@@ -274,9 +360,9 @@ spec = do
           -- Underlying transport was closed
           closedOk <- waitUntil 20 (readIORef closedRef)
           closedOk `shouldBe` True
-          -- Connection reservation was released
+          -- The unused peer scope was garbage-collected.
           usageAfter <- peerUsage sw (connPeerId conn)
-          fmap ruConnsOutbound usageAfter `shouldBe` Just 0
+          usageAfter `shouldBe` Nothing
 
     it "is idempotent (double close does not underflow the reservation)" $ do
       (localPid, localKP) <- mkTestIdentity
@@ -289,7 +375,7 @@ spec = do
       closeConnection sw conn
       closeConnection sw conn
       usage <- peerUsage sw (connPeerId conn)
-      fmap ruConnsOutbound usage `shouldBe` Just 0
+      usage `shouldBe` Nothing
 
   describe "remote disconnect" $ do
     it "removes the connection from the pool when the remote closes; a fresh dial succeeds" $ do
@@ -311,9 +397,9 @@ spec = do
         c <- atomically $ lookupConn (swConnPool swA) pidB
         pure (isNothing c)
       droppedOk `shouldBe` True
-      -- A's connection reservation must be released
+      -- A's unused peer scope must be garbage-collected.
       usageA <- peerUsage swA pidB
-      fmap ruConnsOutbound usageA `shouldBe` Just 0
+      usageA `shouldBe` Nothing
       -- A subsequent dial creates a fresh connection
       redialResult <- timeout 5000000 $ dial swA pidB [listenAddr]
       case redialResult of
@@ -324,6 +410,19 @@ spec = do
           (connState conn2 == connState conn) `shouldBe` False
       switchClose swA
       switchClose swB
+
+  describe "silent peer" $ do
+    it "publishes Disconnected when the remote goes silent without closing" $
+      withFreezablePeers $ \frozen swA _swB _pidA pidB addr -> do
+        events <- Public.subscribeSwitchEvents swA
+        conn <- dialEventConnection swA pidB addr
+        readSwitchEvent events `shouldReturn`
+          Public.Connected pidB Public.Outbound (connRemoteAddr conn)
+        atomically $ writeTVar frozen True
+        -- Nothing else is done: the stack itself must notice the dead peer.
+        result <- timeout 3000000 $ atomically $ readTChan events
+        result `shouldBe`
+          Just (Public.Disconnected pidB Public.Outbound (connRemoteAddr conn))
 
   describe "switchClose" $ do
     it "closes pooled connections on both sides" $ do
@@ -355,7 +454,7 @@ spec = do
       (remotePid, _remoteKP) <- mkTestIdentity
       sw <- newSwitch localPid localKP
       (sIO, _peerIO) <- mkMemoryStreamPair
-      conn <- mkDummyConnection remotePid (pure sIO)
+      conn <- mkDummyConnection sw remotePid (pure sIO)
       atomically $ addConn (swConnPool sw) conn
       result <- newStream sw conn
       case result of
@@ -383,7 +482,7 @@ spec = do
         putMVar gate ()
         takeMVar release
         streamClose remoteStream
-      conn <- mkDummyConnection remotePid (pure localStream)
+      conn <- mkDummyConnection sw remotePid (pure localStream)
       _ <- async $ requestIdentify sw conn
       takeMVar gate
       usageOpen <- peerUsage sw remotePid
@@ -401,7 +500,7 @@ spec = do
       (remotePid, _) <- mkTestIdentity
       sw <- tightOutbound =<< newSwitch localPid localKP
       opens <- newIORef (0 :: Int)
-      conn <- mkDummyConnection remotePid $ do
+      conn <- mkDummyConnection sw remotePid $ do
         modifyIORef' opens (+ 1)
         fst <$> mkMemoryStreamPair
       result <- requestIdentify sw conn
@@ -419,7 +518,7 @@ spec = do
       (localStream, remoteStream) <- mkMemoryStreamPair
       _ <- async $ negotiateResponder remoteStream
         [gossipSubProtocolId, gossipSubProtocolIdV10, floodSubProtocolId]
-      conn <- mkDummyConnection remotePid (pure localStream)
+      conn <- mkDummyConnection sw remotePid (pure localStream)
       notifiers <- atomically $ readTVar (swNotifiers sw)
       mapM_ ($ conn) notifiers
       reserved <- waitUntil 20 $ do
@@ -437,7 +536,7 @@ spec = do
       node <- newGossipSubNode sw defaultGossipSubParams
       startGossipSub node
       opens <- newIORef (0 :: Int)
-      conn <- mkDummyConnection remotePid $ do
+      conn <- mkDummyConnection sw remotePid $ do
         modifyIORef' opens (+ 1)
         fst <$> mkMemoryStreamPair
       notifiers <- atomically $ readTVar (swNotifiers sw)
@@ -461,7 +560,7 @@ spec = do
         putMVar negotiated ()
         takeMVar failRead
         streamWrite remoteStream (BS.replicate 10 0x80)
-      conn <- mkDummyConnection remotePid (pure localStream)
+      conn <- mkDummyConnection sw remotePid (pure localStream)
       notifiers <- atomically $ readTVar (swNotifiers sw)
       mapM_ ($ conn) notifiers
       takeMVar negotiated
@@ -489,8 +588,8 @@ spec = do
         [gossipSubProtocolId, gossipSubProtocolIdV10, floodSubProtocolId]
       _ <- async $ negotiateResponder remoteTwo
         [gossipSubProtocolId, gossipSubProtocolIdV10, floodSubProtocolId]
-      first <- mkDummyConnection remotePid (pure localOne)
-      owner <- mkDummyConnection remotePid (pure localTwo)
+      first <- mkDummyConnection sw remotePid (pure localOne)
+      owner <- mkDummyConnection sw remotePid (pure localTwo)
       notifiers <- atomically $ readTVar (swNotifiers sw)
       withinEventTest "first GossipSub notifier" $ mapM_ ($ first) notifiers
       withinEventTest "second GossipSub notifier" $ mapM_ ($ owner) notifiers
@@ -515,7 +614,7 @@ spec = do
       node <- newDHTNode sw DHTServer
       server <- newDHTNode sw DHTServer
       (localStream, remoteStream) <- mkMemoryStreamPair
-      conn <- mkDummyConnection remotePid (pure localStream)
+      conn <- mkDummyConnection sw remotePid (pure localStream)
       atomically $ addConn (swConnPool sw) conn
       _ <- async $ do
         _ <- negotiateResponder remoteStream [dhtProtocolId]
@@ -538,7 +637,7 @@ spec = do
       sw <- tightOutbound =<< newSwitch localPid localKP
       node <- newDHTNode sw DHTServer
       opens <- newIORef (0 :: Int)
-      conn <- mkDummyConnection remotePid $ do
+      conn <- mkDummyConnection sw remotePid $ do
         modifyIORef' opens (+ 1)
         fst <$> mkMemoryStreamPair
       atomically $ addConn (swConnPool sw) conn
@@ -555,7 +654,7 @@ spec = do
       sw <- newSwitch localPid localKP
       node <- newDHTNode sw DHTServer
       opens <- newIORef (0 :: Int)
-      conn <- mkDummyConnection remotePid $ do
+      conn <- mkDummyConnection sw remotePid $ do
         modifyIORef' opens (+ 1)
         fst <$> mkMemoryStreamPair
       atomically $ addConn (swConnPool sw) conn
@@ -574,8 +673,8 @@ spec = do
       node <- newDHTNode sw DHTServer
       server <- newDHTNode sw DHTServer
       (localStream, remoteStream) <- mkMemoryStreamPair
-      owner <- mkDummyConnection remotePid (pure localStream)
-      survivor <- mkDummyConnection remotePid (fail "survivor should not open")
+      owner <- mkDummyConnection sw remotePid (pure localStream)
+      survivor <- mkDummyConnection sw remotePid (fail "survivor should not open")
       atomically $ do
         addConn (swConnPool sw) owner
         addConn (swConnPool sw) survivor
@@ -606,7 +705,7 @@ spec = do
       setStreamHandler sw "/test/1.0.0" $ \_conn _stream -> do
         usage <- peerUsage sw remotePid
         putMVar usageMVar (fmap ruStreamsInbound usage)
-      conn <- mkDummyConnection remotePid (fail "no outbound")
+      conn <- mkDummyConnection sw remotePid (fail "no outbound")
       (clientIO, serverIO) <- mkMemoryStreamPair
       _ <- async $ negotiateInitiator clientIO ["/test/1.0.0"]
       dispatchResult <- timeout 5000000 $ dispatchStream sw conn serverIO
@@ -624,7 +723,7 @@ spec = do
       sw <- newSwitch localPid localKP
       setStreamHandler sw "/test/1.0.0" $ \_conn _stream -> pure ()
       closed <- newIORef False
-      conn <- mkDummyConnection remotePid (fail "no outbound")
+      conn <- mkDummyConnection sw remotePid (fail "no outbound")
       -- Immediate EOF: negotiateResponder returns NoProtocol without a
       -- handler, so dispatch is the only thing that can close.
       let tracked = mkByteStreamIO (\_ -> pure ()) (fail "EOF") (writeIORef closed True)
@@ -640,7 +739,7 @@ spec = do
       sw <- newSwitch localPid localKP
       setStreamHandler sw "/test/1.0.0" $ \_conn _stream -> pure ()
       closed <- newIORef False
-      conn <- mkDummyConnection remotePid (fail "no outbound")
+      conn <- mkDummyConnection sw remotePid (fail "no outbound")
       (clientIO, serverIO) <- mkMemoryStreamPair
       let tracked = serverIO { streamClose = writeIORef closed True >> streamClose serverIO }
       _ <- async $ negotiateInitiator clientIO ["/test/1.0.0"]
