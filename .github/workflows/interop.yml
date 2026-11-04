@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main, develop]
+    branches: [main, develop, 'release/**']
 
 jobs:
   transport-interop:
@@ -311,3 +311,49 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -f docker-compose.kad-dht.yml down -v
+
+  hole-punch-self-test:
+    name: hole-punch-self-test (separate NATs, TCP)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build pinned hole-punch peer image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: interop/hole-punch/Dockerfile
+          load: true
+          tags: hs-libp2p-hole-punch:latest
+          cache-from: type=gha,scope=hole-punch-peer
+          cache-to: type=gha,mode=max,scope=hole-punch-peer
+
+      - name: Build pinned NAT router image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: interop/hole-punch/router/Dockerfile
+          load: true
+          tags: hs-libp2p-hole-punch-router:latest
+          cache-from: type=gha,scope=hole-punch-router
+          cache-to: type=gha,mode=max,scope=hole-punch-router
+
+      - name: Establish and use a direct TCP connection across separate NATs
+        run: >-
+          docker compose -f docker-compose.hole-punch.yml up --no-build
+          --abort-on-container-exit --exit-code-from hs-hp-dialer
+          redis dialer-router listener-router
+          hs-hp-relay hs-hp-listener hs-hp-dialer
+
+      - name: Capture peer and router logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.hole-punch.yml logs --no-color
+
+      - name: Tear down topology and coordination state
+        if: always()
+        run: docker compose -f docker-compose.hole-punch.yml down -v --remove-orphans
