@@ -9,6 +9,7 @@ WebTransport streams are exposed directly as the native libp2p muxer.
 module LibP2P.Transport.WebTransport (
   newWebTransportTransport,
   canDialWebTransport,
+  verifyBoundHashes,
 ) where
 
 import Control.Applicative ((<|>))

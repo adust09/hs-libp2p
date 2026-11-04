@@ -3,8 +3,36 @@ module LibP2P.Transport.WebTransportSpec (spec) where
 import Control.Concurrent.Async (concurrently)
 import Control.Exception (bracket, try)
 import Control.Monad (replicateM)
+import Crypto.Error qualified as Crypto
+import Crypto.PubKey.Ed25519 qualified as Ed25519
+import Crypto.PubKey.RSA.Types qualified as RSA
+import Data.ByteArray (convert)
+import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.Hourglass
+  ( DateTime
+  , Duration (..)
+  , Hours (..)
+  , Minutes (..)
+  , NanoSeconds (..)
+  , Seconds (..)
+  , timeAdd
+  , timeConvert
+  )
 import Data.Text (Text)
+import Data.X509
+  ( Certificate (..)
+  , CertificateChain (..)
+  , DistinguishedName (..)
+  , Extensions (..)
+  , PubKey (..)
+  , PubKeyALG (..)
+  , SignatureALG (..)
+  , SignedCertificate
+  , encodeSignedObject
+  , objectToSignedExact
+  )
+import LibP2P.Core.Multihash qualified as Multihash
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair, publicKey)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes)
@@ -26,9 +54,14 @@ import LibP2P.Transport (
 import LibP2P.Transport.WebTransport (
   canDialWebTransport,
   newWebTransportTransport,
+  verifyBoundHashes,
  )
+import LibP2P.Transport.WebTransport.Certificate
+  ( verifyWebTransportCertificate
+  )
 import System.Timeout (timeout)
 import Test.Hspec
+import Time.System (timeCurrent)
 
 spec :: Spec
 spec = do
@@ -45,6 +78,55 @@ spec = do
       canDialWebTransport
         (parseAddr "/ip4/127.0.0.1/tcp/443/ws")
         `shouldBe` False
+
+  describe "WebTransport certificate verification" $ do
+    it "rejects a well-formed SHA-256 multihash for a different certificate" $ do
+      fixture <- validCertificateFixture
+      let wrongHash = sha256Multihash "different certificate"
+      verifyWebTransportCertificate [wrongHash] (fixtureChain fixture)
+        `shouldReturn` Left "WebTransport certificate hash mismatch"
+
+    it "keeps malformed hashes distinct from digest mismatches" $ do
+      fixture <- validCertificateFixture
+      verifyWebTransportCertificate [BS.replicate 34 0] (fixtureChain fixture)
+        `shouldReturn` Left "validateMultihash: 32 trailing bytes"
+
+    it "accepts any matching expected hash and rejects when none match" $ do
+      fixture <- validCertificateFixture
+      let wrongA = sha256Multihash "wrong-a"
+          wrongB = sha256Multihash "wrong-b"
+          chain = fixtureChain fixture
+          actual = fixtureHash fixture
+      verifyWebTransportCertificate [wrongA, actual] chain `shouldReturn` Right ()
+      verifyWebTransportCertificate [wrongA, wrongB] chain
+        `shouldReturn` Left "WebTransport certificate hash mismatch"
+
+    it "enforces validity duration, key type, and chain cardinality" $ do
+      now <- timeConvert <$> timeCurrent
+      valid <- certificateFixture now (-1) 1 Ed25519Fixture
+      expired <- certificateFixture now (-2) (-1) Ed25519Fixture
+      future <- certificateFixture now 1 2 Ed25519Fixture
+      tooLong <- certificateFixture now (-1) (14 * 24 + 1) Ed25519Fixture
+      rsa <- certificateFixture now (-1) 1 RSAFixture
+      verifyFixture valid `shouldReturn` Right ()
+      verifyFixture expired `shouldReturn` Left "WebTransport certificate has expired"
+      verifyFixture future `shouldReturn` Left "WebTransport certificate is not yet valid"
+      verifyFixture tooLong
+        `shouldReturn` Left "WebTransport certificate is valid for longer than 14 days"
+      verifyFixture rsa `shouldReturn` Left "WebTransport certificate must not use RSA"
+      verifyWebTransportCertificate [fixtureHash valid] (CertificateChain [])
+        `shouldReturn` Left "WebTransport TLS chain must contain exactly one certificate"
+      verifyWebTransportCertificate
+        [fixtureHash valid]
+        (CertificateChain [fixtureCertificate valid, fixtureCertificate valid])
+        `shouldReturn` Left "WebTransport TLS chain must contain exactly one certificate"
+
+    it "requires Noise to bind hashes even after TLS certificate validation" $ do
+      fixture <- validCertificateFixture
+      verifyFixture fixture `shouldReturn` Right ()
+      result <- try (verifyBoundHashes [fixtureHash fixture] [])
+        :: IO (Either IOError ())
+      result `shouldSatisfy` isLeft
 
   describe "WebTransport loopback" $ do
     it "authenticates both peers and exchanges native stream data" $
@@ -65,7 +147,9 @@ spec = do
         listenerClose
         ( \listener -> do
             listenerAddr listener `shouldSatisfy` hasCerthash
-            let tampered = replaceCerthash (listenerAddr listener) (BS.replicate 34 0)
+            let tampered = replaceCerthash
+                  (listenerAddr listener)
+                  (sha256Multihash "different certificate")
             (_, clientKey) <- generateIdentity
             client <- newWebTransportTransport clientKey
             result <-
@@ -216,6 +300,70 @@ generateIdentity = do
   result <- generateKeyPair
   keyPair <- either fail pure result
   pure (fromPublicKey (publicKey keyPair), keyPair)
+
+data FixtureKey = Ed25519Fixture | RSAFixture
+
+data CertificateFixture = CertificateFixture
+  { fixtureCertificate :: !SignedCertificate
+  , fixtureHash :: !ByteString
+  }
+
+fixtureChain :: CertificateFixture -> CertificateChain
+fixtureChain fixture = CertificateChain [fixtureCertificate fixture]
+
+validCertificateFixture :: IO CertificateFixture
+validCertificateFixture = do
+  now <- timeConvert <$> timeCurrent
+  certificateFixture now (-1) 1 Ed25519Fixture
+
+certificateFixture :: DateTime -> Int -> Int -> FixtureKey -> IO CertificateFixture
+certificateFixture now startHour endHour fixtureKey = do
+  secret <- fixedSecret
+  let signingPublic = Ed25519.toPublic secret
+      subjectPublic = case fixtureKey of
+        Ed25519Fixture -> PubKeyEd25519 signingPublic
+        RSAFixture -> PubKeyRSA (RSA.PublicKey 256 3 65537)
+      certificate = Certificate
+        { certVersion = 2
+        , certSerial = 7
+        , certSignatureAlg = signatureAlgorithm
+        , certIssuerDN = DistinguishedName []
+        , certValidity =
+            (timeAdd now (hoursDuration startHour), timeAdd now (hoursDuration endHour))
+        , certSubjectDN = DistinguishedName []
+        , certPubKey = subjectPublic
+        , certExtensions = Extensions Nothing
+        }
+      signCertificate bytes =
+        (convert (Ed25519.sign secret signingPublic bytes), signatureAlgorithm, ())
+      (signedCertificate, ()) = objectToSignedExact signCertificate certificate
+  pure CertificateFixture
+    { fixtureCertificate = signedCertificate
+    , fixtureHash = sha256Multihash (encodeSignedObject signedCertificate)
+    }
+
+fixedSecret :: IO Ed25519.SecretKey
+fixedSecret = case Crypto.eitherCryptoError (Ed25519.secretKey (BS.replicate 32 7)) of
+  Left err -> fail $ "fixed Ed25519 fixture key: " <> show err
+  Right secret -> pure secret
+
+verifyFixture :: CertificateFixture -> IO (Either String ())
+verifyFixture fixture =
+  verifyWebTransportCertificate [fixtureHash fixture] (fixtureChain fixture)
+
+sha256Multihash :: ByteString -> ByteString
+sha256Multihash = Multihash.encodeMultihash Multihash.SHA256
+
+signatureAlgorithm :: SignatureALG
+signatureAlgorithm = SignatureALG_IntrinsicHash PubKeyALG_Ed25519
+
+hoursDuration :: Int -> Duration
+hoursDuration hours =
+  Duration (Hours (fromIntegral hours)) (Minutes 0) (Seconds 0) (NanoSeconds 0)
+
+isLeft :: Either a b -> Bool
+isLeft Left{} = True
+isLeft Right{} = False
 
 parseAddr :: Text -> Multiaddr
 parseAddr text = case fromText text of
