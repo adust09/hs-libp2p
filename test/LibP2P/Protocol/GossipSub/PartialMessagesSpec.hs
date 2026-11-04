@@ -1,6 +1,9 @@
 module LibP2P.Protocol.GossipSub.PartialMessagesSpec (spec) where
 
+import Control.Concurrent.Async (async, cancel, waitCatch)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
+import Control.Exception (throwIO)
 import Control.Monad (replicateM_)
 import qualified Data.ByteString as BS
 import Data.IORef
@@ -137,8 +140,8 @@ spec = describe "GossipSub partial messages" $ do
           pure (PartialCallbackResult states [])
         config =
           (defaultPartialMessagesConfig 0 onIncoming noGossip)
-            { partialPeerGroupLimitPerTopic = 1
-            , partialPeerGroupLimitPerTopicPerPeer = 1
+            { partialPeerGroupLimitPerTopic = 2
+            , partialPeerGroupLimitPerTopicPerPeer = 2
             }
     extension <- newPartialMessagesExtension config
     installPartialMessages router extension `shouldReturn` Right ()
@@ -158,10 +161,75 @@ spec = describe "GossipSub partial messages" $ do
       emptyRPC
         { rpcPartial = Just (PartialMessage topic "group-2" (Just "b") Nothing)
         }
+    handleRPC
+      router
+      peer
+      emptyRPC
+        { rpcPartial = Just (PartialMessage topic "group-3" (Just "c") Nothing)
+        }
 
-    readIORef callbacks `shouldReturn` 1
+    readIORef callbacks `shouldReturn` 2
     peers <- readTVarIO (gsPeers router)
     psBehaviorPenalty (peers Map.! peer) `shouldBe` 1
+
+  it "applies per-peer caps without blocking another peer or group" $ do
+    (router, _) <- mkRouter
+    callbacks <- newIORef ([] :: [(PeerId, BS.ByteString)])
+    let onIncoming peer states partial = do
+          modifyIORef' callbacks ((peer, partialGroupId partial) :)
+          pure (PartialCallbackResult states [])
+        config =
+          (defaultPartialMessagesConfig 0 onIncoming noGossip)
+            { partialPeerGroupLimitPerTopic = 3
+            , partialPeerGroupLimitPerTopicPerPeer = 1
+            }
+    extension <- newPartialMessagesExtension config
+    installPartialMessages router extension `shouldReturn` Right ()
+    joinPartial router topic RequestsPartialMessages
+    let offender = mkPeer 20
+        unaffected = mkPeer 21
+    connectPeer router offender SupportsPartialMessages
+    connectPeer router unaffected SupportsPartialMessages
+    let send peer groupId = handleRPC router peer emptyRPC
+          { rpcPartial = Just (PartialMessage topic groupId (Just "data") Nothing) }
+    send offender "below-limit"
+    send offender "above-peer-limit"
+    send unaffected "independent-group"
+    readIORef callbacks `shouldReturn`
+      [(unaffected, "independent-group"), (offender, "below-limit")]
+    peers <- readTVarIO (gsPeers router)
+    psBehaviorPenalty (peers Map.! offender) `shouldBe` 1
+    psBehaviorPenalty (peers Map.! unaffected) `shouldBe` 0
+
+  it "releases callback state locks after exceptions and cancellation" $ do
+    (router, _) <- mkRouter
+    entered <- newEmptyMVar
+    continue <- newEmptyMVar
+    mode <- newIORef (0 :: Int)
+    completed <- newIORef ([] :: [BS.ByteString])
+    let onIncoming _ states partial = do
+          current <- readIORef mode
+          case current of
+            0 -> throwIO (userError "injected callback failure")
+            1 -> putMVar entered () >> takeMVar continue >> pure (PartialCallbackResult states [])
+            _ -> modifyIORef' completed (partialGroupId partial :) >> pure (PartialCallbackResult states [])
+        config = defaultPartialMessagesConfig 0 onIncoming noGossip
+    extension <- newPartialMessagesExtension config
+    installPartialMessages router extension `shouldReturn` Right ()
+    joinPartial router topic RequestsPartialMessages
+    let peer = mkPeer 22
+        send groupId = handleRPC router peer emptyRPC
+          { rpcPartial = Just (PartialMessage topic groupId (Just "data") Nothing) }
+    connectPeer router peer SupportsPartialMessages
+    _ <- waitCatch =<< async (send "throws")
+    writeIORef mode 1
+    blocked <- async (send "cancelled")
+    takeMVar entered
+    cancel blocked
+    _ <- waitCatch blocked
+    writeIORef mode 2
+    send "after-cancel"
+    readIORef completed `shouldReturn` ["after-cancel"]
 
   it "removes empty group state when its only peer disconnects" $ do
     (router, _) <- mkRouter
@@ -225,9 +293,12 @@ spec = describe "GossipSub partial messages" $ do
     Just hooks <- readTVarIO (gsPartialMessagesHooks router)
     pmhEmitGossip hooks topic [firstGossipPeer]
     readIORef gossipCalls `shouldReturn` [[firstGossipPeer]]
-    replicateM_ 4 (pmhHeartbeat hooks)
+    replicateM_ 3 (pmhHeartbeat hooks)
     pmhEmitGossip hooks topic [afterExpiryPeer]
-    readIORef gossipCalls `shouldReturn` [[firstGossipPeer]]
+    readIORef gossipCalls `shouldReturn` [[afterExpiryPeer], [firstGossipPeer]]
+    pmhHeartbeat hooks
+    pmhEmitGossip hooks topic [mkPeer 17]
+    readIORef gossipCalls `shouldReturn` [[afterExpiryPeer], [firstGossipPeer]]
 
 topic :: Topic
 topic = "blocks"

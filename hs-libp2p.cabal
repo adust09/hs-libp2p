@@ -338,6 +338,7 @@ test-suite hs-libp2p-test
     LibP2P.Protocol.GossipSub.ExtensionsSpec
     LibP2P.Protocol.GossipSub.IDontWantSpec
     LibP2P.Protocol.GossipSub.PartialMessagesSpec
+    LibP2P.Protocol.GossipSub.ManagedPartialMessagesSpec
     LibP2P.Protocol.GossipSub.PartialMessages.BitmapSpec
     LibP2P.Protocol.GossipSub.RouterSpec
     LibP2P.Protocol.GossipSub.ScoreSpec

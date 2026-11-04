@@ -45,7 +45,7 @@ import Control.Concurrent.STM
   , writeTVar
   , modifyTVar'
   )
-import Control.Exception (SomeException, catch, mask_, onException)
+import Control.Exception (SomeException, catch, finally, mask_, onException)
 import Control.Monad (void, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -416,11 +416,9 @@ handleGossipSubStream node stream pid proto mIP = do
   addPeer (gsnRouter node) pid proto False now
   mapM_ (setPeerIP (gsnRouter node) pid) mIP
   syncSignedPeerRecord node pid
-  -- Read loop
-  readLoop
   -- The inbound stream is distinct from the cached outbound stream.
   -- Do not evict the latter when only this direction reaches EOF.
-  removePeer (gsnRouter node) pid
+  readLoop `finally` removePeer (gsnRouter node) pid
   where
     readLoop = do
       result <- readRPCMessage stream maxRPCSize
@@ -596,13 +594,14 @@ subscriptionOption partialTopics topic = SubOpts
 -- (e.g. subscription announcements). Does NOT remove the peer on
 -- EOF since the inbound handler or another mechanism manages peer lifecycle.
 outboundReadLoop :: GossipSubNode -> StreamIO -> PeerId -> IORef () -> IO ()
-outboundReadLoop node stream pid token = loop
+outboundReadLoop node stream pid token =
+  loop `finally` evictCachedStream
+    (gsnStreams node) (gsnStreamMeta node) pid (Just token) stream
   where
     loop = do
       result <- readRPCMessage stream maxRPCSize
       case result of
-        Left _ -> evictCachedStream
-          (gsnStreams node) (gsnStreamMeta node) pid (Just token) stream
+        Left _ -> pure ()
         Right rpc -> do
           handleRPC (gsnRouter node) pid rpc
           loop
