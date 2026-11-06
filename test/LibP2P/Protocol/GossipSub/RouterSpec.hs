@@ -559,7 +559,7 @@ spec = do
         addPeer router sender GossipSubPeer False fixedTime
         -- Mark mid1 as seen
         atomically $ modifyTVar' (gsSeen router) $
-          Map.insert mid1 fixedTime
+          Map.insert mid1 (SeenMessage fixedTime (ValidationComplete ValidationAccept))
         handleIHave router sender [IHave "blocks" [mid1, mid2]]
         sent <- readIORef logRef
         -- Should send IWANT for mid2 only
@@ -575,7 +575,7 @@ spec = do
             mid1 = BS.pack [1, 2]
         addPeer router sender GossipSubPeer False fixedTime
         atomically $ modifyTVar' (gsSeen router) $
-          Map.insert mid1 fixedTime
+          Map.insert mid1 (SeenMessage fixedTime (ValidationComplete ValidationAccept))
         handleIHave router sender [IHave "blocks" [mid1]]
         sent <- readIORef logRef
         -- Should not send any IWANT

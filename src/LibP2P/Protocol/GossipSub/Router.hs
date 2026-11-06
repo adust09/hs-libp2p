@@ -46,7 +46,7 @@ import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
 import qualified Data.Set as Set
-import Data.Time (UTCTime, addUTCTime, diffUTCTime)
+import Data.Time (UTCTime, addUTCTime)
 import Data.Word (Word64)
 import Crypto.Random (getRandomBytes)
 import List.Shuffle (sampleIO)
@@ -73,13 +73,11 @@ import LibP2P.Protocol.GossipSub.Score
   ( computeScore
   , addP7Penalty
   , captureP3b
-  , recordInvalidMessage
-  , recordFirstDelivery
-  , recordMeshDelivery
   , markPeerInMesh
   , unmarkPeerInMesh
   )
-import LibP2P.Protocol.GossipSub.Validation (validateMessage, signingBytes)
+import LibP2P.Protocol.GossipSub.Validation (signingBytes)
+import LibP2P.Protocol.GossipSub.Delivery (handlePublishedMessage)
 
 -- | Create a new GossipSub router with empty state.
 newRouter :: GossipSubParams
@@ -456,7 +454,8 @@ publish router topic payload mKeyPair = do
   -- Mark as seen and cache for IWANT/IHAVE: gossipsub-v1.0.md answers
   -- IWANT from the mcache, so our own messages must be cached too (#155).
   atomically $ do
-    modifyTVar' (gsSeen router) (Map.insert msgId now)
+    modifyTVar' (gsSeen router) $
+      Map.insert msgId (SeenMessage now (ValidationComplete ValidationAccept))
     modifyTVar' (gsMessageCache router) (cachePut msgId msg)
 
   -- Build RPC with published message and apply any live IDONTWANTs.
@@ -552,7 +551,7 @@ handleRPC' router sender rpc = do
   -- IDONTWANT is emitted immediately before validation of each first-seen
   -- large message, then the normal validation/deduplication path runs.
   mapM_ (\msg -> announceIDontWant router sender msg
-              >> handlePublishedMessage router sender msg) (rpcPublish rpc)
+              >> handlePublishedMessage router (forwardMessage router) sender msg) (rpcPublish rpc)
 
   -- Process control messages
   case rpcControl rpc of
@@ -565,115 +564,6 @@ handleRPC' router sender rpc = do
       handleIDontWant router sender (ctrlIDontWant ctrl)
 
   handlePartialMessageRPC router sender rpc
-
--- | Process a published message: verify, deduplicate, validate, forward, deliver.
---
--- Signature verification runs before deduplication so that an invalid message
--- is never cached, forwarded or delivered, and never poisons the seen cache for
--- the genuine message with the same ID.
-handlePublishedMessage :: GossipSubRouter -> PeerId -> PubSubMessage -> IO ()
-handlePublishedMessage router sender msg =
-  case validateMessage (paramSignaturePolicy (gsParams router)) msg of
-    Left _err -> rejectMessage router sender msg
-    Right ()  -> do
-      let msgId = paramMessageIdFn (gsParams router) msg
-          topic = msgTopic msg
-      now <- gsGetTime router
-
-      -- Deduplicate, keeping the first-seen time for the P3 near-first window
-      mFirstSeen <- atomically $ do
-        s <- readTVar (gsSeen router)
-        case Map.lookup msgId s of
-          Just firstSeen -> pure (Just firstSeen)
-          Nothing -> do
-            writeTVar (gsSeen router) (Map.insert msgId now s)
-            pure Nothing
-
-      -- A signature-valid delivery fulfils any outstanding IWANT promise
-      -- for this message ID (P7 promise tracking, gossipsub-v1.1.md)
-      atomically $ modifyTVar' (gsIWantPromises router) $
-        Map.filterWithKey (\(_, mid) _ -> mid /= msgId)
-
-      case mFirstSeen of
-        Just firstSeen ->
-          -- Duplicate: count as a mesh delivery (P3) when the sender is
-          -- in our mesh and delivered within the near-first window
-          creditMeshDelivery router sender topic (Just (firstSeen, now))
-        Nothing -> do
-          outcome <- runTopicValidator router sender msg
-          case outcome of
-            -- Provably invalid: drop and penalise the source (P4)
-            ValidationReject -> rejectMessage router sender msg
-            -- Undecidable: drop without penalty (extended validators,
-            -- gossipsub-v1.1.md — Ignore must not affect the score)
-            ValidationIgnore -> pure ()
-            ValidationAccept -> do
-              -- First valid delivery: P2, plus P3 for mesh senders (#156)
-              creditFirstDelivery router sender topic
-              creditMeshDelivery router sender topic Nothing
-
-              -- Cache the message for IWANT responses
-              atomically $ modifyTVar' (gsMessageCache router) $
-                cachePut msgId msg
-
-              -- Forward to mesh peers (excluding sender)
-              forwardMessage router sender msg
-
-              -- Deliver to application
-              onMsg <- readTVarIO (gsOnMessage router)
-              onMsg (msgTopic msg) msg
-
--- | Record a P2 first-message delivery for the sender.
-creditFirstDelivery :: GossipSubRouter -> PeerId -> Topic -> IO ()
-creditFirstDelivery router sender topic = atomically $
-  modifyTVar' (gsPeers router) $ Map.adjust bump sender
-  where
-    tsp = Map.findWithDefault defaultTopicScoreParams topic
-      (pspTopicParams (gsScoreParams router))
-    bump ps =
-      let tps = Map.findWithDefault defaultTopicPeerState topic (psTopicState ps)
-      in ps { psTopicState =
-                Map.insert topic (recordFirstDelivery tsp tps) (psTopicState ps) }
-
--- | Record a P3 mesh delivery for a sender in our mesh. For duplicates,
--- the delivery only counts inside the near-first window after the first
--- sighting (gossipsub-v1.1.md mesh message delivery rate).
-creditMeshDelivery :: GossipSubRouter -> PeerId -> Topic
-                   -> Maybe (UTCTime, UTCTime) -> IO ()
-creditMeshDelivery router sender topic mWindow = do
-  meshMap <- readTVarIO (gsMesh router)
-  let inMesh = Set.member sender (Map.findWithDefault Set.empty topic meshMap)
-      tsp = Map.findWithDefault defaultTopicScoreParams topic
-        (pspTopicParams (gsScoreParams router))
-      withinWindow = case mWindow of
-        Nothing -> True
-        Just (firstSeen, now) ->
-          diffUTCTime now firstSeen <= tspMeshMessageDeliveryWindow tsp
-  when (inMesh && withinWindow) $ atomically $
-    modifyTVar' (gsPeers router) $ Map.adjust
-      (\ps ->
-        let tps = Map.findWithDefault defaultTopicPeerState topic (psTopicState ps)
-        in ps { psTopicState =
-                  Map.insert topic (recordMeshDelivery tsp tps) (psTopicState ps) })
-      sender
-
--- | Run the topic validator, if one is registered. No validator means accept.
-runTopicValidator :: GossipSubRouter -> PeerId -> PubSubMessage -> IO ValidationResult
-runTopicValidator router sender msg = do
-  validators <- readTVarIO (gsValidators router)
-  case Map.lookup (msgTopic msg) validators of
-    Nothing -> pure ValidationAccept
-    Just v  -> v sender msg
-
--- | Drop a message and charge the propagation source a P4 invalid delivery.
-rejectMessage :: GossipSubRouter -> PeerId -> PubSubMessage -> IO ()
-rejectMessage router sender msg = atomically $
-  modifyTVar' (gsPeers router) $ Map.adjust bumpInvalid sender
-  where
-    topic = msgTopic msg
-    bumpInvalid ps =
-      let tps = Map.findWithDefault defaultTopicPeerState topic (psTopicState ps)
-      in ps { psTopicState = Map.insert topic (recordInvalidMessage tps) (psTopicState ps) }
 
 -- Control message handlers
 
