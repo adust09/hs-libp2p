@@ -51,7 +51,7 @@ common lang
 library
   import:          warnings, lang
   hs-source-dirs:  src
-  other-modules:   PackageInfo_hs_libp2p
+  other-modules:   PackageInfo_hs_libp2p, LibP2P.Core.Exception
   autogen-modules: PackageInfo_hs_libp2p
   if flag(webrtc)
     cpp-options:             -DWITH_WEBRTC
@@ -312,6 +312,7 @@ test-suite hs-libp2p-test
     LibP2P.DHT.APISpec
     LibP2P.DHT.DHTSpec
     LibP2P.DHT.LookupSpec
+    LibP2P.DHT.CandidateDialSpec
     LibP2P.DHT.MaintenanceSpec
     LibP2P.DHT.ValidatorSpec
     LibP2P.NAT.AutoNAT.MessageSpec

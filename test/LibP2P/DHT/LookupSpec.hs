@@ -185,7 +185,7 @@ spec = do
       sentKeys `shouldSatisfy` (not . null)
       mapM_ (`shouldBe` peerIdBytes targetPid) sentKeys
 
-    it "with local-only routing table returns local peers" $ do
+    it "should return no peers when every routing-table candidate fails" $ do
       now <- getCurrentTime
       -- Node with peers in the routing table, all network queries fail —
       -- but even a failing mock validates the request's wire format first.
@@ -197,9 +197,7 @@ spec = do
         foldl (\r e -> fst (insertPeer e r)) rt entries
 
       result <- iterativeFindNode node (mkPeerId (BS.pack [42]))
-      -- Should return peers even though network queries fail
-      length result `shouldSatisfy` (> 0)
-      length result `shouldSatisfy` (<= kValue)
+      result `shouldBe` []
 
     it "converges through mock network (3-hop)" $ do
       now <- getCurrentTime
@@ -247,7 +245,7 @@ spec = do
       result <- iterativeFindNode node targetPid
       length result `shouldBe` length peers
 
-    it "handles query failures gracefully" $ do
+    it "should discard candidates when their requests are refused" $ do
       now <- getCurrentTime
       -- All queries fail (after wire-format validation)
       node <- mkNodeWithMock localPid
@@ -258,8 +256,7 @@ spec = do
         foldl (\r e -> fst (insertPeer e r)) rt entries
 
       result <- iterativeFindNode node (mkPeerId (BS.pack [42]))
-      -- Should still return the local peers
-      length result `shouldSatisfy` (> 0)
+      result `shouldBe` []
 
     it "terminates early when total peers < k" $ do
       now <- getCurrentTime
