@@ -103,6 +103,9 @@ mkAPITestNodeWithConfig maintenanceConfig pid sentLog = do
         , dhtValidator     = defaultPermissiveValidator
         , dhtStreams        = ks
         , dhtSendRequest    = sendFunc
+        , dhtSendMessage    = \target msg -> do
+            atomically $ modifyTVar' sentLog ((target, msg) :)
+            pure (Right ())
         , dhtDisconnectHook  = hook
         , dhtStopped         = stopped
         , dhtQueryTimeout    = defaultQueryTimeoutMicros

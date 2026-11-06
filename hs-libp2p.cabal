@@ -15,6 +15,10 @@ build-type:      Custom
 extra-doc-files: README.md
 extra-source-files:
   test/fixtures/wss/*.pem
+  interop/provider-announcement/README.md
+  interop/provider-announcement/go-peer/go.mod
+  interop/provider-announcement/go-peer/go.sum
+  interop/provider-announcement/go-peer/main.go
   ffi/webrtc/Cargo.lock
   ffi/webrtc/Cargo.toml
   ffi/webrtc/hs_webrtc.h
@@ -249,6 +253,19 @@ executable libp2p-kad-dht-node
     hs-libp2p
   ghc-options: -threaded -rtsopts
 
+executable libp2p-provider-check
+  import:          warnings, lang
+  hs-source-dirs:  interop/provider-announcement
+  main-is:         Main.hs
+  build-depends:
+    base       >= 4.18 && < 5,
+    async      >= 2.2 && < 2.3,
+    bytestring >= 0.10 && < 0.13,
+    text       >= 1.2 && < 2.2,
+    time       >= 1.9 && < 2,
+    hs-libp2p
+  ghc-options: -threaded
+
 test-suite hs-libp2p-test
   import:          warnings, lang
   if flag(webrtc)
@@ -311,6 +328,7 @@ test-suite hs-libp2p-test
     LibP2P.DHT.MessageSpec
     LibP2P.DHT.APISpec
     LibP2P.DHT.DHTSpec
+    LibP2P.DHT.ProviderAnnouncementSpec
     LibP2P.DHT.LookupSpec
     LibP2P.DHT.MaintenanceSpec
     LibP2P.DHT.ValidatorSpec
