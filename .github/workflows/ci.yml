@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, develop, 'release/**']
 
 jobs:
   build:
@@ -25,9 +25,9 @@ jobs:
           path: |
             ~/.cabal/store
             dist-newstyle
-          key: ${{ runner.os }}-cabal-${{ hashFiles('hs-libp2p.cabal', 'cabal.project') }}
+          key: ${{ runner.os }}-cabal-webrtc-disabled-${{ hashFiles('hs-libp2p.cabal', 'cabal.project') }}
           restore-keys: |
-            ${{ runner.os }}-cabal-
+            ${{ runner.os }}-cabal-webrtc-disabled-
 
       - name: Install dependencies
         run: cabal update && cabal build --only-dependencies --enable-tests
@@ -40,3 +40,57 @@ jobs:
           LANG: C
           LC_ALL: C
         run: cabal test all --test-show-details=direct
+
+  webrtc-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Haskell
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: '9.10.1'
+          cabal-version: '3.12'
+
+      - name: Setup pinned Rust toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install 1.85.1 --component rustfmt
+          rustup override set 1.85.1
+
+      - name: Cache WebRTC Cabal build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cabal/store
+            dist-newstyle
+          key: ${{ runner.os }}-cabal-webrtc-enabled-${{ hashFiles('hs-libp2p.cabal', 'cabal.project', 'ffi/webrtc/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cabal-webrtc-enabled-
+
+      - name: Cache WebRTC Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ffi/webrtc/target
+          key: ${{ runner.os }}-rust-webrtc-${{ hashFiles('ffi/webrtc/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-webrtc-
+
+      - name: Test Rust WebRTC backend
+        run: cargo test --locked --manifest-path ffi/webrtc/Cargo.toml
+
+      - name: Test Haskell with WebRTC enabled
+        env:
+          LANG: C
+          LC_ALL: C
+        shell: bash
+        run: |
+          set -o pipefail
+          cabal update
+          cabal test hs-libp2p-test -fwebrtc --test-show-details=direct \
+            --test-options='--match WebRTC' | tee webrtc-test.log
+          grep -Eq '(^|[^0-9])[1-9][0-9]* examples?, 0 failures' webrtc-test.log

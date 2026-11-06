@@ -89,6 +89,18 @@ To listen on `/wss`, load a Web-PKI `Credential`, set
 `webSocketServerTLSParams = Just (webSocketServerParams credential)` on
 `defaultWebSocketConfig`, and use `newWebSocketTransportWithConfig`.
 
+AutoNAT v2 is registered together with the other NAT traversal protocols. Use
+the returned service handles to correlate the authenticated dial-back nonce:
+
+```haskell
+(_, _, natServices) <- registerNATHandlers sw defaultNATConfig
+result <- checkAutoNATV2 sw (nsAutoNATV2State natServices) connection
+  [AutoNATV2Request advertisedAddr True]
+```
+
+The final flag allows the server to request a bounded 30–100KB upload when it
+must dial an address on a different IP, preventing reflection amplification.
+
 ## Building
 
 Requires **GHC 9.10.x** (the `cacophony` dependency requires `base < 4.22`).

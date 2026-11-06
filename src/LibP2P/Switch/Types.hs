@@ -182,5 +182,6 @@ data Switch = Switch
   , swNotifiers    :: !(TVar [Connection -> IO ()])                      -- ^ Callbacks on new connection
   , swDisconnectNotifiers :: !(TVar [Connection -> IO ()])               -- ^ Callbacks on connection teardown
   , swListeners    :: !(TVar [ActiveListener])                           -- ^ Active listeners
+  , swShutdownActions :: !(TVar [IO ()])                                 -- ^ Background service cleanup actions
   , swConfig       :: !SwitchConfig                                      -- ^ Settings given at creation
   }

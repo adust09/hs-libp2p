@@ -7,7 +7,7 @@
 -- Candidates are maintained as a list sorted by XOR distance to the
 -- target key, ensuring the closest peers are always queried first.
 --
--- Bootstrap performs a self-lookup followed by per-bucket random refresh.
+-- Bootstrap performs a self-lookup followed by one valid FIND_NODE per occupied bucket.
 module LibP2P.DHT.Lookup
   ( -- * Lookup results
     LookupResult (..)
@@ -27,14 +27,12 @@ import Control.Concurrent.STM
 import Control.Exception (SomeException, catch)
 import Control.Monad (forever, void)
 import Crypto.Random (getRandomBytes)
-import Data.Bits (clearBit, setBit, shiftL, testBit, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Time (UTCTime, getCurrentTime)
-import Data.Word (Word8)
 import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import LibP2P.DHT
   ( DHTNode (..)
@@ -42,10 +40,17 @@ import LibP2P.DHT
   , Validator (..)
   , addPeerToTable
   , decodePeerAddrs
+  , lookupRecord
   )
 import LibP2P.DHT.Distance (keyToDHTKey, peerIdToKey, sortByDistance)
 import LibP2P.DHT.Message
-import LibP2P.DHT.RoutingTable (closestPeers, occupiedBuckets)
+import LibP2P.DHT.RoutingTable
+  ( RoutingTable
+  , allPeers
+  , bucketForPeer
+  , closestPeers
+  , occupiedBuckets
+  )
 import LibP2P.DHT.Types
 import System.Timeout (timeout)
 
@@ -188,11 +193,23 @@ queryPeer node wireKey queryType entry = do
 -- Same as FIND_NODE but also tracks the best value found and which peers
 -- returned it. On completion, sends PUT_VALUE to peers with outdated values.
 iterativeGetValue :: DHTNode -> Validator -> ByteString -> IO (Either String DHTRecord)
-iterativeGetValue node validator key =
-  withQueryTimeout node (Left "query timed out") (getValueUncapped node validator key)
+iterativeGetValue node validator key = do
+  stored <- lookupRecord node key
+  let local = stored >>= validRecord
+      timeoutResult = maybe (Left "query timed out") Right local
+  withQueryTimeout node timeoutResult (getValueUncapped node validator key local)
+  where
+    validRecord record = case valValidate validator key (recValue record) of
+      Left _ -> Nothing
+      Right () -> Just record
 
-getValueUncapped :: DHTNode -> Validator -> ByteString -> IO (Either String DHTRecord)
-getValueUncapped node validator key = do
+getValueUncapped
+  :: DHTNode
+  -> Validator
+  -> ByteString
+  -> Maybe DHTRecord
+  -> IO (Either String DHTRecord)
+getValueUncapped node validator key local = do
   rt <- readTVarIO (dhtRoutingTable node)
   -- The raw record key goes on the wire; distance uses its SHA-256.
   let targetKey = keyToDHTKey key
@@ -202,7 +219,7 @@ getValueUncapped node validator key = do
   candidatesVar <- newTVarIO (sortByDistance targetKey seeds)
   queriedVar    <- newTVarIO Set.empty
   knownVar      <- newTVarIO (Set.fromList (map entryPeerId seeds))
-  bestVar       <- newTVarIO (Nothing :: Maybe DHTRecord)
+  bestVar       <- newTVarIO local
   bestPeersVar  <- newTVarIO (Set.empty :: Set PeerId)
   outdatedVar   <- newTVarIO (Set.empty :: Set PeerId)
 
@@ -448,16 +465,38 @@ bootstrapRun node seeds = do
   mapM_ (addPeerToTable node) seedEntries
   _ <- findNodeUncapped node (dhtLocalPeerId node)
   rt <- readTVarIO (dhtRoutingTable node)
-  mapM_ (refreshBucket node (dhtLocalKey node)) (occupiedBuckets rt)
+  mapM_ (refreshBucket node rt) (occupiedBuckets rt)
 
--- | FIND_NODE a random key in the bucket's XOR range (specs/kad-dht).
-refreshBucket :: DHTNode -> DHTKey -> Int -> IO ()
-refreshBucket node selfKey cpl = do
-  target <- randomKadKeyInBucket selfKey cpl
-  let DHTKey wireKey = target
-  void $
-    lookupByKey node wireKey target
-      `catch` (\(_ :: SomeException) -> pure [])
+-- | FIND_NODE a valid peer ID whose SHA-256 key lies in the occupied bucket.
+--
+-- FIND_NODE carries raw peer ID bytes. Reusing an entry from the bucket keeps
+-- the request valid while the remote peer's SHA-256 transform selects the same
+-- keyspace range as our local distance calculation.
+refreshBucket :: DHTNode -> RoutingTable -> Int -> IO ()
+refreshBucket node routingTable cpl = do
+  let candidates = filter belongsToBucket (allPeers routingTable)
+  selected <- randomBucketEntry candidates
+  case selected of
+    Nothing -> pure ()
+    Just entry -> do
+      let wireKey = peerIdBytes (entryPeerId entry)
+          target = keyToDHTKey wireKey
+      void $
+        lookupByKey node wireKey target
+          `catch` (\(_ :: SomeException) -> pure [])
+ where
+  belongsToBucket entry =
+    entryPeerId entry /= dhtLocalPeerId node
+      && bucketForPeer (entryKey entry) routingTable == cpl
+
+randomBucketEntry :: [BucketEntry] -> IO (Maybe BucketEntry)
+randomBucketEntry [] = pure Nothing
+randomBucketEntry entries = do
+  randomBytes <- getRandomBytes 1
+  let randomIndex = case BS.uncons randomBytes of
+        Nothing -> 0
+        Just (byte, _) -> fromIntegral byte `mod` length entries
+  pure $ listToMaybe (drop randomIndex entries)
 
 -- | FIND_NODE whose local distance uses @targetKey@ as-is (already a
 -- kad-id) so a bucket refresh actually queries that bucket.
@@ -484,29 +523,6 @@ startBootstrap node seeds intervalMicros = do
     bootstrap node seeds
     threadDelay intervalMicros
   atomically $ writeTVar (dhtBootstrapWorker node) (Just worker)
-
--- | A kad-id whose XOR with @self@ has common prefix length @cpl@.
--- Bit @cpl@ is flipped so the key falls in that bucket; remaining bits
--- are random so successive refreshes explore the range.
-randomKadKeyInBucket :: DHTKey -> Int -> IO DHTKey
-randomKadKeyInBucket (DHTKey self) cpl = do
-  noise <- getRandomBytes 32
-  let cpl' = max 0 (min 255 cpl)
-      keepBytes = cpl' `div` 8
-      bitInByte = cpl' `mod` 8
-      prefix = BS.take keepBytes self
-      selfByte = BS.index self keepBytes
-      noiseByte = BS.index noise keepBytes
-      keepMask :: Word8
-      keepMask = if bitInByte == 0 then 0 else 0xFF `shiftL` (8 - bitInByte)
-      kept = selfByte .&. keepMask
-      flipBit = 7 - bitInByte
-      flipped = if testBit selfByte flipBit then clearBit kept flipBit else setBit kept flipBit
-      lowerMask :: Word8
-      lowerMask = (1 `shiftL` flipBit) - 1
-      mixed = flipped .|. (noiseByte .&. lowerMask)
-      rest = BS.drop (keepBytes + 1) noise
-  pure (DHTKey (prefix <> BS.singleton mixed <> rest))
 
 -- Helpers
 

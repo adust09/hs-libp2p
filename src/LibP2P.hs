@@ -16,7 +16,7 @@
 --   addTransport sw tcp
 --   registerIdentifyHandlers sw
 --   registerPingHandler sw
---   (_relayState, _circuitState) <- registerNATHandlers sw defaultNATConfig
+--   (_relayState, _circuitState, _natServices) <- registerNATHandlers sw defaultNATConfig
 --   addrs <- switchListen sw defaultConnectionGater [fromText "/ip4/127.0.0.1/tcp/0"]
 --   print addrs
 --   -- ... dial other peers, etc.
@@ -135,7 +135,10 @@ module LibP2P
   , BucketEntry
   , entryPeerId
   , entryAddrs
+  , DHTMaintenanceConfig (..)
+  , defaultDHTMaintenanceConfig
   , newDHTNode
+  , newDHTNodeWithConfig
   , stopDHTNode
   , registerDHTHandler
   , bootstrap
@@ -146,11 +149,51 @@ module LibP2P
   , findProviders
   , findPeer
 
+    -- * Discovery
+  , DiscoveryEvent (..)
+  , newDiscoveryQueue
+  , drainDiscoveryQueue
+
+    -- ** mDNS
+  , MDNSConfig (..)
+  , defaultMDNSConfig
+  , MDNSService (..)
+  , newMDNSService
+  , stopMDNSService
+
+    -- ** Rendezvous
+  , RendezvousConfig (..)
+  , defaultRendezvousConfig
+  , RendezvousError (..)
+  , registerRendezvousPoint
+  , registeredCount
+  , registerSelf
+  , unregisterSelf
+  , discover
+  , inspectRegistration
+  , pushDiscoverEvents
     -- * NAT traversal (AutoNAT, Circuit Relay v2, DCUtR)
   , NATConfig (..)
   , defaultNATConfig
+  , NATStatus (..)
+  , AutoNATClientConfig (..)
+  , defaultAutoNATClientConfig
+  , AutoNATClientService
+  , NATServices (..)
+  , startAutoNATClient
+  , autoNATClientStatus
+  , stopAutoNATClient
   , registerNATHandlers
   , registerAutoNATHandler
+  , registerAutoNATV2Handlers
+  , checkAutoNATV2
+  , AutoNATV2Config (..)
+  , defaultAutoNATV2Config
+  , AutoNATV2State
+  , AutoNATV2Request (..)
+  , AutoNATV2Result (..)
+  , autoNATV2DialProtocolId
+  , autoNATV2DialBackProtocolId
   , registerRelayHopHandler
   , registerRelayStopHandler
   , registerDCUtRHandler
@@ -195,12 +238,15 @@ import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes, toBase58, parsePeerId, toCIDv1)
 import LibP2P.DHT
-  ( DHTMode (..)
+  ( DHTMaintenanceConfig (..)
+  , DHTMode (..)
   , DHTNode
   , ProviderEntry
   , Validator (..)
+  , defaultDHTMaintenanceConfig
   , defaultValidator
   , newDHTNode
+  , newDHTNodeWithConfig
   , peAddrs
   , peProvider
   , registerDHTHandler
@@ -221,13 +267,34 @@ import LibP2P.Multiaddr (Multiaddr (..), fromText, splitP2P, toText)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO (..))
 import LibP2P.NAT
-  ( NATConfig (..)
+  ( AutoNATClientConfig (..)
+  , AutoNATClientService
+  , NATConfig (..)
+  , NATServices (..)
+  , autoNATClientStatus
+  , checkAutoNATV2
+  , defaultAutoNATClientConfig
   , defaultNATConfig
   , registerAutoNATHandler
+  , registerAutoNATV2Handlers
   , registerDCUtRHandler
   , registerNATHandlers
   , registerRelayHopHandler
   , registerRelayStopHandler
+  , startAutoNATClient
+  , stopAutoNATClient
+  )
+import LibP2P.NAT.AutoNAT (NATStatus (..))
+import LibP2P.NAT.AutoNAT.V2
+  ( AutoNATV2Config (..)
+  , AutoNATV2Request (..)
+  , AutoNATV2Result (..)
+  , AutoNATV2State
+  , defaultAutoNATV2Config
+  )
+import LibP2P.NAT.AutoNAT.V2.Message
+  ( autoNATV2DialBackProtocolId
+  , autoNATV2DialProtocolId
   )
 import LibP2P.NAT.Relay (RelayConfig (..), RelayState, defaultRelayConfig, newRelayState)
 import LibP2P.NAT.Relay.Transport
@@ -266,6 +333,30 @@ import LibP2P.Protocol.GossipSub.Types
   , PartialMessage (..)
   , PartialTopicMode (..)
   , defaultGossipSubParams
+  )
+import LibP2P.Discovery.MDNS
+  ( MDNSConfig (..)
+  , MDNSService (..)
+  , defaultMDNSConfig
+  , newMDNSService
+  , stopMDNSService
+  )
+import LibP2P.Discovery.Rendezvous
+  ( RendezvousConfig (..)
+  , RendezvousError (..)
+  , defaultRendezvousConfig
+  , discover
+  , inspectRegistration
+  , pushDiscoverEvents
+  , registerRendezvousPoint
+  , registeredCount
+  , registerSelf
+  , unregisterSelf
+  )
+import LibP2P.Discovery.Types
+  ( DiscoveryEvent (..)
+  , drainDiscoveryQueue
+  , newDiscoveryQueue
   )
 import LibP2P.Protocol.Identify
   ( identifyPeer

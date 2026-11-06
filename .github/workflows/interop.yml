@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, develop, 'release/**']
 
 jobs:
   transport-interop:
@@ -311,3 +311,107 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -f docker-compose.kad-dht.yml down -v
+
+  hole-punch-self-test:
+    name: hole-punch-self-test (separate NATs, TCP)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build pinned hole-punch peer image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: interop/hole-punch/Dockerfile
+          load: true
+          tags: hs-libp2p-hole-punch:latest
+          cache-from: type=gha,scope=hole-punch-peer
+          cache-to: type=gha,mode=max,scope=hole-punch-peer
+
+      - name: Build pinned NAT router image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: interop/hole-punch/router/Dockerfile
+          load: true
+          tags: hs-libp2p-hole-punch-router:latest
+          cache-from: type=gha,scope=hole-punch-router
+          cache-to: type=gha,mode=max,scope=hole-punch-router
+
+      - name: Establish and use a direct TCP connection across separate NATs
+        run: >-
+          docker compose -f docker-compose.hole-punch.yml up --no-build
+          --abort-on-container-exit --exit-code-from hs-hp-dialer
+          redis dialer-router listener-router
+          hs-hp-relay hs-hp-listener hs-hp-dialer
+
+      - name: Capture peer and router logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.hole-punch.yml logs --no-color
+
+      - name: Tear down topology and coordination state
+        if: always()
+        run: docker compose -f docker-compose.hole-punch.yml down -v --remove-orphans
+
+  gossipsub-interop:
+    name: gossipsub-interop (hs <-> rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build hs-libp2p GossipSub image
+        timeout-minutes: 20
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: hs-libp2p-interop:latest
+          cache-from: type=gha,scope=gossipsub-hs
+          cache-to: type=gha,mode=max,scope=gossipsub-hs
+
+      - name: Build pinned rust-libp2p GossipSub image
+        timeout-minutes: 20
+        uses: docker/build-push-action@v6
+        with:
+          context: interop/rust-peer
+          load: true
+          tags: hs-libp2p-gossipsub-rust:latest
+          cache-from: type=gha,scope=gossipsub-rust
+          cache-to: type=gha,mode=max,scope=gossipsub-rust
+
+      # The Rust listener exits zero only after it receives the Haskell payload.
+      - name: Rust listener receives the Haskell message
+        timeout-minutes: 10
+        run: >-
+          docker compose -f docker-compose.gossipsub.yml up --no-build
+          --abort-on-container-exit --exit-code-from rust-listener
+          redis rust-listener hs-dialer
+
+      - name: Reset Redis and containers between directions
+        run: docker compose -f docker-compose.gossipsub.yml down -v --remove-orphans
+
+      # The Rust dialer exits zero only after the Haskell listener replies.
+      - name: Haskell listener receives the Rust message
+        timeout-minutes: 10
+        run: >-
+          docker compose -f docker-compose.gossipsub.yml up --no-build
+          --abort-on-container-exit --exit-code-from rust-dialer
+          redis hs-listener rust-dialer
+
+      - name: Capture GossipSub logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.gossipsub.yml logs --no-color || true
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.gossipsub.yml down -v --remove-orphans

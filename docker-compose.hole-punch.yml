@@ -12,6 +12,7 @@ x-hs-env: &hs-env
   MUXER: yamux
 
 x-router: &router
+  image: hs-libp2p-hole-punch-router:latest
   build:
     context: .
     dockerfile: interop/hole-punch/router/Dockerfile
@@ -37,7 +38,7 @@ networks:
 
 services:
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     networks:
       - coordination
@@ -48,6 +49,7 @@ services:
       retries: 30
 
   hs-hp-relay:
+    image: hs-libp2p-hole-punch:latest
     build:
       context: .
       dockerfile: interop/hole-punch/Dockerfile
@@ -100,6 +102,7 @@ services:
       LAN_SUBNET: "10.131.49.128/27"
 
   hs-hp-listener:
+    image: hs-libp2p-hole-punch:latest
     build:
       context: .
       dockerfile: interop/hole-punch/Dockerfile
@@ -119,6 +122,7 @@ services:
       WAN_ROUTER_IP: "10.131.49.130"
 
   hs-hp-dialer:
+    image: hs-libp2p-hole-punch:latest
     build:
       context: .
       dockerfile: interop/hole-punch/Dockerfile
