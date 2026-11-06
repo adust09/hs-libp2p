@@ -1,5 +1,7 @@
 # Pin APT to the snapshot used to create the base image. The image digest alone
 # does not prevent Debian sid packages from changing between rebuilds.
+# deb.debian.org is a fallback for snapshot.debian.org outages; it serves
+# current sid, so pinning is only degraded while the snapshot is down.
 FROM debian:sid-slim@sha256:5ac67a4d7c0de96e83873e4dd8f7ea3b507ba292fb2cce60a0c3f73322df5cae AS pinned-debian
 
 RUN printf '%s\n' \
@@ -8,8 +10,14 @@ RUN printf '%s\n' \
        'Suites: sid' \
        'Components: main' \
        'Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp' \
+       '' \
+       'Types: deb' \
+       'URIs: http://deb.debian.org/debian' \
+       'Suites: sid' \
+       'Components: main' \
+       'Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp' \
        > /etc/apt/sources.list.d/debian.sources \
-    && printf 'Acquire::Check-Valid-Until "false";\n' \
+    && printf 'Acquire::Check-Valid-Until "false";\nAcquire::Retries "5";\n' \
        > /etc/apt/apt.conf.d/99snapshot
 
 # Build in one layer so package caches and object files never enter an image
