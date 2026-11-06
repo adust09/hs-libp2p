@@ -3,7 +3,7 @@
 # (the gossipsub mode itself is a local extension, not an upstream contract).
 #
 # Test 1 (Rust listener, HS dialer):
-#   docker compose -f docker-compose.gossipsub.yml up --build --exit-code-from hs-dialer redis rust-listener hs-dialer
+#   docker compose -f docker-compose.gossipsub.yml up --build --exit-code-from rust-listener redis rust-listener hs-dialer
 #
 # Test 2 (HS listener, Rust dialer):
 #   docker compose -f docker-compose.gossipsub.yml up --build --exit-code-from rust-dialer redis hs-listener rust-dialer
@@ -24,10 +24,8 @@ x-rust-env: &rust-env
 
 services:
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f
     command: ["redis-server", "--save", "", "--appendonly", "no"]
-    ports:
-      - "6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 1s
@@ -36,6 +34,7 @@ services:
 
   # --- Test 1: Rust listener, HS dialer ---
   rust-listener:
+    image: hs-libp2p-gossipsub-rust:latest
     build:
       context: ./interop/rust-peer
     depends_on:
@@ -46,6 +45,7 @@ services:
       IS_DIALER: "false"
 
   hs-dialer:
+    image: hs-libp2p-interop:latest
     build: .
     depends_on:
       redis:
@@ -58,6 +58,7 @@ services:
 
   # --- Test 2: HS listener, Rust dialer ---
   hs-listener:
+    image: hs-libp2p-interop:latest
     build: .
     depends_on:
       redis:
@@ -67,6 +68,7 @@ services:
       IS_DIALER: "false"
 
   rust-dialer:
+    image: hs-libp2p-gossipsub-rust:latest
     build:
       context: ./interop/rust-peer
     depends_on:
