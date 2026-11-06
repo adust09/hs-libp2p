@@ -5,19 +5,21 @@
 module LibP2P.Protocol.GossipSub.HandlerSpec (spec) where
 
 import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (Async, async, cancel)
+import Control.Concurrent.Async (Async, async, cancel, link, withAsync)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( atomically
+  , check
   , newTVarIO
   , readTVar
   , writeTVar
   )
-import Control.Exception (finally)
+import Control.Exception (bracket_, finally)
 import Control.Monad (unless)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import LibP2P.Multiaddr (Multiaddr (..))
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
@@ -119,6 +121,14 @@ testParams :: GossipSubParams
 testParams = defaultGossipSubParams
   { paramHeartbeatInterval = 10.0  -- Long interval so heartbeat doesn't interfere
   }
+
+waitForPeerTopics :: GossipSubNode -> PeerId -> Set.Set Topic -> IO Bool
+waitForPeerTopics node pid expected = do
+  result <- timeout 5000000 $ atomically $ do
+    peers <- readTVar (gsPeers (gsnRouter node))
+    let topics = psTopics <$> Map.lookup pid peers
+    check (topics == Just expected)
+  pure (maybe False (const True) result)
 
 -- | Connection whose muxer yields one stream that accepts GossipSub.
 mkGossipConn :: Switch -> PeerId -> IO (Connection, Async NegotiationResult)
@@ -495,31 +505,33 @@ spec = do
 
   describe "Two-node exchange" $ do
     it "two nodes exchange subscription announcements via memory streams" $ do
-      -- Node A
       (swA, pidA) <- mkTestSwitch
       nodeA <- newGossipSubNode swA testParams
-      -- Node B
       (swB, pidB) <- mkTestSwitch
       nodeB <- newGossipSubNode swB testParams
-      -- Create paired streams (A→B and B→A)
       (streamAtoB, streamBfromA) <- mkMemoryStreamPair
       (streamBtoA, streamAfromB) <- mkMemoryStreamPair
-      -- Spawn stream handlers
-      _ <- async $ handleGossipSubStream nodeB streamBfromA pidA GossipSubPeer Nothing
-      _ <- async $ handleGossipSubStream nodeA streamAfromB pidB GossipSubPeer Nothing
-      -- Inject cached outbound streams for sendRPC
-      atomically $ do
-        writeTVar (gsnStreams nodeA) (Map.singleton pidB streamAtoB)
-        writeTVar (gsnStreams nodeB) (Map.singleton pidA streamBtoA)
-      -- Node A subscribes to topic, which sends subscription RPCs
-      gossipJoin nodeA "shared-topic"
-      -- Give time for RPCs to propagate
-      threadDelay 500000
-      -- Node B should see A's subscription
-      peersB <- atomically $ readTVar (gsPeers (gsnRouter nodeB))
-      case Map.lookup pidA peersB of
-        Nothing -> expectationFailure "nodeB should know about nodeA"
-        Just _  -> pure ()  -- Peer registered by handleGossipSubStream
+      let closeStreams = mapM_ streamClose
+            [streamAtoB, streamBfromA, streamBtoA, streamAfromB]
+          runExchange =
+            withAsync (handleGossipSubStream nodeB streamBfromA pidA GossipSubPeer Nothing) $ \workerB ->
+              withAsync (handleGossipSubStream nodeA streamAfromB pidB GossipSubPeer Nothing) $ \workerA -> do
+                link workerA
+                link workerB
+                atomically $ do
+                  writeTVar (gsnStreams nodeA) (Map.singleton pidB streamAtoB)
+                  writeTVar (gsnStreams nodeB) (Map.singleton pidA streamBtoA)
+                waitForPeerTopics nodeA pidB Set.empty `shouldReturn` True
+                waitForPeerTopics nodeB pidA Set.empty `shouldReturn` True
+                gossipJoin nodeA "shared-topic"
+                waitForPeerTopics nodeB pidA (Set.singleton "shared-topic")
+                  `shouldReturn` True
+                gossipLeave nodeA "shared-topic"
+                waitForPeerTopics nodeB pidA Set.empty `shouldReturn` True
+                gossipJoin nodeA "later-topic"
+                waitForPeerTopics nodeB pidA (Set.singleton "later-topic")
+                  `shouldReturn` True
+      bracket_ (pure ()) closeStreams runExchange
 
     it "publish on one node delivers message to the other" $ do
       -- Node A (publisher)

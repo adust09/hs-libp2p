@@ -7,6 +7,7 @@ import Control.Concurrent.STM
 import Control.Monad (forever, unless)
 import Data.Bits ((.&.))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.List (nub)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -14,7 +15,12 @@ import Data.Time (diffUTCTime, getCurrentTime)
 import Data.Word (Word8)
 import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import LibP2P.DHT
-import LibP2P.DHT.Distance (commonPrefixLength, peerIdToKey, sortByDistance)
+import LibP2P.DHT.Distance
+  ( commonPrefixLength
+  , keyToDHTKey
+  , peerIdToKey
+  , sortByDistance
+  )
 import LibP2P.DHT.Lookup
 import LibP2P.DHT.Message
 import LibP2P.DHT.RoutingTable (bucketForPeer, insertPeer, allPeers, newRoutingTable)
@@ -695,10 +701,20 @@ spec = do
       bootstrap node []
       sentKeys <- readIORef sentKeysRef
       let selfKey = peerIdToKey localPid
+          refreshKeys = filter (/= peerIdBytes localPid) sentKeys
           refreshCpls =
-            [ commonPrefixLength selfKey (DHTKey k) | k <- drop 1 sentKeys ]
-      refreshCpls `shouldSatisfy` (bucketA `elem`)
-      refreshCpls `shouldSatisfy` (bucketB `elem`)
+            [ commonPrefixLength selfKey (keyToDHTKey rawKey)
+            | rawKey <- refreshKeys
+            ]
+          expectedPeerIds = [peerIdBytes pidA, peerIdBytes pidB]
+      refreshKeys `shouldSatisfy` all (`elem` expectedPeerIds)
+      nub refreshCpls `shouldMatchList` [bucketA, bucketB]
+      keyToDHTKey "raw-refresh-fixture" `shouldBe` DHTKey (BS.pack
+        [ 0xde, 0x8a, 0x6c, 0x10, 0x58, 0xf0, 0x89, 0x4b
+        , 0x31, 0x46, 0x0c, 0x8a, 0xdc, 0x5a, 0xc9, 0x1b
+        , 0x71, 0xc9, 0x80, 0x4f, 0x16, 0xd1, 0x64, 0x24
+        , 0x2e, 0x61, 0x28, 0x53, 0x08, 0xb1, 0xbf, 0x70
+        ])
 
     it "periodic refresh runs more than once under a short test interval" $ do
       sentKeysRef <- newIORef ([] :: [BS.ByteString])

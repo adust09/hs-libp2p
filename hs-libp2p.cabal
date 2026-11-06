@@ -14,6 +14,7 @@ category:        Network
 build-type:      Custom
 extra-doc-files: README.md
 extra-source-files:
+  test/fixtures/wss/*.pem
   ffi/webrtc/Cargo.lock
   ffi/webrtc/Cargo.toml
   ffi/webrtc/hs_webrtc.h
@@ -338,6 +339,7 @@ test-suite hs-libp2p-test
     LibP2P.Protocol.GossipSub.ExtensionsSpec
     LibP2P.Protocol.GossipSub.IDontWantSpec
     LibP2P.Protocol.GossipSub.PartialMessagesSpec
+    LibP2P.Protocol.GossipSub.ManagedPartialMessagesSpec
     LibP2P.Protocol.GossipSub.PartialMessages.BitmapSpec
     LibP2P.Protocol.GossipSub.RouterSpec
     LibP2P.Protocol.GossipSub.ScoreSpec
@@ -368,8 +370,10 @@ test-suite hs-libp2p-test
     crypton-asn1-encoding >= 0.9 && < 0.11,
     crypton-asn1-types >= 0.4 && < 0.5,
     crypton-x509 >= 1.8 && < 1.9,
+    crypton-x509-store >= 1.8 && < 1.9,
     tls        >= 2.2 && < 2.3,
     time-hourglass >= 0.3 && < 0.4,
+    network    >= 3.2.3 && < 3.3,
     ppad-base58 >= 0.2 && < 0.3,
     hspec      >= 2.11 && < 2.12,
     QuickCheck >= 2.14 && < 2.16
