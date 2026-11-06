@@ -12,7 +12,7 @@ import LibP2P.Multiaddr (Multiaddr (..), fromText)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
 import LibP2P.Protocol.Ping (PingResult (..), registerPingHandler, sendPing)
-import LibP2P.Security.TLS.Certificate (newIdentityCredential)
+import Data.X509.CertificateStore (CertificateStore, readCertificateStore)
 import LibP2P.Switch (addTransport, newSwitch, switchClose)
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (defaultConnectionGater, switchListen)
@@ -31,8 +31,9 @@ import LibP2P.Transport.WebSocket
   , webSocketServerParams
   )
 import Network.TLS
-  ( ClientHooks (..)
-  , ClientParams (..)
+  ( ClientParams (..)
+  , Shared (..)
+  , credentialLoadX509
   , defaultParamsClient
   )
 import System.Timeout (timeout)
@@ -83,8 +84,7 @@ spec = do
         Right listener -> listenerClose listener >> expectationFailure "wss listener unexpectedly started"
 
     it "rejects an untrusted /wss server with the default client configuration" $ do
-      (_, serverKey) <- generateIdentity
-      serverConfig <- localWSSConfig serverKey
+      serverConfig <- serverWSSConfig "valid"
       serverTransport <- newWebSocketTransportWithConfig serverConfig
       clientTransport <- newWebSocketTransport
       bracket
@@ -96,14 +96,46 @@ spec = do
             (try (listenerAccept listener) :: IO (Either SomeException RawConnection))
           case result of
             Nothing -> expectationFailure "untrusted wss handshake timed out"
-            Just (Right client, _) -> rcClose client >> expectationFailure "untrusted wss dial succeeded"
-            Just (Left _, _) -> pure ())
+            Just (Right client, accepted) -> do
+              rcClose client
+              closeAccepted accepted
+              expectationFailure "untrusted wss dial succeeded"
+            Just (Left _, accepted) -> closeAccepted accepted)
 
-    it "exchanges a byte stream over /wss with explicit TLS parameters" $ do
-      (_, serverKey) <- generateIdentity
-      config <- localWSSConfig serverKey
+    it "accepts a trusted CA, matching DNS SAN, and valid dates" $ do
+      config <- serverWSSConfig "valid"
       transport <- newWebSocketTransportWithConfig config
-      withWebSocketPair transport (parseAddr "/ip4/127.0.0.1/tcp/0/wss") exchangePayload
+      withWebSocketPairTo transport
+        (parseAddr "/ip4/127.0.0.1/tcp/0/wss")
+        localhostWSSAddress
+        exchangePayload
+
+    it "rejects a trusted certificate for the wrong hostname and reuses the listener" $ do
+      config <- serverWSSConfig "valid"
+      transport <- newWebSocketTransportWithConfig config
+      bracket
+        (transportListen transport (parseAddr "/ip4/127.0.0.1/tcp/0/wss"))
+        listenerClose
+        (\listener -> do
+          failed <- timeout 10000000 $ concurrently
+            (try (transportDial transport (listenerAddr listener))
+              :: IO (Either SomeException RawConnection))
+            (try (listenerAccept listener) :: IO (Either SomeException RawConnection))
+          case failed of
+            Just (Left _, accepted) -> closeAccepted accepted
+            Just (Right client, accepted) -> do
+              rcClose client
+              closeAccepted accepted
+              expectationFailure "wrong-host WSS dial succeeded"
+            Nothing -> expectationFailure "wrong-host WSS handshake timed out"
+          connected <- timeout 10000000 $ concurrently
+            (transportDial transport (localhostWSSAddress (listenerAddr listener)))
+            (listenerAccept listener)
+          pair <- maybe (fail "listener did not recover after failed WSS handshake") pure connected
+          bracket (pure pair) (\(client, server) -> rcClose client >> rcClose server) exchangePayload)
+
+    it "rejects expired and not-yet-valid trusted certificates" $ do
+      mapM_ shouldRejectCertificate ["expired", "future"]
 
   describe "Switch integration" $ do
     it "runs Noise, Yamux, and Ping over /ws" $
@@ -112,16 +144,26 @@ spec = do
         newWebSocketTransport
         (parseAddr "/ip4/127.0.0.1/tcp/0/ws")
 
-    it "runs Noise, Yamux, and Ping over /wss" $ do
-      (_, outerTLSKey) <- generateIdentity
-      config <- localWSSConfig outerTLSKey
-      verifySwitchPing
-        (newWebSocketTransportWithConfig config)
-        (newWebSocketTransportWithConfig config)
+    it "runs Noise, Yamux, and Ping over verified /wss" $ do
+      serverConfig <- serverWSSConfig "valid"
+      clientConfig <- trustedClientWSSConfig
+      verifySwitchPingTo
+        (newWebSocketTransportWithConfig clientConfig)
+        (newWebSocketTransportWithConfig serverConfig)
         (parseAddr "/ip4/127.0.0.1/tcp/0/wss")
+        localhostWSSAddress
 
 verifySwitchPing :: IO Transport -> IO Transport -> Multiaddr -> IO ()
-verifySwitchPing clientTransport serverTransport listenAddress = do
+verifySwitchPing clientTransport serverTransport listenAddress =
+  verifySwitchPingTo clientTransport serverTransport listenAddress id
+
+verifySwitchPingTo
+  :: IO Transport
+  -> IO Transport
+  -> Multiaddr
+  -> (Multiaddr -> Multiaddr)
+  -> IO ()
+verifySwitchPingTo clientTransport serverTransport listenAddress dialAddress = do
   (clientPeer, clientKey) <- generateIdentity
   (serverPeer, serverKey) <- generateIdentity
   bracket (newSwitch clientPeer clientKey) switchClose $ \clientSwitch ->
@@ -130,7 +172,8 @@ verifySwitchPing clientTransport serverTransport listenAddress = do
       serverTransport >>= addTransport serverSwitch
       registerPingHandler serverSwitch
       addresses <- switchListen serverSwitch defaultConnectionGater [listenAddress]
-      connectionResult <- timeout 10000000 $ dial clientSwitch serverPeer addresses
+      connectionResult <- timeout 10000000 $
+        dial clientSwitch serverPeer (map dialAddress addresses)
       connection <- case connectionResult of
         Nothing -> fail "WebSocket Switch dial timed out"
         Just (Left err) -> fail $ "WebSocket Switch dial failed: " <> show err
@@ -147,13 +190,22 @@ withWebSocketPair
   -> Multiaddr
   -> ((RawConnection, RawConnection) -> IO a)
   -> IO a
-withWebSocketPair transport listenAddress action =
+withWebSocketPair transport listenAddress =
+  withWebSocketPairTo transport listenAddress id
+
+withWebSocketPairTo
+  :: Transport
+  -> Multiaddr
+  -> (Multiaddr -> Multiaddr)
+  -> ((RawConnection, RawConnection) -> IO a)
+  -> IO a
+withWebSocketPairTo transport listenAddress dialAddress action =
   bracket
     (transportListen transport listenAddress)
     listenerClose
     (\listener -> do
       connected <- timeout 10000000 $ concurrently
-        (transportDial transport (listenerAddr listener))
+        (transportDial transport (dialAddress (listenerAddr listener)))
         (listenerAccept listener)
       pair <- maybe (fail "websocket loopback connection timed out") pure connected
       bracket
@@ -180,28 +232,70 @@ expectByteStream raw = case rcEndpoint raw of
 readExactly :: StreamIO -> Int -> IO BS.ByteString
 readExactly stream size = BS.pack <$> replicateM size (streamReadByte stream)
 
-localWSSConfig :: KeyPair -> IO WebSocketConfig
-localWSSConfig serverKey = do
-  credential <- newIdentityCredential serverKey
+trustedClientWSSConfig :: IO WebSocketConfig
+trustedClientWSSConfig = do
+  certificateStore <- readCertificateStore (fixturePath "ca.pem")
+    >>= maybe (fail "failed to load WSS test CA") pure
   pure WebSocketConfig
-    { webSocketClientTLSParams = acceptingClientParams
-    , webSocketServerTLSParams = Just (webSocketServerParams credential)
+    { webSocketClientTLSParams = trustedClientParams certificateStore
+    , webSocketServerTLSParams = Nothing
     }
 
-acceptingClientParams :: String -> ClientParams
-acceptingClientParams host = base
-  { clientUseServerNameIndication = False
-  , clientHooks = (clientHooks base)
-      { onServerCertificate = \_ _ _ _ -> pure []
+serverWSSConfig :: FilePath -> IO WebSocketConfig
+serverWSSConfig fixture = do
+  clientConfig <- trustedClientWSSConfig
+  loaded <- credentialLoadX509
+    (fixturePath (fixture <> "-cert.pem"))
+    (fixturePath (fixture <> "-key.pem"))
+  credential <- either fail pure loaded
+  pure clientConfig
+    { webSocketServerTLSParams = Just (webSocketServerParams credential)
+    }
+
+trustedClientParams :: CertificateStore -> String -> ClientParams
+trustedClientParams certificateStore host =
+  let base = defaultParamsClient host BS.empty
+   in base
+      { clientShared = (clientShared base)
+          { sharedCAStore = certificateStore
+          }
       }
-  }
-  where
-    base = defaultParamsClient host BS.empty
+
+shouldRejectCertificate :: FilePath -> Expectation
+shouldRejectCertificate fixture = do
+  config <- serverWSSConfig fixture
+  transport <- newWebSocketTransportWithConfig config
+  bracket
+    (transportListen transport (parseAddr "/ip4/127.0.0.1/tcp/0/wss"))
+    listenerClose
+    (\listener -> do
+      result <- timeout 10000000 $ concurrently
+        (try (transportDial transport (localhostWSSAddress (listenerAddr listener)))
+          :: IO (Either SomeException RawConnection))
+        (try (listenerAccept listener) :: IO (Either SomeException RawConnection))
+      case result of
+        Just (Left _, accepted) -> closeAccepted accepted
+        Just (Right client, accepted) -> do
+          rcClose client
+          closeAccepted accepted
+          expectationFailure ("accepted invalid WSS certificate fixture: " <> fixture)
+        Nothing -> expectationFailure ("invalid WSS handshake timed out: " <> fixture))
+
+closeAccepted :: Either SomeException RawConnection -> IO ()
+closeAccepted = either (const $ pure ()) rcClose
+
+fixturePath :: FilePath -> FilePath
+fixturePath name = "test/fixtures/wss/" <> name
 
 localhostAddress :: Multiaddr -> Multiaddr
 localhostAddress (Multiaddr [IP4 _, TCP port, WS]) =
   Multiaddr [DNS4 "localhost", TCP port, WS]
 localhostAddress address = error $ "unexpected websocket listener address: " <> show address
+
+localhostWSSAddress :: Multiaddr -> Multiaddr
+localhostWSSAddress (Multiaddr [IP4 _, TCP port, WSS]) =
+  Multiaddr [DNS4 "localhost", TCP port, WSS]
+localhostWSSAddress address = error $ "unexpected WSS listener address: " <> show address
 
 generateIdentity :: IO (PeerId, KeyPair)
 generateIdentity = do

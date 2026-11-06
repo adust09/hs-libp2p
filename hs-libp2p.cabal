@@ -14,6 +14,7 @@ category:        Network
 build-type:      Custom
 extra-doc-files: README.md
 extra-source-files:
+  test/fixtures/wss/*.pem
   ffi/webrtc/Cargo.lock
   ffi/webrtc/Cargo.toml
   ffi/webrtc/hs_webrtc.h
@@ -369,6 +370,7 @@ test-suite hs-libp2p-test
     crypton-asn1-encoding >= 0.9 && < 0.11,
     crypton-asn1-types >= 0.4 && < 0.5,
     crypton-x509 >= 1.8 && < 1.9,
+    crypton-x509-store >= 1.8 && < 1.9,
     tls        >= 2.2 && < 2.3,
     time-hourglass >= 0.3 && < 0.4,
     network    >= 3.2.3 && < 3.3,
