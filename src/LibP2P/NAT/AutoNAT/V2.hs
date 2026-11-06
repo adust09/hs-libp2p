@@ -123,6 +123,7 @@ data RateState = RateState
 data AutoNATV2State = AutoNATV2State
   { an2Config :: !AutoNATV2Config
   , an2PendingDialBacks :: !(TVar (Map Word64 (TMVar Multiaddr)))
+  , an2LastIssuedNonce :: !(TVar (Maybe Word64))
   , an2RateState :: !(TVar RateState)
   }
 
@@ -130,10 +131,12 @@ newAutoNATV2State :: AutoNATV2Config -> IO AutoNATV2State
 newAutoNATV2State config = do
   validateConfig config
   pending <- newTVarIO Map.empty
+  lastNonce <- newTVarIO Nothing
   rateState <- newTVarIO (RateState [] [] Map.empty)
   pure AutoNATV2State
     { an2Config = config
     , an2PendingDialBacks = pending
+    , an2LastIssuedNonce = lastNonce
     , an2RateState = rateState
     }
 
@@ -301,7 +304,7 @@ requestAutoNATV2 state stream requests = do
   let indexed = zip [0 ..] requests
       filtered = filter (allowedAddress config . an2RequestAddr . snd) indexed
   if null filtered
-    then pure (Left "AutoNAT v2 requires at least one dialable address")
+    then closeQuietly stream >> pure (Left "AutoNAT v2 requires at least one dialable address")
     else do
       (nonce, dialBackResult) <- registerPending state
       let cleanup = atomically $
@@ -421,15 +424,25 @@ registerPending state = do
   result <- newEmptyTMVarIO
   nonce <- atomically $ do
     pending <- readTVar (an2PendingDialBacks state)
-    let available = nextAvailableNonce candidate pending
+    lastIssued <- readTVar (an2LastIssuedNonce state)
+    -- Never immediately reuse a completed nonce, even when the injected
+    -- source collides; wrap safely and still skip every currently pending key.
+    let firstCandidate = case lastIssued of
+          Nothing -> candidate
+          Just nonce | nonce == maxBound -> 0
+          Just nonce -> nonce + 1
+        available = nextAvailableNonce firstCandidate pending
     writeTVar (an2PendingDialBacks state) (Map.insert available result pending)
+    writeTVar (an2LastIssuedNonce state) (Just available)
     pure available
   pure (nonce, result)
 
 nextAvailableNonce :: Word64 -> Map Word64 a -> Word64
 nextAvailableNonce candidate pending
-  | Map.member candidate pending = nextAvailableNonce (candidate + 1) pending
+  | Map.member candidate pending = nextAvailableNonce successor pending
   | otherwise = candidate
+ where
+  successor = if candidate == maxBound then 0 else candidate + 1
 
 acquireRequest :: AutoNATV2State -> PeerId -> IO Bool
 acquireRequest state peer = do
