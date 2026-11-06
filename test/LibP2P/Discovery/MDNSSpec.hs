@@ -10,20 +10,25 @@
 module LibP2P.Discovery.MDNSSpec (spec) where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (bracket)
+import Control.Concurrent.STM
+import Control.Exception (bracket, throwIO)
 import qualified Data.ByteString as BS
 import Data.Either (isLeft)
 import Data.Foldable (forM_)
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Text.Encoding (encodeUtf8)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (KeyPair, publicKey)
-import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
+import LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes)
 import LibP2P.Discovery.MDNS
-  ( MDNSConfig (..)
+  ( MDNSBackend (..)
+  , MDNSConfig (..)
   , MDNSService (..)
+  , MDNSSocket (..)
   , defaultMDNSConfig
   , newMDNSService
+  , newMDNSServiceWithBackend
   , stopMDNSService
   )
 import LibP2P.Discovery.MDNS.Message
@@ -45,6 +50,7 @@ import LibP2P.Switch (addTransport, newSwitch, switchClose)
 import LibP2P.Switch.Listen (defaultConnectionGater, switchListen)
 import LibP2P.Switch.Types (Switch (..))
 import LibP2P.Transport.TCP (newTCPTransport)
+import Network.Socket (HostAddress, SockAddr (..), tupleToHostAddress)
 import System.Timeout (timeout)
 import Test.Hspec
 
@@ -205,7 +211,176 @@ spec = do
             , 0x20, 0x01, 0x02 -- len 32, then 2 bytes
             ]
       decodeDnsPacket (BS.pack truncatedTxt) `shouldSatisfy` isLeft
+  specDeterministic
   specService
+
+--------------------------------------------------------------------------------
+-- Deterministic service behavior with injected packet sockets
+--------------------------------------------------------------------------------
+
+data FakeSocket = FakeSocket
+  { fakeSocket :: !MDNSSocket
+  , fakeIncoming :: !(TQueue (Maybe (BS.ByteString, SockAddr)))
+  , fakeSent :: !(TQueue (BS.ByteString, SockAddr))
+  , fakeClosed :: !(TVar Bool)
+  }
+
+newFakeSocket :: SockAddr -> IO FakeSocket
+newFakeSocket group = do
+  incoming <- newTQueueIO
+  sent <- newTQueueIO
+  closed <- newTVarIO False
+  let receive = atomically (readTQueue incoming) >>= maybe fakeEOF pure
+      send payload destination = atomically $ writeTQueue sent (payload, destination)
+      closeFake = atomically $ do
+        writeTVar closed True
+        writeTQueue incoming Nothing
+  pure FakeSocket
+    { fakeSocket = MDNSSocket group receive send closeFake
+    , fakeIncoming = incoming
+    , fakeSent = sent
+    , fakeClosed = closed
+    }
+ where
+  fakeEOF = throwIO (userError "fake mDNS socket closed")
+
+fakeConfig :: MDNSConfig
+fakeConfig = testMdnsConfig
+  { mcAnnounceCount = 1
+  , mcAnnounceSpacingMs = 0
+  , mcAdvertiseInterval = 0
+  }
+
+fakeBackend :: [FakeSocket] -> MDNSBackend
+fakeBackend sockets = MDNSBackend
+  { mdnsOpenSockets = const (pure (map fakeSocket sockets))
+  , mdnsRandomPeerName = pure "0123456789abcdef0123456789abcdef"
+  }
+
+feedPacket :: FakeSocket -> SockAddr -> BS.ByteString -> IO ()
+feedPacket socket source payload =
+  atomically $ writeTQueue (fakeIncoming socket) (Just (payload, source))
+
+readSentPacket :: FakeSocket -> IO (DnsPacket, SockAddr)
+readSentPacket socket = do
+  result <- timeout 2000000 $ atomically (readTQueue (fakeSent socket))
+  (payload, destination) <- maybe (fail "timed out waiting for fake mDNS send") pure result
+  packet <- either fail pure (decodeDnsPacket payload)
+  pure (packet, destination)
+
+discardInitialPackets :: FakeSocket -> IO ()
+discardInitialPackets socket = do
+  _ <- readSentPacket socket
+  pure ()
+
+specDeterministic :: Spec
+specDeterministic = describe "mDNS deterministic socket behavior" $ do
+  it "emits a valid TTL-zero goodbye and closes every acquired socket" $ do
+    withAdvertisedNode $ \(sw, _) -> do
+      v4 <- newFakeSocket fakeGroupV4
+      v6 <- newFakeSocket fakeGroupV6
+      result <- newMDNSServiceWithBackend (fakeBackend [v4, v6]) sw fakeConfig
+      service <- either fail pure result
+      discardInitialPackets v4
+      discardInitialPackets v6
+      stopMDNSService service
+      (goodbye4, destination4) <- readSentPacket v4
+      (goodbye6, destination6) <- readSentPacket v6
+      destination4 `shouldBe` fakeGroupV4
+      destination6 `shouldBe` fakeGroupV6
+      let records packet = pkAnswer packet <> pkAdditional packet
+      records goodbye4 `shouldSatisfy` (not . null)
+      records goodbye4 `shouldSatisfy` all ((== 0) . rTTL)
+      records goodbye6 `shouldSatisfy` all ((== 0) . rTTL)
+      map rName (records goodbye4) `shouldSatisfy`
+        all (T.isInfixOf (mcServiceName fakeConfig))
+      atomically (readTVar (fakeClosed v4)) `shouldReturn` True
+      atomically (readTVar (fakeClosed v6)) `shouldReturn` True
+
+  it "routes service, direct TXT, and meta queries and preserves legacy ids" $ do
+    withAdvertisedNode $ \(sw, _) -> do
+      socket <- newFakeSocket fakeGroupV4
+      result <- newMDNSServiceWithBackend (fakeBackend [socket]) sw fakeConfig
+      service <- either fail pure result
+      discardInitialPackets socket
+      let serviceName = mcServiceName fakeConfig
+          instanceName = msPeerName service <> "." <> serviceName
+          multicastSource = SockAddrInet (fromIntegral (mcPort fakeConfig)) loopbackHost
+          legacySource = SockAddrInet 42000 loopbackHost
+          ask ident source question = do
+            feedPacket socket source . encodeDnsPacket $
+              DnsPacket ident 0 [question] [] []
+            readSentPacket socket
+      (serviceReply, serviceDestination) <-
+        ask 0 multicastSource (DnsQuestion serviceName typePTR classIN)
+      serviceDestination `shouldBe` fakeGroupV4
+      pkAnswer serviceReply `shouldSatisfy` any ((== typePTR) . rType)
+      pkAdditional serviceReply `shouldSatisfy` any ((== typeTXT) . rType)
+      (txtReply, _) <- ask 0 multicastSource (DnsQuestion instanceName typeTXT classIN)
+      pkAnswer txtReply `shouldSatisfy` any ((== typeTXT) . rType)
+      (metaReply, _) <- ask 0 multicastSource
+        (DnsQuestion "_services._dns-sd._udp.local" typePTR classIN)
+      pkAnswer metaReply `shouldBe`
+        [DnsRecord "_services._dns-sd._udp.local" typePTR classIN
+          (mcAnnounceTTL fakeConfig) (RdPtr serviceName)]
+      (legacyReply, legacyDestination) <-
+        ask 0x1234 legacySource (DnsQuestion serviceName typePTR classIN)
+      legacyDestination `shouldBe` legacySource
+      pkID legacyReply `shouldBe` 0x1234
+      stopMDNSService service
+
+  it "ignores goodbye, malformed, and unrelated traffic then discovers a valid peer" $ do
+    withAdvertisedNode $ \(sw, _) -> do
+      socket <- newFakeSocket fakeGroupV4
+      result <- newMDNSServiceWithBackend (fakeBackend [socket]) sw fakeConfig
+      service <- either fail pure result
+      discardInitialPackets socket
+      (remotePeer, _) <- mkIdentity
+      let source = SockAddrInet (fromIntegral (mcPort fakeConfig)) loopbackHost
+          remoteAddress = Multiaddr [IP4 0x08080808, TCP 4001, P2P (peerIdBytes remotePeer)]
+          response ttl = DnsPacket 0 0x8400 [] []
+            [DnsRecord "remote._hs-libp2p._udp.local" typeTXT classIN ttl
+              (RdTxt [encodeUtf8 ("dnsaddr=" <> toText remoteAddress)])]
+          unrelated = DnsPacket 0 0x8400 [] []
+            [DnsRecord "other.local" typeTXT classIN 60 (RdTxt ["not-a-dnsaddr"])]
+      feedPacket socket source (encodeDnsPacket (response 0))
+      feedPacket socket source BS.empty
+      feedPacket socket source (encodeDnsPacket unrelated)
+      feedPacket socket source . encodeDnsPacket $
+        DnsPacket 0 0
+          [DnsQuestion (mcServiceName fakeConfig) typePTR classIN] [] []
+      _ <- readSentPacket socket
+      drainDiscoveryQueue (msEvents service) `shouldReturn` []
+      feedPacket socket source (encodeDnsPacket (response 60))
+      event <- waitForDiscovery service 2
+      discoveryPeerId event `shouldBe` remotePeer
+      stopMDNSService service
+
+  it "keeps the available address family operational when the other is absent" $ do
+    withAdvertisedNode $ \(sw, _) -> do
+      onlyV4 <- newFakeSocket fakeGroupV4
+      result <- newMDNSServiceWithBackend (fakeBackend [onlyV4]) sw fakeConfig
+      service <- either fail pure result
+      discardInitialPackets onlyV4
+      let source = SockAddrInet (fromIntegral (mcPort fakeConfig)) loopbackHost
+          query = DnsPacket 0 0
+            [DnsQuestion (mcServiceName fakeConfig) typePTR classIN] [] []
+      feedPacket onlyV4 source (encodeDnsPacket query)
+      (reply, destination) <- readSentPacket onlyV4
+      destination `shouldBe` fakeGroupV4
+      pkAnswer reply `shouldSatisfy` (not . null)
+      stopMDNSService service
+      atomically (readTVar (fakeClosed onlyV4)) `shouldReturn` True
+
+fakeGroupV4 :: SockAddr
+fakeGroupV4 = SockAddrInet (fromIntegral (mcPort fakeConfig))
+  (tupleToHostAddress (224, 0, 0, 251))
+
+fakeGroupV6 :: SockAddr
+fakeGroupV6 = SockAddrInet6 (fromIntegral (mcPort fakeConfig)) 0 (0, 0, 0, 0) 0
+
+loopbackHost :: HostAddress
+loopbackHost = tupleToHostAddress (127, 0, 0, 1)
 
 --------------------------------------------------------------------------------
 -- Service over loopback multicast

@@ -39,7 +39,10 @@ module LibP2P.Discovery.MDNS
   , defaultMDNSConfig
     -- * Service
   , MDNSService (..)
+  , MDNSBackend (..)
+  , MDNSSocket (..)
   , newMDNSService
+  , newMDNSServiceWithBackend
   , stopMDNSService
     -- * Well-known mDNS constants
   , mdnsIPv4Group
@@ -219,15 +222,24 @@ data MDNSService = MDNSService
   , msEvents :: !(TQueue DiscoveryEvent)
   -- ^ Discovered peers, drained by the application.
   , msThreads :: [Async ()]
-  , msSockets :: [MdnsSocket]
+  , msSockets :: [MDNSSocket]
   }
 
 -- | A socket joined to its mDNS group. 'skGroup' carries the family
 -- and the group address so sends and replies stay on the socket's own
 -- stack.
-data MdnsSocket = MdnsSocket
-  { skSock :: !Socket
-  , skGroup :: !SockAddr
+data MDNSSocket = MDNSSocket
+  { mdnsGroup :: !SockAddr
+  , mdnsReceive :: !(IO (ByteString, SockAddr))
+  , mdnsSend :: !(ByteString -> SockAddr -> IO ())
+  , mdnsClose :: !(IO ())
+  }
+
+-- | Injectable socket and peer-name operations used by deterministic tests
+-- and by platforms that need custom multicast setup.
+data MDNSBackend = MDNSBackend
+  { mdnsOpenSockets :: !(MDNSConfig -> IO [MDNSSocket])
+  , mdnsRandomPeerName :: !(IO Text)
   }
 
 -- | Start the mDNS service: open the multicast sockets (IPv4, and
@@ -236,12 +248,16 @@ data MdnsSocket = MdnsSocket
 -- opened at all; failing one stack (an IPv4-only host, for example)
 -- degrades the service to the other.
 newMDNSService :: Switch -> MDNSConfig -> IO (Either String MDNSService)
-newMDNSService sw cfg = do
-  opened <- openSockets cfg
+newMDNSService = newMDNSServiceWithBackend defaultMDNSBackend
+
+newMDNSServiceWithBackend
+  :: MDNSBackend -> Switch -> MDNSConfig -> IO (Either String MDNSService)
+newMDNSServiceWithBackend backend sw cfg = do
+  opened <- mdnsOpenSockets backend cfg
   case opened of
     [] -> pure (Left "mdns: could not open any multicast socket")
     _ -> do
-      peerName <- randomPeerName
+      peerName <- mdnsRandomPeerName backend
       events <- newDiscoveryQueue
       readers <- mapM (async . readerThread sw cfg peerName events) opened
       announcer <- async (announceThread sw cfg peerName opened)
@@ -266,9 +282,9 @@ stopMDNSService svc = do
   -- The goodbye matters less than tearing down: a dead socket must
   -- not stop the rest of the shutdown.
   forM_ (msSockets svc) $ \sk ->
-    bestEffort (sendTo (skSock sk) bye (skGroup sk))
+    bestEffort (mdnsSend sk bye (mdnsGroup sk))
   traverse_ cancel (msThreads svc)
-  traverse_ (close . skSock) (msSockets svc)
+  traverse_ (bestEffort . mdnsClose) (msSockets svc)
 
 --------------------------------------------------------------------------------
 -- Multicast sockets
@@ -277,7 +293,10 @@ stopMDNSService svc = do
 -- | Open every configured multicast socket, bound to the mDNS port
 -- and joined to its group. Sockets that fail are dropped silently, so
 -- an IPv4-only host still gets @ip4@ only.
-openSockets :: MDNSConfig -> IO [MdnsSocket]
+defaultMDNSBackend :: MDNSBackend
+defaultMDNSBackend = MDNSBackend openSockets randomPeerName
+
+openSockets :: MDNSConfig -> IO [MDNSSocket]
 openSockets cfg = do
   v4 <- tagged (ipv4GroupAddr cfg) (openIPv4Socket cfg)
   v6 <-
@@ -286,12 +305,20 @@ openSockets cfg = do
       else pure Nothing
   pure (catMaybes [v4, v6])
   where
-    tagged :: SockAddr -> IO Socket -> IO (Maybe MdnsSocket)
+    tagged :: SockAddr -> IO Socket -> IO (Maybe MDNSSocket)
     tagged group io = do
       opened <- try io
       pure $ case opened :: Either IOException Socket of
         Left _ -> Nothing -- this stack is unavailable: skip it
-        Right sock -> Just (MdnsSocket sock group)
+        Right sock -> Just (nativeSocket sock group)
+
+nativeSocket :: Socket -> SockAddr -> MDNSSocket
+nativeSocket sock group = MDNSSocket
+  { mdnsGroup = group
+  , mdnsReceive = recvFrom sock 65536
+  , mdnsSend = \payload destination -> void (sendTo sock payload destination)
+  , mdnsClose = close sock
+  }
 
 ipv4GroupAddr :: MDNSConfig -> SockAddr
 ipv4GroupAddr cfg =
@@ -405,15 +432,15 @@ bestEffort action = do
 -- query is answered, a response is consumed). Exits quietly when the
 -- socket dies — 'stopMDNSService' shuts it down from the outside.
 readerThread
-  :: Switch -> MDNSConfig -> Text -> TQueue DiscoveryEvent -> MdnsSocket -> IO ()
+  :: Switch -> MDNSConfig -> Text -> TQueue DiscoveryEvent -> MDNSSocket -> IO ()
 readerThread sw cfg peerName events sk = loop
   where
     loop = do
-      received <- try (recvFrom (skSock sk) 65536)
+      received <- try (mdnsReceive sk)
       case received :: Either SomeException (ByteString, SockAddr) of
         Left _ -> pure () -- socket gone: end the thread
         Right (payload, src) -> do
-          handlePacket sw cfg peerName events sk src payload
+          bestEffort (handlePacket sw cfg peerName events sk src payload)
           loop
 
 handlePacket
@@ -421,7 +448,7 @@ handlePacket
   -> MDNSConfig
   -> Text
   -> TQueue DiscoveryEvent
-  -> MdnsSocket
+  -> MDNSSocket
   -> SockAddr
   -> ByteString
   -> IO ()
@@ -438,7 +465,7 @@ handlePacket sw cfg peerName events sk src payload =
 -- (find-all-peers), the DNS-SD meta-query, or our instance's TXT
 -- name, produce the records and send them on the query's own channel.
 answerQuery
-  :: Switch -> MDNSConfig -> Text -> MdnsSocket -> SockAddr -> DnsPacket -> IO ()
+  :: Switch -> MDNSConfig -> Text -> MDNSSocket -> SockAddr -> DnsPacket -> IO ()
 answerQuery sw cfg peerName sk src pk = do
   addrs <- advertisedAddrs sw
   let ttl = mcAnnounceTTL cfg
@@ -456,15 +483,15 @@ answerQuery sw cfg peerName sk src pk = do
     [] -> pure () -- not a name we serve: stay silent (RFC 6762 §6.7)
     _ -> do
       dst <- replyDestination cfg sk src
-      bestEffort (sendTo (skSock sk) (encodeDnsPacket reply) dst)
+      bestEffort (mdnsSend sk (encodeDnsPacket reply) dst)
 
 -- | Where a response to a query goes: genuine mDNS queries come from
 -- the mDNS port and are answered on the multicast group;
 -- legacy-unicast queries are answered unicast at their source.
-replyDestination :: MDNSConfig -> MdnsSocket -> SockAddr -> IO SockAddr
+replyDestination :: MDNSConfig -> MDNSSocket -> SockAddr -> IO SockAddr
 replyDestination cfg sk src = case src of
-  SockAddrInet p _ | p == toPort (mcPort cfg) -> pure (skGroup sk)
-  SockAddrInet6 p _ _ _ | p == toPort (mcPort cfg) -> pure (skGroup sk)
+  SockAddrInet p _ | p == toPort (mcPort cfg) -> pure (mdnsGroup sk)
+  SockAddrInet6 p _ _ _ | p == toPort (mcPort cfg) -> pure (mdnsGroup sk)
   _ -> pure src
   where
     toPort = fromIntegral
@@ -535,7 +562,7 @@ queryPacket service =
 
 -- | Announcer: announce and query at start-up ('mcAnnounceCount'
 -- times), then re-announce every 'mcAdvertiseInterval' seconds.
-announceThread :: Switch -> MDNSConfig -> Text -> [MdnsSocket] -> IO ()
+announceThread :: Switch -> MDNSConfig -> Text -> [MDNSSocket] -> IO ()
 announceThread sw cfg peerName sockets = do
   replicateM_ (max 1 (mcAnnounceCount cfg)) $ do
     announceOnce
@@ -554,7 +581,7 @@ announceThread sw cfg peerName sockets = do
           )
       forM_ sockets $ \sk ->
         forM_ packets $ \bs ->
-          bestEffort (sendTo (skSock sk) bs (skGroup sk))
+          bestEffort (mdnsSend sk bs (mdnsGroup sk))
 
 --------------------------------------------------------------------------------
 -- Discovery of remote peers
@@ -581,6 +608,7 @@ processResponse sw peerName service events pk =
         [ (rName r, txtMultiaddrs (rData r))
         | r <- pkAnswer pk ++ pkAdditional pk
         , rType r == typeTXT
+        , rTTL r > 0
         ]
     txtMultiaddrs (RdTxt strings) = mapMaybe dnsaddrMultiaddr strings
     txtMultiaddrs _ = []
