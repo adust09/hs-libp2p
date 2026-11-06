@@ -46,7 +46,8 @@ module LibP2P.DHT
 import Control.Concurrent.Async (Async, cancel)
 import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar, tryTakeMVar)
 import Control.Concurrent.STM
-import Control.Exception (SomeException, catch, mask, onException, try)
+import Control.Exception
+  ( SomeAsyncException, SomeException, catch, fromException, mask, onException, try, tryJust )
 import Control.Monad (when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -159,7 +160,9 @@ data DHTNode = DHTNode
     -- (go-libp2p reuses a single long-lived stream per peer)
   , dhtSendRequest   :: !(PeerId -> DHTMessage -> IO (Either String DHTMessage))
     -- ^ Outbound RPC sender. Wired to the Switch by 'newDHTNode';
-    -- kept as a field so tests can inject mocks.
+    -- kept as a field so tests can inject mocks. ADD_PROVIDER uses 'dhtSendMessage'.
+  , dhtSendMessage :: !(PeerId -> DHTMessage -> IO (Either String ()))
+    -- ^ Send-only ADD_PROVIDER sender, sharing the RPC session's exchange lock.
   , dhtDisconnectHook :: !(IORef (Maybe (Connection -> IO ())))
     -- ^ Disconnect notifier; 'stopDHTNode' clears it so a stopped node
     -- does not keep a callback alive on the Switch.
@@ -213,6 +216,7 @@ newDHTNodeWithConfig maintenanceConfig sw mode = do
         , dhtValidator        = defaultValidator
         , dhtStreams          = streams
         , dhtSendRequest      = sendRequestViaSwitch sw stopped streams
+        , dhtSendMessage      = sendMessageViaSwitch sw stopped streams
         , dhtDisconnectHook   = hook
         , dhtStopped          = stopped
         , dhtQueryTimeout     = defaultQueryTimeoutMicros
@@ -270,7 +274,7 @@ handleDHTRequest node stream remotePeerId remoteAddr = loop
           Left err -> pure (Left err)
           Right msg -> do
             response <- processRequest node msg remotePeerId
-            writeFramedMessage stream response
+            mapM_ (writeFramedMessage stream) response
             -- Routing-table growth: a peer speaking the DHT protocol to
             -- us is a live contact; insert (or refresh) it. Note this
             -- cannot distinguish client-mode senders (the spec would
@@ -282,15 +286,15 @@ handleDHTRequest node stream remotePeerId remoteAddr = loop
         Right (Left _err) -> pure ()          -- Framing/decode error: stop serving
         Right (Right ()) -> loop
 
--- | Process a single DHT request and produce a response.
-processRequest :: DHTNode -> DHTMessage -> PeerId -> IO DHTMessage
+-- | ADD_PROVIDER is an announcement; all other messages have a response.
+processRequest :: DHTNode -> DHTMessage -> PeerId -> IO (Maybe DHTMessage)
 processRequest node msg remotePeerId =
   case msgType msg of
-    FindNode -> handleFindNode node msg
-    GetValue -> handleGetValue node msg
-    PutValue -> handlePutValue node msg
-    AddProvider -> handleAddProvider node msg remotePeerId
-    GetProviders -> handleGetProviders node msg
+    FindNode -> Just <$> handleFindNode node msg
+    GetValue -> Just <$> handleGetValue node msg
+    PutValue -> Just <$> handlePutValue node msg
+    AddProvider -> Nothing <$ handleAddProvider node msg remotePeerId
+    GetProviders -> Just <$> handleGetProviders node msg
 
 -- | Insert or refresh the RPC sender, seeding its dial address from
 -- the authenticated connection.
@@ -396,14 +400,13 @@ handlePutValue node msg = do
     rejected = emptyDHTMessage { msgType = PutValue }
 
 -- | ADD_PROVIDER: verify sender and store provider record.
-handleAddProvider :: DHTNode -> DHTMessage -> PeerId -> IO DHTMessage
+handleAddProvider :: DHTNode -> DHTMessage -> PeerId -> IO ()
 handleAddProvider node msg remotePeerId = do
   now <- getCurrentTime
   -- Verify that provider peers match sender's Peer ID
   let validProviders = filter (\p -> dhtPeerId p == peerIdBytes remotePeerId) (msgProviderPeers msg)
   -- Store each valid provider keyed by msgKey
   mapM_ (\p -> addProvider node (msgKey msg) (dhtPeerToProvider p now)) validProviders
-  pure emptyDHTMessage { msgType = AddProvider }
 
 -- | GET_PROVIDERS: return stored providers + k closest peers.
 handleGetProviders :: DHTNode -> DHTMessage -> IO DHTMessage
@@ -493,7 +496,26 @@ sendRequestViaSwitch
   -> PeerId
   -> DHTMessage
   -> IO (Either String DHTMessage)
-sendRequestViaSwitch sw stoppedVar sessionsVar pid request = do
+sendRequestViaSwitch sw stoppedVar sessionsVar pid request
+  | msgType request == AddProvider = pure (Left "ADD_PROVIDER requires dhtSendMessage")
+  | otherwise = withPeerStream sw stoppedVar sessionsVar pid $ \stream ->
+      streamIOResult $ do
+        writeFramedMessage stream request
+        readFramedMessage stream maxDHTMessageSize
+
+sendMessageViaSwitch
+  :: Switch -> TVar Bool -> TVar (Map PeerId PeerSession)
+  -> PeerId -> DHTMessage -> IO (Either String ())
+sendMessageViaSwitch sw stoppedVar sessionsVar pid message
+  | msgType message /= AddProvider = pure (Left "only ADD_PROVIDER is send-only")
+  | otherwise = withPeerStream sw stoppedVar sessionsVar pid $ \stream ->
+      streamIOResult (Right <$> writeFramedMessage stream message)
+
+-- | Serialize an entire RPC or announcement on the same peer session.
+withPeerStream
+  :: Switch -> TVar Bool -> TVar (Map PeerId PeerSession)
+  -> PeerId -> (StreamIO -> IO (Either String a)) -> IO (Either String a)
+withPeerStream sw stoppedVar sessionsVar pid exchangeStream = do
   mSession <- peerSession stoppedVar sessionsVar pid
   case mSession of
     Nothing -> pure (Left "DHT node is stopped")
@@ -513,7 +535,7 @@ sendRequestViaSwitch sw stoppedVar sessionsVar pid request = do
 
     exchange session Nothing = openAndExchange session
     exchange session (Just stream) = do
-      result <- exchangeFramed stream request
+      result <- exchangeStream stream
       case result of
         Right resp -> pure (Just stream, Right resp)
         Left _ -> do
@@ -528,7 +550,7 @@ sendRequestViaSwitch sw stoppedVar sessionsVar pid request = do
         Left err -> pure (Nothing, Left err)
         Right stream ->
           (`onException` closeQuietly stream) $ do
-            result <- exchangeFramed stream request
+            result <- exchangeStream stream
             case result of
               Left err -> do
                 closeQuietly stream
@@ -617,15 +639,19 @@ invalidateHeldSession session = do
       mapM_ closeQuietly slot
       putMVar (psSlot session) Nothing
 
--- | Write a framed request and read the framed response, capturing IO errors.
-exchangeFramed :: StreamIO -> DHTMessage -> IO (Either String DHTMessage)
-exchangeFramed stream request = do
-  result <- try $ do
-    writeFramedMessage stream request
-    readFramedMessage stream maxDHTMessageSize
+-- | Preserve cancellation so an interrupted exchange is not retried.
+streamIOResult :: IO (Either String a) -> IO (Either String a)
+streamIOResult action = do
+  result <- tryJust synchronousException action
   pure $ case result of
-    Left (e :: SomeException) -> Left ("DHT stream I/O failed: " ++ show e)
-    Right r -> r
+    Left _ -> Left "DHT stream I/O failed"
+    Right response -> response
+
+synchronousException :: SomeException -> Maybe SomeException
+synchronousException exception =
+  case fromException exception :: Maybe SomeAsyncException of
+    Just _ -> Nothing
+    Nothing -> Just exception
 
 -- | Open a new muxer stream to the peer and negotiate @/ipfs/kad/1.0.0@.
 openDHTStream :: Switch -> PeerSession -> PeerId -> IO (Either String StreamIO)
