@@ -51,7 +51,9 @@ common lang
 library
   import:          warnings, lang
   hs-source-dirs:  src
-  other-modules:   PackageInfo_hs_libp2p
+  other-modules:
+    PackageInfo_hs_libp2p
+    LibP2P.Protocol.GossipSub.Delivery
   autogen-modules: PackageInfo_hs_libp2p
   if flag(webrtc)
     cpp-options:             -DWITH_WEBRTC
@@ -344,6 +346,7 @@ test-suite hs-libp2p-test
     LibP2P.Protocol.GossipSub.RouterSpec
     LibP2P.Protocol.GossipSub.ScoreSpec
     LibP2P.Protocol.GossipSub.ValidationSpec
+    LibP2P.Protocol.GossipSub.DuplicateValidationSpec
     LibP2P.Protocol.GossipSub.MessageCacheSpec
     LibP2P.Protocol.GossipSub.HeartbeatSpec
     LibP2P.Protocol.GossipSub.OpportunisticGraftSpec
