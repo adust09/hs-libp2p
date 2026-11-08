@@ -2,80 +2,272 @@
 
 -- | libp2p framing over an RTCDataChannel.
 module LibP2P.Transport.WebRTC.Stream (
+  ChannelIO (..),
   channelToStreamIO,
   closeOnce,
 ) where
 
-import Control.Concurrent (MVar, modifyMVar, modifyMVar_, newMVar)
-import Control.Exception (SomeException, catch)
-import Control.Monad (unless)
+import Control.Concurrent (MVar, modifyMVar, modifyMVar_, newMVar, withMVar)
+import Control.Concurrent.Async (Async, async, wait, waitCatch, withAsync)
+import Control.Concurrent.STM
+import Control.Exception
+  ( Exception
+  , IOException
+  , SomeException
+  , catch
+  , displayException
+  , finally
+  , fromException
+  , mask
+  , onException
+  , throwIO
+  )
+import Control.Monad (unless, void, when)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.Maybe (isNothing)
+import Data.Sequence (Seq, ViewL (..), (<|), (|>))
+import qualified Data.Sequence as Seq
 import Data.Word (Word64)
-import Foreign.Ptr (Ptr)
+import System.IO.Error (eofErrorType, ioeGetErrorString, mkIOError)
 import LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
 import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
-import LibP2P.Transport.WebRTC.FFI qualified as FFI
+import System.Timeout (timeout)
 
-data ChannelReadState = ChannelReadState
-  { channelBuffered :: !ByteString
-  , channelWireBuffered :: !ByteString
-  , channelFinished :: !Bool
+-- | The adapter owns the channel. Shutdown must unblock I/O without freeing it.
+-- Final close releases the handle after receives and sends have stopped.
+data ChannelIO = ChannelIO
+  { dcSend :: ByteString -> IO ()
+  , dcReceive :: IO (Maybe ByteString)
+  , dcShutdown :: IO ()
+  , dcClose :: IO ()
   }
 
-channelToStreamIO :: Ptr FFI.CWebRTCChannel -> IO StreamIO
-channelToStreamIO channel = do
-  state <- newMVar (ChannelReadState BS.empty BS.empty False)
-  close <- closeOnce $ do
-    FFI.channelSend channel (encodeFlagFrame 0)
-      `catch` \(_ :: SomeException) -> pure ()
-    FFI.channelClose channel
-  pure
-    StreamIO
-      { streamWrite = mapM_ (FFI.channelSend channel . encodeDataFrame) . chunksOf 1200
-      , streamReadByte = BS.head <$> readChannel state channel 1
-      , streamReadChunk = readChannel state channel
-      , streamClose = close
-      }
+data WebRTCStreamError
+  = WebRTCStreamReset
+  | WebRTCStopSending
+  | WebRTCWriteClosed
+  | WebRTCChannelFailed
+  | WebRTCFrameError String
+  deriving (Eq, Show)
 
-readChannel :: MVar ChannelReadState -> Ptr FFI.CWebRTCChannel -> Int -> IO ByteString
-readChannel stateVar channel requested
+instance Exception WebRTCStreamError
+
+streamErrorText :: WebRTCStreamError -> String
+streamErrorText err = case err of
+  WebRTCStreamReset -> "WebRTC stream reset"
+  WebRTCStopSending -> "WebRTC peer stopped receiving"
+  WebRTCWriteClosed -> "WebRTC write side closed"
+  WebRTCChannelFailed -> "WebRTC channel failed"
+  WebRTCFrameError message -> message
+
+streamIOException :: WebRTCStreamError -> IOException
+streamIOException err = userError (streamErrorText err)
+
+-- Keep the diagnostic text of the original failure, whether it was an
+-- IOException from the channel or a framing error raised here.
+failureText :: SomeException -> String
+failureText exception
+  | Just ioException <- fromException exception :: Maybe IOException =
+      ioeGetErrorString ioException
+  | Just streamError <- fromException exception :: Maybe WebRTCStreamError =
+      streamErrorText streamError
+  | otherwise = displayException exception
+
+
+data ReceiveState = Receiving | ReceivedFIN | ReceiveReset | ReceiveFailed WebRTCStreamError
+  deriving (Eq)
+
+data SendState = Sending | SentFIN | ReceivedFINAck | SendStopped
+  deriving (Eq)
+
+data ChannelState = ChannelState
+  { channelReceiveState :: !ReceiveState
+  , channelSendState :: !SendState
+  , channelPhysicalClosed :: !Bool
+  , channelBuffered :: !(Seq ByteString)
+  , channelBufferedSize :: !Int
+  }
+
+data ChannelRuntime = ChannelRuntime
+  { crChannel :: !ChannelIO
+  , crState :: !(TVar ChannelState)
+  , crWriteLock :: !(MVar ())
+  , crLifetime :: !(MVar Bool)
+  , crShutdownSent :: !(MVar Bool)
+  }
+
+-- | Close writes with FIN, waiting at most the given microseconds for FIN_ACK.
+-- Reads remain usable until remote FIN; only the receive worker frees the handle.
+channelToStreamIO :: Int -> ChannelIO -> IO StreamIO
+channelToStreamIO closeTimeoutMicros channel = mask $ \restore -> do
+  when (closeTimeoutMicros <= 0) $ fail "WebRTC close timeout must be positive"
+  state <- newTVarIO (ChannelState Receiving Sending False Seq.empty 0)
+  runtime <- ChannelRuntime channel state <$> newMVar () <*> newMVar True <*> newMVar False
+  worker <- async $
+    (restore (receiveLoop runtime BS.empty) `catch` recordFailure runtime)
+      `finally` finishChannel runtime
+  close <- closeOnce $ closeWrite runtime worker closeTimeoutMicros
+  pure StreamIO
+    { streamWrite = mapM_ (writeData runtime) . chunksOf 1200
+    , streamReadByte = BS.head <$> readChannel state 1
+    , streamReadChunk = readChannel state
+    , streamClose = close
+    }
+
+readChannel :: TVar ChannelState -> Int -> IO ByteString
+readChannel stateVar requested
   | requested <= 0 = pure BS.empty
-  | otherwise = modifyMVar stateVar $ \state -> do
-      filled <- fillReadBuffer channel state
-      if BS.null (channelBuffered filled)
-        then fail "WebRTC data channel closed"
-        else do
-          let (result, remaining) = BS.splitAt requested (channelBuffered filled)
-          pure (filled{channelBuffered = remaining}, result)
+  | otherwise = atomically $ do
+      state <- readTVar stateVar
+      case channelReceiveState state of
+        ReceiveReset -> throwSTM (streamIOException WebRTCStreamReset)
+        ReceiveFailed err -> throwSTM (streamIOException err)
+        _ -> case Seq.viewl (channelBuffered state) of
+          bytes :< rest -> do
+            let (result, remaining) = BS.splitAt requested bytes
+                buffered = if BS.null remaining then rest else remaining <| rest
+            writeTVar stateVar state
+              { channelBuffered = buffered
+              , channelBufferedSize = channelBufferedSize state - BS.length result
+              }
+            pure result
+          EmptyL
+            | channelReceiveState state == Receiving && not (channelPhysicalClosed state) -> retry
+            | otherwise -> throwSTM (mkIOError eofErrorType "WebRTC stream ended" Nothing Nothing)
 
-fillReadBuffer :: Ptr FFI.CWebRTCChannel -> ChannelReadState -> IO ChannelReadState
-fillReadBuffer _ state
-  | not (BS.null (channelBuffered state)) || channelFinished state = pure state
-fillReadBuffer channel state = do
-  received <- receiveFrame channel (channelWireBuffered state)
-  case received of
-    Nothing -> pure state{channelFinished = True}
-    Just (framed, remaining) -> case decodeMessage framed Nothing Nothing of
-      Left message -> fail message
-      Right (Just payload, _) ->
-        pure state{channelBuffered = payload, channelWireBuffered = remaining}
-      Right (Nothing, Just 0) -> do
-        FFI.channelSend channel (encodeFlagFrame 3)
-        pure state{channelWireBuffered = remaining, channelFinished = True}
-      Right _ -> fillReadBuffer channel state{channelWireBuffered = remaining}
+writeData :: ChannelRuntime -> ByteString -> IO ()
+writeData runtime bytes = withMVar (crWriteLock runtime) $ \_ -> do
+  atomically $ do
+    state <- readTVar (crState runtime)
+    case channelSendState state of
+      SendStopped -> throwSTM (streamIOException WebRTCStopSending)
+      Sending | not (channelPhysicalClosed state) -> pure ()
+      _ -> throwSTM (streamIOException WebRTCWriteClosed)
+  dcSend (crChannel runtime) (encodeDataFrame bytes)
+    `onException` shutdownChannel runtime
 
-receiveFrame :: Ptr FFI.CWebRTCChannel -> ByteString -> IO (Maybe (ByteString, ByteString))
+sendFIN :: ChannelRuntime -> IO ()
+sendFIN runtime = withMVar (crWriteLock runtime) $ \_ -> do
+  send <- atomically $ do
+    state <- readTVar (crState runtime)
+    if channelPhysicalClosed state || channelSendState state /= Sending
+      then pure False
+      else do
+        writeTVar (crState runtime) state { channelSendState = SentFIN }
+        pure True
+  when send $ dcSend (crChannel runtime) (encodeFlagFrame 0)
+
+-- Keep the deadline outside foreign send calls so it can shut them down before joining.
+closeWrite :: ChannelRuntime -> Async () -> Int -> IO ()
+closeWrite runtime worker closeTimeoutMicros =
+  withAsync (sendFIN runtime >> awaitAcknowledgement) $ \closing -> do
+    result <- timeout closeTimeoutMicros (wait closing)
+      `onException` shutdownChannel runtime
+    when (isNothing result) $ do
+      shutdownChannel runtime
+      void $ waitCatch worker
+  where
+    awaitAcknowledgement = atomically $ do
+      state <- readTVar (crState runtime)
+      check (channelPhysicalClosed state || channelSendState state /= SentFIN)
+
+receiveLoop :: ChannelRuntime -> ByteString -> IO ()
+receiveLoop runtime buffered = do
+  closed <- channelPhysicalClosed <$> readTVarIO (crState runtime)
+  unless closed $ do
+    received <- receiveFrame (crChannel runtime) buffered
+    case received of
+      Nothing -> pure ()
+      Just (framed, remaining) -> do
+        decoded <- either (throwIO . WebRTCFrameError) pure (decodeMessage framed Nothing Nothing)
+        accepted <- atomically $ applyMessage (crState runtime) decoded
+        when (accepted && snd decoded == Just 0) $ acknowledgeFIN runtime
+        state <- readTVarIO (crState runtime)
+        unless (channelPhysicalClosed state || bothHalvesFinished state) $
+          receiveLoop runtime remaining
+
+-- Payload and FIN become visible in the same transaction: EOF cannot overtake data.
+applyMessage :: TVar ChannelState -> (Maybe ByteString, Maybe Word64) -> STM Bool
+applyMessage stateVar (payload, flag) = do
+  state <- readTVar stateVar
+  if channelPhysicalClosed state then pure False else do
+    let updated = applyFlag flag state
+        dataAllowed = channelReceiveState state == Receiving && flag /= Just 2
+        bytes = if dataAllowed then maybe BS.empty id payload else BS.empty
+        total = channelBufferedSize updated + BS.length bytes
+    check (total <= 256 * 1024)
+    writeTVar stateVar updated
+      { channelBuffered = if BS.null bytes then channelBuffered updated else channelBuffered updated |> bytes
+      , channelBufferedSize = total
+      }
+    pure True
+
+applyFlag :: Maybe Word64 -> ChannelState -> ChannelState
+applyFlag (Just 0) state
+  | channelReceiveState state == Receiving = state { channelReceiveState = ReceivedFIN }
+applyFlag (Just 1) state
+  | channelSendState state `elem` [Sending, SentFIN] = state { channelSendState = SendStopped }
+applyFlag (Just 2) state
+  | channelReceiveState state == Receiving = state
+      { channelReceiveState = ReceiveReset, channelBuffered = Seq.empty, channelBufferedSize = 0 }
+applyFlag (Just 3) state
+  | channelSendState state == SentFIN = state { channelSendState = ReceivedFINAck }
+applyFlag _ state = state
+
+acknowledgeFIN :: ChannelRuntime -> IO ()
+acknowledgeFIN runtime = withMVar (crWriteLock runtime) $ \_ -> do
+  closed <- channelPhysicalClosed <$> readTVarIO (crState runtime)
+  unless closed $ dcSend (crChannel runtime) (encodeFlagFrame 3)
+
+bothHalvesFinished :: ChannelState -> Bool
+bothHalvesFinished state =
+  channelReceiveState state /= Receiving
+    && channelSendState state `elem` [ReceivedFINAck, SendStopped]
+
+-- Shutdown may run alongside a blocked send or receive, but never after free.
+shutdownChannel :: ChannelRuntime -> IO ()
+shutdownChannel runtime = do
+  first <- modifyMVar (crShutdownSent runtime) $ \sent -> pure (True, not sent)
+  when first $ withMVar (crLifetime runtime) $ \alive -> when alive $ do
+    shutdown <- atomically $ do
+      state <- readTVar (crState runtime)
+      writeTVar (crState runtime) (markClosed state)
+      pure (not (channelPhysicalClosed state))
+    when shutdown $ dcShutdown (crChannel runtime)
+
+-- Only the receive worker calls this, after leaving its last raw receive.
+finishChannel :: ChannelRuntime -> IO ()
+finishChannel runtime = withMVar (crWriteLock runtime) $ \_ -> do
+  alive <- modifyMVar (crLifetime runtime) $ \owned -> pure (False, owned)
+  atomically $ modifyTVar' (crState runtime) markClosed
+  when alive $ dcClose (crChannel runtime)
+
+markClosed :: ChannelState -> ChannelState
+markClosed state = state
+  { channelPhysicalClosed = True
+  , channelReceiveState = case channelReceiveState state of
+      Receiving -> ReceivedFIN
+      other -> other
+  }
+
+-- Preserve the underlying failure text; late failures after FIN stay silent.
+recordFailure :: ChannelRuntime -> SomeException -> IO ()
+recordFailure runtime exception = atomically $ modifyTVar' (crState runtime) $ \state ->
+  if channelPhysicalClosed state || channelReceiveState state /= Receiving then state else state
+    { channelReceiveState = ReceiveFailed (WebRTCFrameError (failureText exception)) }
+
+receiveFrame :: ChannelIO -> ByteString -> IO (Maybe (ByteString, ByteString))
 receiveFrame channel buffered = case extractFrame buffered of
-  Left message -> fail message
+  Left message -> throwIO (WebRTCFrameError message)
   Right (Just result) -> pure (Just result)
   Right Nothing -> do
-    received <- FFI.channelReceive channel
+    received <- dcReceive channel
     case received of
       Nothing
         | BS.null buffered -> pure Nothing
-        | otherwise -> fail "WebRTC stream frame is truncated"
+        | otherwise -> throwIO (WebRTCFrameError "WebRTC stream frame is truncated")
       Just bytes -> receiveFrame channel (buffered <> bytes)
 
 encodeDataFrame :: ByteString -> ByteString
@@ -93,8 +285,8 @@ extractFrame input = case decodeFrameLength input of
   Nothing -> Right Nothing
   Just (Left message) -> Left message
   Just (Right (frameLength, prefixLength)) -> do
-    let totalLength = frameLength + fromIntegral prefixLength
-    unless (totalLength <= 16384) $ Left "WebRTC stream frame exceeds 16 KiB"
+    unless (frameLength <= 16384 - fromIntegral prefixLength) $
+      Left "WebRTC stream frame exceeds 16 KiB"
     let byteCount = fromIntegral frameLength
         frameEnd = prefixLength + byteCount
     if BS.length input < frameEnd
