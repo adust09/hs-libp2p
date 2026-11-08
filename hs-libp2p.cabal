@@ -61,7 +61,6 @@ library
       LibP2P.Transport.WebRTC.Direct
       LibP2P.Transport.WebRTC.FFI
       LibP2P.Transport.WebRTC.Relay
-      LibP2P.Transport.WebRTC.Stream
     exposed-modules:
       LibP2P.Transport.WebRTC
       LibP2P.Transport.WebRTC.Signaling
@@ -89,6 +88,7 @@ library
     LibP2P.Transport
     LibP2P.Transport.TCP
     LibP2P.Transport.WebSocket
+    LibP2P.Transport.WebRTC.Stream
     LibP2P.Transport.WebTransport
     LibP2P.Transport.WebTransport.Certificate
     LibP2P.Transport.WebTransport.HTTP3
@@ -287,6 +287,7 @@ test-suite hs-libp2p-test
     LibP2P.Transport.WebSocketSpec
     LibP2P.Transport.WebTransportSpec
     LibP2P.Transport.WebRTCSpec
+    LibP2P.Transport.WebRTCStreamSpec
     LibP2P.Transport.QUICSpec
     LibP2P.Security.TLSSpec
     LibP2P.Security.TLS.CertificateSpec

@@ -59,7 +59,7 @@ import LibP2P.Transport.WebRTC.Signaling (
   signalingProtocolId,
   writeSignalingMessage,
  )
-import LibP2P.Transport.WebRTC.Stream (channelToStreamIO, closeOnce)
+import LibP2P.Transport.WebRTC.Stream (closeOnce)
 
 -- | A STUN server used to gather a server-reflexive ICE candidate.
 data STUNServer = STUNServer
@@ -310,8 +310,8 @@ rawSignaledConnection connection remotePeer localAddress remoteAddress = do
         { nativePeerId = remotePeer
         , nativeSecurity = "/webrtc"
         , nativeMuxerProtocol = "/webrtc"
-        , nativeOpenStream = FFI.connectionOpenChannel connection >>= channelToStreamIO
-        , nativeAcceptStream = FFI.connectionAcceptChannel connection >>= channelToStreamIO
+        , nativeOpenStream = FFI.connectionOpenChannel connection >>= FFI.channelStreamIO
+        , nativeAcceptStream = FFI.connectionAcceptChannel connection >>= FFI.channelStreamIO
         , nativeClose = close
         }
   pure RawConnection
