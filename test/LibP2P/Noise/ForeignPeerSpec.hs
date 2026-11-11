@@ -25,15 +25,17 @@ import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkMemoryStreamPair)
 import LibP2P.Noise.Handshake
   ( HandshakeResult (..)
   , HandshakeState (..)
-  , NoisePayload (..)
-  , buildHandshakePayload
-  , decodeNoisePayload
   , decodePublicKey
-  , encodeNoisePayload
   , initHandshakeInitiator
   , initHandshakeResponder
   , readHandshakeMsg
   , writeHandshakeMsg
+  )
+import LibP2P.Noise.Handshake.Payload
+  ( NoisePayload (..)
+  , buildHandshakePayload
+  , decodeNoisePayload
+  , encodeNoisePayload
   )
 import LibP2P.Noise.Session (NoiseSession, encryptMessage, mkNoiseSession)
 import LibP2P.Switch.Types (Direction (..))
@@ -84,14 +86,14 @@ runForeignResponder identityKP sigTarget stream = do
 
   -- Message 2: -> e, ee, s, es (identity payload, signature over sigTarget)
   payload <- either fail pure $
-    encodeNoisePayload <$> buildHandshakePayload identityKP (sigTarget staticPub)
+    encodeNoisePayload <$> buildHandshakePayload identityKP (sigTarget staticPub) Nothing
   (msg2, st2) <- either fail pure $ writeHandshakeMsg st1 payload
   writeFramedMessage stream msg2
 
   -- Message 3: <- s, se (initiator identity payload)
   msg3 <- readFramedMessage stream
   (p3, _stFinal) <- either fail pure $ readHandshakeMsg st2 msg3
-  np <- either fail pure $ decodeNoisePayload p3
+  np <- either (fail . show) pure $ decodeNoisePayload p3
   pk <- either fail pure $ decodePublicKey (npIdentityKey np)
   pure (fromPublicKey pk, pk)
 
@@ -109,12 +111,12 @@ runForeignInitiator identityKP sigTarget stream = do
   -- Message 2: <- e, ee, s, es (responder identity payload)
   msg2 <- readFramedMessage stream
   (p2, st2) <- either fail pure $ readHandshakeMsg st1 msg2
-  np <- either fail pure $ decodeNoisePayload p2
+  np <- either (fail . show) pure $ decodeNoisePayload p2
   pk <- either fail pure $ decodePublicKey (npIdentityKey np)
 
   -- Message 3: -> s, se (identity payload, signature over sigTarget)
   payload <- either fail pure $
-    encodeNoisePayload <$> buildHandshakePayload identityKP (sigTarget staticPub)
+    encodeNoisePayload <$> buildHandshakePayload identityKP (sigTarget staticPub) Nothing
   (msg3, _stFinal) <- either fail pure $ writeHandshakeMsg st2 payload
   writeFramedMessage stream msg3
   pure (fromPublicKey pk, pk)
@@ -139,7 +141,7 @@ runForeignResponderSession identityKP stream = do
   msg1 <- readFramedMessage stream
   (_p1, st1) <- either fail pure $ readHandshakeMsg st0 msg1
   payload <- either fail pure $
-    encodeNoisePayload <$> buildHandshakePayload identityKP staticPub
+    encodeNoisePayload <$> buildHandshakePayload identityKP staticPub Nothing
   (msg2, st2) <- either fail pure $ writeHandshakeMsg st1 payload
   writeFramedMessage stream msg2
   msg3 <- readFramedMessage stream
@@ -155,7 +157,7 @@ spec = do
       (streamA, streamB) <- mkMemoryStreamPair
       ((_sess, result), (foreignSeenPid, foreignSeenKey)) <-
         concurrently
-          (performStreamHandshake kpA Outbound streamA)
+          (performStreamHandshake kpA Nothing Outbound streamA)
           (runForeignResponder kpB id streamB)
       -- Production side sees the foreign peer's identity ...
       hrRemotePeerId result `shouldBe` pidB
@@ -170,7 +172,7 @@ spec = do
       (streamA, streamB) <- mkMemoryStreamPair
       ((_sess, result), (foreignSeenPid, foreignSeenKey)) <-
         concurrently
-          (performStreamHandshake kpA Inbound streamA)
+          (performStreamHandshake kpA Nothing Inbound streamA)
           (runForeignInitiator kpB id streamB)
       hrRemotePeerId result `shouldBe` pidB
       hrRemotePublicKey result `shouldBe` kpPublic kpB
@@ -186,7 +188,7 @@ spec = do
       -- replaying an intercepted payload looks like on the wire. It blocks
       -- waiting for msg3 (which never comes) and is cancelled by withAsync.
       withAsync (runForeignResponder kpB (const foreignStaticKey) streamB) $ \_ ->
-        performStreamHandshake kpA Outbound streamA
+        performStreamHandshake kpA Nothing Outbound streamA
           `shouldThrow` isSignatureRejection
 
     it "responder rejects an initiator whose identity_sig covers the wrong static key" $ do
@@ -194,7 +196,7 @@ spec = do
       (_pidB, kpB) <- mkTestIdentity
       (streamA, streamB) <- mkMemoryStreamPair
       withAsync (runForeignInitiator kpB (const foreignStaticKey) streamB) $ \_ ->
-        performStreamHandshake kpA Inbound streamA
+        performStreamHandshake kpA Nothing Inbound streamA
           `shouldThrow` isSignatureRejection
 
     it "empty transport messages between data frames do not kill the connection" $ do
@@ -208,7 +210,7 @@ spec = do
       (streamA, streamB) <- mkMemoryStreamPair
       ((prodSess, _result), foreignSess) <-
         concurrently
-          (performStreamHandshake kpA Outbound streamA)
+          (performStreamHandshake kpA Nothing Outbound streamA)
           (runForeignResponderSession kpB streamB)
       -- Foreign peer sends: data, zero-length frame, tag-only frame, data.
       (ct1, fs1) <- either fail pure $ encryptMessage foreignSess "hello"
@@ -235,8 +237,8 @@ spec = do
       (_pidEve, kpEve) <- mkTestIdentity
       (streamA, streamB) <- mkMemoryStreamPair
       let impersonate staticPub = do
-            honest <- buildHandshakePayload kpEve staticPub
-            bobPayload <- buildHandshakePayload kpBob staticPub
+            honest <- buildHandshakePayload kpEve staticPub Nothing
+            bobPayload <- buildHandshakePayload kpBob staticPub Nothing
             Right honest {npIdentityKey = npIdentityKey bobPayload}
           eveResponder stream = do
             (st0, staticPub) <- initHandshakeResponder kpEve
@@ -246,7 +248,7 @@ spec = do
             (msg2, _st2) <- either fail pure $ writeHandshakeMsg st1 payload
             writeFramedMessage stream msg2
       withAsync (eveResponder streamB) $ \_ ->
-        performStreamHandshake kpA Outbound streamA
+        performStreamHandshake kpA Nothing Outbound streamA
           `shouldThrow` isSignatureRejection
 
   describe "Peer disconnect during the handshake (EOF harness)" $ do
@@ -264,7 +266,7 @@ spec = do
       -- direction, but the reply direction is already at EOF.
       streamClose streamB
       shouldFailCleanlyWithin 2000000 $
-        performStreamHandshake kpA Outbound streamA
+        performStreamHandshake kpA Nothing Outbound streamA
 
     it "initiator fails cleanly when the peer disconnects mid-frame of msg2" $ do
       (_pidA, kpA) <- mkTestIdentity
@@ -274,14 +276,14 @@ spec = do
       streamWrite streamB (BS.pack [0x00, 0x60] <> BS.replicate 10 0xAA)
       streamClose streamB
       shouldFailCleanlyWithin 2000000 $
-        performStreamHandshake kpA Outbound streamA
+        performStreamHandshake kpA Nothing Outbound streamA
 
     it "responder fails cleanly when the peer disconnects before msg1" $ do
       (_pidB, kpB) <- mkTestIdentity
       (streamA, streamB) <- mkEofStreamPair
       streamClose streamA
       shouldFailCleanlyWithin 2000000 $
-        performStreamHandshake kpB Inbound streamB
+        performStreamHandshake kpB Nothing Inbound streamB
 
     it "responder fails cleanly when the peer disconnects after msg1, before msg3" $ do
       -- A well-formed foreign initiator sends a real msg1 and then
@@ -295,7 +297,7 @@ spec = do
       writeFramedMessage streamA msg1
       streamClose streamA
       shouldFailCleanlyWithin 2000000 $
-        performStreamHandshake kpB Inbound streamB
+        performStreamHandshake kpB Nothing Inbound streamB
 
     it "established connection: EOF mid-encrypted-frame is a clean error, not a partial read" $ do
       (_pidA, kpA) <- mkTestIdentity
@@ -303,7 +305,7 @@ spec = do
       (streamA, streamB) <- mkEofStreamPair
       ((prodSess, _result), foreignSess) <-
         concurrently
-          (performStreamHandshake kpA Outbound streamA)
+          (performStreamHandshake kpA Nothing Outbound streamA)
           (runForeignResponderSession kpB streamB)
       -- Foreign peer sends one complete frame, then a frame whose
       -- header declares the full ciphertext length but whose body is

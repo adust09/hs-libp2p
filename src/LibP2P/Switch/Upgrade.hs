@@ -4,7 +4,8 @@
 -- (secure + multiplexed) Connection by executing a 4-step pipeline:
 --   1. multistream-select: negotiate security protocol (Noise or TLS 1.3)
 --   2. secure handshake: encrypted channel + remote PeerId
---   3. negotiate Yamux via multistream-select or TLS ALPN
+--   3. negotiate Yamux via TLS ALPN or multistream-select
+--      (skipped if the Noise handshake inlines the muxer negotiation (see: https://github.com/libp2p/specs/connections/inlined-muxer-negotiation.md))
 --   4. Yamux session init: multiplexed streams
 --
 -- Implements the connection upgrading pipeline.
@@ -33,11 +34,12 @@ module LibP2P.Switch.Upgrade
 import Control.Concurrent.Async (async, cancel, race, waitCatch)
 import Control.Concurrent.STM (STM, atomically, isEmptyTQueue, newTVarIO, retry)
 import Control.Exception (SomeException, catch, finally, mask, mask_, onException, throwIO)
-import Control.Monad (unless)
+import Control.Monad (unless, join)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Word (Word8)
+import Data.Text (unpack)
 import LibP2P.Core.Binary (readWord16BE)
 import LibP2P.Crypto.Key (KeyPair (..))
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
@@ -70,17 +72,19 @@ import LibP2P.MultistreamSelect.Negotiation
 import LibP2P.Noise.Framing (chunkPlaintext, encodeFrame)
 import LibP2P.Noise.Handshake
   ( HandshakeResult (..)
-  , buildHandshakePayload
-  , decodeNoisePayload
-  , encodeNoisePayload
   , getRemoteNoiseStaticKey
   , initHandshakeInitiator
   , initHandshakeInitiatorWithPrologue
   , initHandshakeResponder
   , initHandshakeResponderWithPrologue
   , readHandshakeMsg
-  , verifyStaticKey
   , writeHandshakeMsg
+  )
+import LibP2P.Noise.Handshake.Payload
+  ( decodeNoisePayload
+  , encodeNoisePayload
+  , buildHandshakePayload
+  , verifyStaticKey
   )
 import LibP2P.Noise.Session
   ( NoiseSession
@@ -123,6 +127,9 @@ import LibP2P.Transport
 import System.Timeout (timeout)
 import qualified LibP2P.Crypto.Protobuf as Proto
 import qualified LibP2P.Noise.Handshake as HS
+import qualified LibP2P.Noise.Handshake.Payload as NP
+import qualified Data.List.NonEmpty as NE
+import Data.List.NonEmpty (NonEmpty)
 
 -- | Read exactly n bytes from a StreamIO.
 --
@@ -153,27 +160,35 @@ writeFramedMessage stream msg =
   either fail (streamWrite stream) (encodeFrame msg)
 
 -- | Perform a Noise XX handshake over a StreamIO using framed messages.
--- Returns (NoiseSession, HandshakeResult) with the remote PeerId.
+-- Returns (NoiseSession, HandshakeResult) with the remote PeerId and
+-- the result of the inlined muxer negotiation (if any).
 performStreamHandshake
-  :: KeyPair -> Direction -> StreamIO -> IO (NoiseSession, HandshakeResult)
-performStreamHandshake identityKP dir =
-  performStreamHandshakeWithPrologue identityKP dir BS.empty
+  :: KeyPair -> Maybe NP.NoiseExtensions -> Direction -> StreamIO
+  -> IO (NoiseSession, HandshakeResult)
+performStreamHandshake identityKP exts dir =
+  performStreamHandshakeWithPrologue identityKP BS.empty exts dir
 
 -- | Perform Noise XX with a transport-binding prologue.
 performStreamHandshakeWithPrologue
-  :: KeyPair -> Direction -> ByteString -> StreamIO -> IO (NoiseSession, HandshakeResult)
-performStreamHandshakeWithPrologue identityKP dir prologue stream = case dir of
-  Outbound -> performInitiatorHandshake identityKP prologue stream
-  Inbound  -> performResponderHandshake identityKP prologue stream
+  :: KeyPair -> ByteString -> Maybe NP.NoiseExtensions -> Direction -> StreamIO
+  -> IO (NoiseSession, HandshakeResult)
+performStreamHandshakeWithPrologue identityKP prologue exts dir stream =
+  case dir of
+    Outbound -> performInitiatorHandshake identityKP prologue exts stream
+    Inbound  -> performResponderHandshake identityKP prologue exts stream
 
 -- | Initiator (dialer) side of the Noise XX handshake.
 --
 -- Message flow:
 --   1. Initiator → Responder: e (empty payload)
---   2. Responder → Initiator: e, ee, s, es (responder identity payload)
---   3. Initiator → Responder: s, se (initiator identity payload)
-performInitiatorHandshake :: KeyPair -> ByteString -> StreamIO -> IO (NoiseSession, HandshakeResult)
-performInitiatorHandshake identityKP prologue stream = do
+--   2. Responder → Initiator: e, ee, s, es (responder identity payload,
+--      optionally carrying the responder's inlined muxer list)
+--   3. Initiator → Responder: s, se (initiator identity payload,
+--      optionally carrying the initiator's inlined muxer list)
+performInitiatorHandshake
+  :: KeyPair -> ByteString -> Maybe NP.NoiseExtensions -> StreamIO
+  -> IO (NoiseSession, HandshakeResult)
+performInitiatorHandshake identityKP prologue initiatorExts stream = do
   (hsState0, noiseStaticPub) <-
     if BS.null prologue
       then initHandshakeInitiator identityKP
@@ -184,39 +199,69 @@ performInitiatorHandshake identityKP prologue stream = do
     writeHandshakeMsg hsState0 BS.empty
   writeFramedMessage stream msg1
 
-  -- Message 2: ← (responder's identity payload)
+  -- Message 2: ← (responder's identity payload, possibly with muxers)
   msg2 <- readFramedMessage stream
   (payload2, hsState2) <- either (fail . ("initiator msg2 read: " <>)) pure $
     readHandshakeMsg hsState1 msg2
 
   -- Decode responder's identity
-  remoteNP <- either (fail . ("initiator decode payload: " <>)) pure $
+  remoteNP <- either (fail . ("initiator decode payload: " <>) . show) pure $
     decodeNoisePayload payload2
   remotePubKey <- either (fail . ("initiator decode pubkey: " <>)) pure $
-    Proto.decodePublicKey (HS.npIdentityKey remoteNP)
+    Proto.decodePublicKey (NP.npIdentityKey remoteNP)
   let remotePeerId = fromPublicKey remotePubKey
 
   -- Verify identity_sig: binds identity key to Noise static key
   case getRemoteNoiseStaticKey hsState2 of
     Nothing -> fail "performInitiatorHandshake: remote Noise static key unavailable after msg2"
     Just remoteNoisePub ->
-      if not (verifyStaticKey remotePubKey remoteNoisePub (HS.npIdentitySig remoteNP))
-        then fail "performInitiatorHandshake: identity signature verification failed"
-        else pure ()
+      unless (verifyStaticKey remotePubKey remoteNoisePub (NP.npIdentitySig remoteNP)) $
+        fail "performInitiatorHandshake: identity signature verification failed"
 
-  -- Message 3: → (initiator's identity payload)
+  -- Inlined muxer negotiation (initiator prefers its own order)
+  let initiatorMuxers = join $ fmap NP.nExtStreamMuxers initiatorExts
+      responderMuxers = NP.getStreamMuxers remoteNP
+      negotiatedMuxer = matchMuxers initiatorMuxers responderMuxers
+
+  case negotiatedMuxer of
+    HS.NoOverlap -> fail "performInitiatorHandshake: both peers supply non-overlapping muxer lists"
+    HS.Selected _ -> pure ()
+    HS.Fallback -> pure ()
+
+  -- Message 3: → (initiator's identity payload, possibly with muxers)
   identPayload <- either (fail . ("initiator payload build: " <>)) pure $
-    encodeNoisePayload <$> buildHandshakePayload identityKP noiseStaticPub
+    encodeNoisePayload <$> buildHandshakePayload identityKP noiseStaticPub initiatorExts
   (msg3, hsStateFinal) <- either (fail . ("initiator msg3 write: " <>)) pure $
     writeHandshakeMsg hsState2 identPayload
   writeFramedMessage stream msg3
 
   let noiseSession = mkNoiseSession (HS.hsNoiseState hsStateFinal)
-  pure (noiseSession, HandshakeResult remotePeerId remotePubKey)
+  pure (noiseSession, HandshakeResult remotePeerId remotePubKey negotiatedMuxer)
+
+-- | Iterates the initiator's muxer list and checks if each muxer is
+-- supported by the responder. The chosen muxer prioritizes the
+-- initiator's preference.
+matchMuxers
+  :: Maybe (NonEmpty ProtocolId)
+  -> Maybe (NonEmpty ProtocolId)
+  -> HS.InlinedNegotiationResult
+matchMuxers Nothing Nothing = HS.Fallback
+matchMuxers Nothing (Just _) = HS.Fallback
+matchMuxers (Just _) Nothing = HS.Fallback
+matchMuxers (Just initMuxers) (Just respMuxers) =
+  matchMuxers' (NE.toList initMuxers) respMuxers
+  where
+    matchMuxers' :: [ProtocolId] -> NonEmpty ProtocolId -> HS.InlinedNegotiationResult
+    matchMuxers' [] _ = HS.NoOverlap
+    matchMuxers' (m:ms) muxers
+      | m `elem` muxers = HS.Selected m
+      | otherwise = matchMuxers' ms muxers
 
 -- | Responder (listener) side of the Noise XX handshake.
-performResponderHandshake :: KeyPair -> ByteString -> StreamIO -> IO (NoiseSession, HandshakeResult)
-performResponderHandshake identityKP prologue stream = do
+performResponderHandshake
+  :: KeyPair -> ByteString -> Maybe NP.NoiseExtensions -> StreamIO
+  -> IO (NoiseSession, HandshakeResult)
+performResponderHandshake identityKP prologue responderExts stream = do
   (hsState0, noiseStaticPub) <-
     if BS.null prologue
       then initHandshakeResponder identityKP
@@ -227,35 +272,44 @@ performResponderHandshake identityKP prologue stream = do
   (_payload1, hsState1) <- either (fail . ("responder msg1 read: " <>)) pure $
     readHandshakeMsg hsState0 msg1
 
-  -- Message 2: → (responder's identity payload)
+  -- Message 2: → (responder's identity payload, possibly with muxers)
   identPayload <- either (fail . ("responder payload build: " <>)) pure $
-    encodeNoisePayload <$> buildHandshakePayload identityKP noiseStaticPub
+    encodeNoisePayload <$> buildHandshakePayload identityKP noiseStaticPub responderExts
   (msg2, hsState2) <- either (fail . ("responder msg2 write: " <>)) pure $
     writeHandshakeMsg hsState1 identPayload
   writeFramedMessage stream msg2
 
-  -- Message 3: ← (initiator's identity payload)
+  -- Message 3: ← (initiator's identity payload, possibly with muxers)
   msg3 <- readFramedMessage stream
   (payload3, hsStateFinal) <- either (fail . ("responder msg3 read: " <>)) pure $
     readHandshakeMsg hsState2 msg3
 
   -- Decode initiator's identity
-  remoteNP <- either (fail . ("responder decode payload: " <>)) pure $
+  remoteNP <- either (fail . ("responder decode payload: " <>) . show) pure $
     decodeNoisePayload payload3
   remotePubKey <- either (fail . ("responder decode pubkey: " <>)) pure $
-    Proto.decodePublicKey (HS.npIdentityKey remoteNP)
+    Proto.decodePublicKey (NP.npIdentityKey remoteNP)
   let remotePeerId = fromPublicKey remotePubKey
 
   -- Verify identity_sig: binds identity key to Noise static key
   case getRemoteNoiseStaticKey hsStateFinal of
     Nothing -> fail "performResponderHandshake: remote Noise static key unavailable after msg3"
     Just remoteNoisePub ->
-      if not (verifyStaticKey remotePubKey remoteNoisePub (HS.npIdentitySig remoteNP))
-        then fail "performResponderHandshake: identity signature verification failed"
-        else pure ()
+      unless (verifyStaticKey remotePubKey remoteNoisePub (NP.npIdentitySig remoteNP)) $
+        fail "performResponderHandshake: identity signature verification failed"
+
+  -- Inlined muxer negotiation (responder respects initiator's order)
+  let initiatorMuxers = NP.getStreamMuxers remoteNP
+      responderMuxers = join $ fmap NP.nExtStreamMuxers responderExts
+      negotiatedMuxer = matchMuxers initiatorMuxers responderMuxers
+
+  case negotiatedMuxer of
+    HS.NoOverlap -> fail "performResponderHandshake: both peers supply non-overlapping muxer lists"
+    HS.Selected _ -> pure ()
+    HS.Fallback -> pure ()
 
   let noiseSession = mkNoiseSession (HS.hsNoiseState hsStateFinal)
-  pure (noiseSession, HandshakeResult remotePeerId remotePubKey)
+  pure (noiseSession, HandshakeResult remotePeerId remotePubKey negotiatedMuxer)
 
 -- | Create an encrypted StreamIO from a NoiseSession and raw StreamIO.
 --
@@ -397,21 +451,10 @@ goAwayFlushTimeoutUs = 200000
 
 -- | Wrap a YamuxSession as a MuxerSession.
 -- Starts sendLoop, recvLoop and keepaliveLoop as background threads.
--- The MuxerSession provides open/accept stream operations that
--- produce StreamIO-compatible streams.
---
--- The supplied close action closes the underlying transport; muxClose
--- runs it after sending GoAway and stopping the session loops, so
--- closing a connection actually releases the socket.
 yamuxToMuxerSession :: YamuxSession -> IO () -> IO MuxerSession
 yamuxToMuxerSession yamuxSess closeTransport = do
-  -- Start background loops
   sendLoopA <- async (sendLoop yamuxSess)
   recvLoopA <- async (recvLoop yamuxSess)
-  -- A failed keepalive means the peer went silent without closing the
-  -- transport, so recvLoop is still blocked on a read that will never
-  -- return. Stopping it is what makes muxAcceptStream fail and the
-  -- Switch tear the connection down.
   keepaliveA <- async $ do
     result <- keepaliveLoop yamuxSess
     case result of
@@ -424,10 +467,6 @@ yamuxToMuxerSession yamuxSess closeTransport = do
           Right stream -> yamuxStreamToStreamIO account stream
           Left err -> fail $ "muxOpenStream: " <> show err
     , muxAcceptStream = do
-        -- Fail the accept as soon as the receive loop dies (remote
-        -- GoAway followed by EOF, transport error, or local close), so
-        -- the Switch's stream accept loop exits and tears down the
-        -- connection instead of blocking forever.
         result <- race (waitCatch recvLoopA) (Yamux.acceptStream yamuxSess)
         case result of
           Left _ -> fail "muxAcceptStream: session terminated"
@@ -435,8 +474,6 @@ yamuxToMuxerSession yamuxSess closeTransport = do
             yamuxStreamToStreamIO (ysMemoryAccount stream) stream
           Right (Left err) -> fail $ "muxAcceptStream: " <> show err
     , muxClose = do
-        -- Queue GoAway, give the send loop a bounded window to flush
-        -- it, then stop the loops and close the underlying transport.
         closeSession yamuxSess
         _ <- timeout goAwayFlushTimeoutUs $ atomically $ do
           empty <- isEmptyTQueue (ysessSendCh yamuxSess)
@@ -448,8 +485,6 @@ yamuxToMuxerSession yamuxSess closeTransport = do
     }
 
 -- | Convert a YamuxStream to StreamIO with a read buffer.
--- Yamux delivers data in chunks via streamRead; an IORef buffer holds
--- the bytes a byte- or chunk-level read did not consume.
 yamuxStreamToStreamIO :: MemoryAccount -> YamuxStream -> IO StreamIO
 yamuxStreamToStreamIO account yamuxStream = do
   readBuf <- newIORef BS.empty
@@ -489,13 +524,13 @@ yamuxStreamToStreamIO account yamuxStream = do
 -- | Upgrade a raw connection, taking every role from the direction.
 --
 -- Byte streams negotiate Noise or TLS 1.3, then Yamux. TLS can inline
--- Yamux negotiation through ALPN; Noise and legacy TLS peers use a second
+-- Yamux negotiation through ALPN; Noise can inline it through early
+-- data in the handshake payload. Legacy peers use a second
 -- multistream-select exchange. The direction determines every protocol role.
 upgradeAs :: ResourceManager -> Direction -> KeyPair -> RawConnection -> IO Connection
 upgradeAs = upgradeAsWithConfig defaultYamuxConfig
 
--- | Like 'upgradeAs', with an explicit Yamux configuration. A native
--- multiplexer (QUIC) does not run Yamux, so the configuration is unused there.
+-- | Like 'upgradeAs', with an explicit Yamux configuration.
 upgradeAsWithConfig
   :: YamuxConfig
   -> ResourceManager
@@ -520,8 +555,7 @@ upgradeWithSwitchConfig config rm =
     rm
     (scSecurityProtocols config)
 
--- | Upgrade with an explicit security preference list. Exported for conformance
--- tests and embedders that need to require one secure transport.
+-- | Upgrade with an explicit security preference list.
 upgradeAsWithSecurityProtocols
   :: ResourceManager
   -> [ProtocolId]
@@ -549,6 +583,14 @@ upgradeAsWithOptions yamuxConfig rm securityProtocols dir identityKP rawConn =
 data MuxerNegotiation
   = NegotiateMuxer
   | InlinedMuxer ProtocolId
+
+-- | Muxers this implementation advertises for inlined Noise negotiation.
+supportedMuxers :: NonEmpty ProtocolId
+supportedMuxers = NE.fromList [yamuxProtocolId]
+
+-- | Noise extensions advertised in the handshake payload.
+noiseExtensions :: Maybe NP.NoiseExtensions
+noiseExtensions = Just $ NP.NoiseExtensions [] $ Just supportedMuxers
 
 upgradeByteStream
   :: YamuxConfig
@@ -584,16 +626,21 @@ upgradeNoiseChannel
   -> String
   -> IO Connection
 upgradeNoiseChannel yamuxConfig rm dir identityKP rawConn rawIO negotiate role = do
-  (noiseSess, HandshakeResult remotePeerId _remotePK) <-
-    performStreamHandshake identityKP dir rawIO
+  (noiseSess, HandshakeResult remotePeerId _remotePK negotiatedMuxer) <-
+    performStreamHandshake identityKP noiseExtensions dir rawIO
   connScope <- acquireConnectionScope rm remotePeerId dir
   sendRef <- newIORef noiseSess
   recvRef <- newIORef noiseSess
   bufRef <- newIORef BS.empty
   let encryptedIO = noiseSessionToManagedStreamIO
         (scopeMemoryAccount rm connScope) sendRef recvRef bufRef rawIO
+      muxerNegotiation = case negotiatedMuxer of
+        HS.Selected protocol -> InlinedMuxer protocol
+        HS.Fallback           -> NegotiateMuxer
+        HS.NoOverlap ->
+          error $ role <> ": non-overlapping muxer list should have failed at handshake"
   finishSecureUpgrade yamuxConfig rm dir rawConn connScope remotePeerId "/noise"
-    encryptedIO (pure ()) NegotiateMuxer negotiate role
+    encryptedIO (pure ()) muxerNegotiation negotiate role
     `onException` atomically (releaseConnection rm connScope)
 
 upgradeTLSChannel
@@ -622,7 +669,7 @@ upgradeTLSChannel yamuxConfig rm dir identityKP rawConn rawIO negotiate role = d
 tlsMuxerNegotiation :: TLSHandshakeResult -> Either String MuxerNegotiation
 tlsMuxerNegotiation result = case tlsNegotiatedALPN result of
   Just protocol
-    | protocol == "/yamux/1.0.0" -> Right (InlinedMuxer yamuxProtocolId)
+    | protocol == yamuxProtocolId -> Right (InlinedMuxer yamuxProtocolId)
     | protocol == libp2pALPN -> Right NegotiateMuxer
     | otherwise -> Left "TLS handshake selected an unsupported ALPN protocol"
   Nothing -> Left "TLS handshake did not negotiate ALPN"

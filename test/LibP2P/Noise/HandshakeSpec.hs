@@ -1,13 +1,15 @@
 module LibP2P.Noise.HandshakeSpec (spec) where
 
 import qualified Data.ByteString as BS
+import qualified Data.List.NonEmpty as NE
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key
-import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
+import LibP2P.Crypto.PeerId (fromPublicKey)
 import LibP2P.Core.Varint (encodeUvarint)
 import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.Noise.Framing
 import LibP2P.Noise.Handshake
+import LibP2P.Noise.Handshake.Payload
 import LibP2P.Noise.Session
 import Test.Hspec
 
@@ -119,7 +121,7 @@ spec = do
 
     it "identity_sig covers the literal domain-separation prefix bytes" $ do
       -- The prefix is built here from a string literal on purpose: this
-      -- pins the constant in Handshake.hs to the bytes the Noise spec
+      -- pins the constant in Handshake/Payload.hs to the bytes the Noise spec
       -- mandates, independently of the constant itself. A typo in the
       -- prefix would keep every self-paired test green while silently
       -- breaking interop with go-libp2p/rust-libp2p.
@@ -140,15 +142,16 @@ spec = do
       let noiseStaticPK = BS.replicate 32 0xCC
       case signStaticKey (kpPrivate kp) noiseStaticPK of
         Right identSig -> do
-          let payload = NoisePayload identKey identSig
+          let payload = NoisePayload identKey identSig Nothing
           let encoded = encodeNoisePayload payload
           decodeNoisePayload encoded `shouldBe` Right payload
         Left err -> expectationFailure err
 
     it "round-trip with various sizes" $ do
       let key = BS.replicate 36 0x11
-      let sig = BS.replicate 64 0x22
-      let payload = NoisePayload key sig
+          sig = BS.replicate 64 0x22
+          ext = NoiseExtensions (replicate 4 (BS.replicate 8 0x44) ) (NE.nonEmpty $ replicate 8 "aa/bb")
+          payload = NoisePayload key sig $ Just ext
       decodeNoisePayload (encodeNoisePayload payload) `shouldBe` Right payload
 
     it "decodes fields in reversed order (identity_sig before identity_key)" $ do
@@ -159,17 +162,52 @@ spec = do
           reversed =
             BS.singleton 0x12 <> encodeUvarint (fromIntegral (BS.length sig)) <> sig
               <> BS.singleton 0x0a <> encodeUvarint (fromIntegral (BS.length key)) <> key
-      decodeNoisePayload reversed `shouldBe` Right (NoisePayload key sig)
+      decodeNoisePayload reversed `shouldBe` Right (NoisePayload key sig Nothing)
 
-    it "skips an unknown trailing length-delimited field (extensions, field 4)" $ do
-      -- go-libp2p appends a NoiseExtensions message as field 4.
+    it "decodes a NoiseExtensions message in field 4" $ do
+      -- go-libp2p emits NoiseExtensions as field 4. The inner message is
+      -- hand-derived from the noise spec schema: field 1 repeated bytes
+      -- (tag 0x0a), field 2 repeated string (tag 0x12).
       let key = BS.replicate 36 0x11
           sig = BS.replicate 64 0x22
-          ext = BS.pack [0xDE, 0xAD, 0xBE, 0xEF]
+          ext = NoiseExtensions
+            { nExtWebTransportCertHashes = [BS.replicate 8 0x44]
+            , nExtStreamMuxers = NE.nonEmpty ["/yamux/1.0.0"]
+            }
+          inner =
+            BS.singleton 0x0a <> encodeUvarint 8 <> BS.replicate 8 0x44
+              <> BS.singleton 0x12
+                <> encodeUvarint (fromIntegral (BS.length "/yamux/1.0.0"))
+                <> "/yamux/1.0.0"
           encoded =
-            encodeNoisePayload (NoisePayload key sig)
-              <> BS.singleton 0x22 <> encodeUvarint (fromIntegral (BS.length ext)) <> ext
-      decodeNoisePayload encoded `shouldBe` Right (NoisePayload key sig)
+            encodeNoisePayload (NoisePayload key sig Nothing)
+              <> BS.singleton 0x22 <> encodeUvarint (fromIntegral (BS.length inner)) <> inner
+      decodeNoisePayload encoded `shouldBe` Right (NoisePayload key sig (Just ext))
+
+    it "fails on a malformed NoiseExtensions message in field 4" $ do
+      -- Field 4 is parsed, not skipped: an invalid wire type inside the
+      -- embedded message is a decode error (previously this garbage was
+      -- silently ignored when field 4 was skipped wholesale).
+      let key = BS.replicate 36 0x11
+          sig = BS.replicate 64 0x22
+          -- Inner tag 0x0e = field 1, wire type 6 (invalid).
+          inner = BS.pack [0x0e, 0x00]
+          encoded =
+            encodeNoisePayload (NoisePayload key sig Nothing)
+              <> BS.singleton 0x22 <> encodeUvarint (fromIntegral (BS.length inner)) <> inner
+      decodeNoisePayload encoded `shouldSatisfy` isLeft
+
+    it "distinguishes an absent field 4 from a present empty one" $ do
+      -- proto3-wire `embedded` yields Nothing when the field is absent and
+      -- Just for a zero-length embedded message; pin that presence rule so
+      -- "peer sent no extensions" stays distinguishable from "peer sent
+      -- an empty extensions message".
+      let key = BS.replicate 36 0x11
+          sig = BS.replicate 64 0x22
+          base = encodeNoisePayload (NoisePayload key sig Nothing)
+      decodeNoisePayload base `shouldBe` Right (NoisePayload key sig Nothing)
+      decodeNoisePayload (base <> BS.pack [0x22, 0x00])
+        `shouldBe` Right (NoisePayload key sig (Just (NoiseExtensions [] Nothing)))
 
     it "round-trips WebTransport certhashes in Noise extensions" $ do
       let payload = NoisePayload (BS.replicate 36 0x11) (BS.replicate 64 0x22)
@@ -199,7 +237,7 @@ spec = do
           field2 = BS.singleton 0x12 <> encodeUvarint (fromIntegral (BS.length sig)) <> sig
           unknown = encodeUvarint 16376 <> encodeUvarint 300
       decodeNoisePayload (field1 <> unknown <> field2)
-        `shouldBe` Right (NoisePayload key sig)
+        `shouldBe` Right (NoisePayload key sig Nothing)
 
     it "skips unknown fixed32 and fixed64 fields" $ do
       let key = BS.replicate 36 0x11
@@ -211,7 +249,7 @@ spec = do
           -- Field 6, wire type 1 (fixed64): tag = 6 << 3 | 1 = 0x31.
           fixed64 = BS.singleton 0x31 <> BS.replicate 8 0xCD
       decodeNoisePayload (fixed32 <> field1 <> fixed64 <> field2)
-        `shouldBe` Right (NoisePayload key sig)
+        `shouldBe` Right (NoisePayload key sig Nothing)
 
     it "fails when identity_key (field 1) is missing" $ do
       let sig = BS.replicate 64 0x22
@@ -239,12 +277,12 @@ spec = do
       -- not abort the process (issue #166, item 3).
       Right kp <- generateKeyPair
       let badKP = kp {kpPrivate = PrivateKey Ed25519 (BS.replicate 10 0x00)}
-      case buildHandshakePayload badKP (BS.replicate 32 0xAA) of
+      case buildHandshakePayload badKP (BS.replicate 32 0xAA) Nothing of
         Left err -> err `shouldContain` "buildHandshakePayload"
         Right _ -> expectationFailure "expected Left for a malformed private key"
 
   describe "Noise XX handshake" $ do
-    it "completes 3-message handshake between initiator and responder" $ do
+    it "completes 3-message handshake between initiator and responder without extension" $ do
       -- Generate identity key pairs for both peers
       Right aliceIdentity <- generateKeyPair
       Right bobIdentity <- generateKeyPair
@@ -262,28 +300,82 @@ spec = do
 
       -- Message 2: Bob -> Alice (ephemeral + static key, identity payload)
       bobPayload <- either fail pure $
-        encodeNoisePayload <$> buildHandshakePayload bobIdentity bobNoiseStaticPub
+        encodeNoisePayload <$> buildHandshakePayload bobIdentity bobNoiseStaticPub Nothing
       (msg2, bobState2) <- either fail pure $ writeHandshakeMsg bobState1 bobPayload
       (payload2, aliceState2) <- either fail pure $ readHandshakeMsg aliceState1 msg2
 
       -- Alice can decode Bob's identity from payload2
       case decodeNoisePayload payload2 of
-        Left err -> expectationFailure $ "Failed to decode Bob's payload: " <> err
+        Left err -> expectationFailure $ "Failed to decode Bob's payload: " <> show err
         Right np -> do
           let remotePubKey = decodePublicKey (npIdentityKey np)
           remotePubKey `shouldSatisfy` isRight
 
       -- Message 3: Alice -> Bob (static key, identity payload)
       alicePayload <- either fail pure $
-        encodeNoisePayload <$> buildHandshakePayload aliceIdentity aliceNoiseStaticPub
+        encodeNoisePayload <$> buildHandshakePayload aliceIdentity aliceNoiseStaticPub Nothing
       (msg3, aliceSession) <- either fail pure $ writeHandshakeMsg aliceState2 alicePayload
       (payload3, bobSession) <- either fail pure $ readHandshakeMsg bobState2 msg3
 
       -- Bob can decode Alice's identity from payload3
       case decodeNoisePayload payload3 of
-        Left err -> expectationFailure $ "Failed to decode Alice's payload: " <> err
+        Left err -> expectationFailure $ "Failed to decode Alice's payload: " <> show err
         Right np -> do
           let remotePubKey = decodePublicKey (npIdentityKey np)
+          remotePubKey `shouldSatisfy` isRight
+
+      -- Both sides should indicate handshake is complete
+      sessionComplete aliceSession `shouldBe` True
+      sessionComplete bobSession `shouldBe` True
+
+    it "completes 3-message handshake between initiator and responder with extension" $ do
+      -- Generate identity key pairs for both peers
+      Right aliceIdentity <- generateKeyPair
+      Right bobIdentity <- generateKeyPair
+
+      -- Create handshake states
+      (aliceInit, aliceNoiseStaticPub) <- initHandshakeInitiator aliceIdentity
+      (bobInit, bobNoiseStaticPub) <- initHandshakeResponder bobIdentity
+
+      -- Message 1: Alice -> Bob (ephemeral key, empty payload)
+      (msg1, aliceState1) <- either fail pure $ writeHandshakeMsg aliceInit BS.empty
+      (payload1, bobState1) <- either fail pure $ readHandshakeMsg bobInit msg1
+
+      -- Message 1 has no encrypted payload
+      payload1 `shouldBe` BS.empty
+
+      -- Message 2: Bob -> Alice (ephemeral + static key, identity payload)
+      let bobMuxers = [ "/mplex/6.7.0", "/yamux/1.0.0" ]
+      let bobExts = buildInlinedExtensions bobMuxers
+      bobPayload <- either fail pure $
+        encodeNoisePayload <$> buildHandshakePayload bobIdentity bobNoiseStaticPub bobExts
+      (msg2, bobState2) <- either fail pure $ writeHandshakeMsg bobState1 bobPayload
+      (payload2, aliceState2) <- either fail pure $ readHandshakeMsg aliceState1 msg2
+
+      -- Alice can decode Bob's identity from payload2
+      case decodeNoisePayload payload2 of
+        Left err -> expectationFailure $ "Failed to decode Bob's payload: " <> show err
+        Right np -> do
+          let remoteMuxers = getStreamMuxers np
+          let remotePubKey = decodePublicKey (npIdentityKey np)
+          remoteMuxers `shouldBe` (Just $ NE.fromList bobMuxers)
+          remotePubKey `shouldSatisfy` isRight
+
+      -- Message 3: Alice -> Bob (static key, identity payload)
+      let aliceMuxers = [ "/yamux/1.0.0", "/mplex/6.7.0" ]
+      let aliceExts = buildInlinedExtensions aliceMuxers
+      alicePayload <- either fail pure $
+        encodeNoisePayload <$> buildHandshakePayload aliceIdentity aliceNoiseStaticPub aliceExts
+      (msg3, aliceSession) <- either fail pure $ writeHandshakeMsg aliceState2 alicePayload
+      (payload3, bobSession) <- either fail pure $ readHandshakeMsg bobState2 msg3
+
+      -- Bob can decode Alice's identity from payload3
+      case decodeNoisePayload payload3 of
+        Left err -> expectationFailure $ "Failed to decode Alice's payload: " <> show err
+        Right np -> do
+          let remoteMuxers = getStreamMuxers np
+          let remotePubKey = decodePublicKey (npIdentityKey np)
+          remoteMuxers `shouldBe` (Just $ NE.fromList aliceMuxers)
           remotePubKey `shouldSatisfy` isRight
 
       -- Both sides should indicate handshake is complete
@@ -321,7 +413,7 @@ spec = do
       -- Simulate: Bob pre-signed his identity for a different Noise session
       let bobOtherNoiseKey = BS.replicate 32 0xBB  -- arbitrary, not the actual session key
       replayedPayload <- either fail pure $
-        encodeNoisePayload <$> buildHandshakePayload bobIdentity bobOtherNoiseKey
+        encodeNoisePayload <$> buildHandshakePayload bobIdentity bobOtherNoiseKey Nothing
 
       -- Message 1 (normal)
       (msg1, aliceState1) <- either fail pure $ writeHandshakeMsg aliceInit BS.empty
@@ -332,8 +424,8 @@ spec = do
       (payload2, aliceState2) <- either fail pure $ readHandshakeMsg aliceState1 msg2
 
       -- Alice decodes payload (valid protobuf, Bob's key)
-      let Right remoteNP = decodeNoisePayload payload2
-      let Right remotePubKey = decodePublicKey (npIdentityKey remoteNP)
+      remoteNP <- either (fail . show) pure $ decodeNoisePayload payload2
+      remotePubKey <- either (fail . show) pure $ decodePublicKey (npIdentityKey remoteNP)
 
       -- Alice extracts the ACTUAL Noise static key from the handshake state
       case getRemoteNoiseStaticKey aliceState2 of
@@ -356,13 +448,13 @@ spec = do
       (_payload1, bobState1) <- either fail pure $ readHandshakeMsg bobInit msg1
 
       bobPayload <- either fail pure $
-        encodeNoisePayload <$> buildHandshakePayload bobIdentity bobNoiseStaticPub
+        encodeNoisePayload <$> buildHandshakePayload bobIdentity bobNoiseStaticPub Nothing
       (msg2, _bobState2) <- either fail pure $ writeHandshakeMsg bobState1 bobPayload
       (payload2, aliceState2) <- either fail pure $ readHandshakeMsg aliceState1 msg2
 
       -- Alice decodes Bob's legitimate payload
-      let Right remoteNP = decodeNoisePayload payload2
-      let Right remotePubKey = decodePublicKey (npIdentityKey remoteNP)
+      remoteNP <- either (fail . show) pure $ decodeNoisePayload payload2
+      remotePubKey <- either (fail . show) pure $ decodePublicKey (npIdentityKey remoteNP)
 
       -- Verification MUST pass: Bob signed his own Noise static key
       case getRemoteNoiseStaticKey aliceState2 of

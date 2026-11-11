@@ -138,8 +138,9 @@ library
     LibP2P.NAT.DCUtR
     LibP2P.NAT
     LibP2P.Noise.Framing
-    LibP2P.Noise.Handshake
     LibP2P.Noise.Session
+    LibP2P.Noise.Handshake
+    LibP2P.Noise.Handshake.Payload
     LibP2P.Noise.WebTransport
     LibP2P.Protocol.GossipSub.Types
     LibP2P.Protocol.GossipSub.Message
@@ -181,7 +182,7 @@ library
     stm         >= 2.4  && < 2.6,
     async       >= 2.2  && < 2.3,
     containers  >= 0.6  && < 0.8,
-    proto3-wire >= 1.4  && < 1.5,
+    proto3-wire >= 1.4.6  && < 1.5,
     list-shuffle >= 1.0  && < 1.1
 
 executable libp2p-interop
