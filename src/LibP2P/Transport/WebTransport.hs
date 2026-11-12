@@ -14,22 +14,26 @@ module LibP2P.Transport.WebTransport (
 ) where
 
 import Control.Applicative ((<|>))
-import Control.Concurrent (modifyMVar, modifyMVar_, newMVar)
+import Control.Concurrent (modifyMVar, modifyMVar_, newMVar, threadDelay)
 import Control.Concurrent.Async (Async, async, cancel, race, waitCatch)
 import Control.Concurrent.STM (
+  STM,
   TMVar,
   TQueue,
   atomically,
   newEmptyTMVarIO,
   newTQueueIO,
+  newTVarIO,
   putTMVar,
   readTMVar,
   readTQueue,
+  readTVar,
   tryPutTMVar,
   writeTQueue,
+  writeTVar,
  )
 import Control.Exception (SomeException, displayException, finally, onException, try)
-import Control.Monad (unless, void, when)
+import Control.Monad (forever, unless, void, when)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
@@ -97,10 +101,8 @@ webTransportMaxDatagramFrameSize = 65535
 
 {- | Construct a WebTransport transport with rolling short-lived self-signed
 TLS certificates. Listener addresses include the SHA-256 @/certhash@ of the
-active certificate and of its successor.
-
-A listener's address is fixed when it starts, so dialers holding that address
-can reach it until the successor certificate is replaced, roughly 26 days.
+active certificate and of its successor, and 'listenerCurrentAddr' follows
+the certificates as they roll.
 -}
 newWebTransportTransport :: KeyPair -> IO Transport
 newWebTransportTransport =
@@ -109,11 +111,14 @@ newWebTransportTransport =
 -- | 'newWebTransportTransport' with an injectable clock for certificate rolling.
 newWebTransportTransportWithClock :: IO DateTime -> KeyPair -> IO Transport
 newWebTransportTransportWithClock clock identity = do
-  certificates <- clock >>= newCertificateSet >>= newMVar
-  -- Rolled lazily on handshakes, so there is no timer to cancel on shutdown.
+  initial <- clock >>= newCertificateSet
+  certificates <- newMVar initial
+  published <- newTVarIO initial
+  -- Rolled on handshakes and by each listener's roll timer.
   let currentCertificates = modifyMVar certificates $ \current -> do
         now <- clock
         rolled <- rollCertificates now current
+        atomically (writeTVar published rolled)
         pure (rolled, rolled)
   pure
     Transport
@@ -121,7 +126,7 @@ newWebTransportTransportWithClock clock identity = do
       , transportDialFrom = \local remote -> case local of
           Nothing -> dialWebTransport identity remote
           Just _ -> fail "WebTransport does not support binding an existing listen address"
-      , transportListen = listenWebTransport identity currentCertificates
+      , transportListen = listenWebTransport identity currentCertificates (readTVar published)
       , transportCanDial = canDialWebTransport
       }
 
@@ -234,17 +239,17 @@ verifyExpectedPeer (Just expected) actual =
     fail "WebTransport Noise peer ID does not match the /p2p address"
 
 listenWebTransport ::
-  KeyPair -> IO CertificateSet -> Multiaddr -> IO Listener
-listenWebTransport identity currentCertificates requestedAddress = do
+  KeyPair -> IO CertificateSet -> STM CertificateSet -> Multiaddr -> IO Listener
+listenWebTransport identity currentCertificates publishedCertificates requestedAddress = do
   socketAddress <- either fail pure (listenSocketAddress requestedAddress)
   socket <- openServerSocket socketAddress
   boundBase <- Socket.getSocketName socket >>= socketAddressToWebTransport
-  certificates <- currentCertificates
-  let advertised =
+  let advertise certificates =
         foldl
           appendCerthash
           boundBase
           [wtHash (csActive certificates), wtHash (csNext certificates)]
+  advertised <- advertise <$> currentCertificates
   accepted <- newTQueueIO
   ready <- newEmptyTMVarIO
   worker <-
@@ -254,12 +259,21 @@ listenWebTransport identity currentCertificates requestedAddress = do
         (serverConfig currentCertificates ready)
         (acceptConnection identity currentCertificates advertised accepted)
   waitForServer worker ready `onException` closeServer worker socket
+  -- Roll without waiting for a handshake, so the advertised address moves on
+  -- before the successor certificate expires. Rolling is a no-op until due.
+  roller <- async $ forever (threadDelay rollCheckMicros >> void currentCertificates)
   pure
     Listener
       { listenerAccept = atomically (readTQueue accepted)
-      , listenerClose = closeServer worker socket
+      , listenerClose = cancel roller >> closeServer worker socket
       , listenerAddr = advertised
+      , listenerCurrentAddr = advertise <$> publishedCertificates
       }
+
+-- | How often a listener checks whether its certificates are due to roll,
+-- well inside the 30-minute rotation margin.
+rollCheckMicros :: Int
+rollCheckMicros = 60 * 1000000
 
 serverConfig :: IO CertificateSet -> TMVar () -> ServerConfig
 serverConfig currentCertificates ready =

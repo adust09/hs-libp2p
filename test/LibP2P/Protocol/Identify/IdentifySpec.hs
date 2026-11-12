@@ -42,7 +42,12 @@ import LibP2P.MultistreamSelect.Negotiation
   )
 import LibP2P.Protocol.Identify
 import LibP2P.Protocol.Identify.Message (IdentifyInfo (..), decodeIdentify, encodeIdentify, maxIdentifySize)
-import LibP2P.Switch (newSwitch, setStreamHandler)
+import LibP2P.Switch (addTransport, newSwitch, setStreamHandler, switchClose)
+import LibP2P.Switch.Listen (defaultConnectionGater, switchListen, switchListenAddrs)
+import LibP2P.Transport (Listener (..), Transport (..))
+import Control.Concurrent (threadDelay)
+import Control.Monad (forever)
+import System.Timeout (timeout)
 import LibP2P.Switch.CertifiedRecords (CertifiedRecord (..), lookupCertifiedRecord)
 import LibP2P.Switch.ResourceManager
   ( DefaultLimits (..)
@@ -774,6 +779,48 @@ spec = do
         Left err -> expectationFailure $ "push to the live peer failed: " ++ err
         Right info ->
           idObservedAddr info `shouldBe` Just (encodeProtocols [IP4 0x7f000001, TCP 2222])
+
+    it "pushes identify when a listener's advertised address changes" $ do
+      -- A WebTransport listener's address changes as its certificates roll;
+      -- connected peers must learn the new address (specs/identify push).
+      Right kp <- generateKeyPair
+      sw <- newSwitch (fromPublicKey (kpPublic kp)) kp
+      let addrA = Multiaddr [IP4 0x7f000001, TCP 4101]
+          addrB = Multiaddr [IP4 0x7f000001, TCP 4102]
+          encoded (Multiaddr ps) = encodeProtocols ps
+      addrVar <- newTVarIO addrA
+      let listener = Listener
+            { listenerAccept = forever (threadDelay 1000000000) >> fail "unreachable"
+            , listenerClose = pure ()
+            , listenerAddr = addrA
+            , listenerCurrentAddr = readTVar addrVar
+            }
+      addTransport sw Transport
+        { transportDial = const (fail "unused")
+        , transportDialFrom = \_ _ -> fail "unused"
+        , transportListen = const (pure listener)
+        , transportCanDial = const True
+        }
+      _ <- switchListen sw defaultConnectionGater [addrA]
+      pushes <- newTQueueIO
+      conn <- mkPushConnection (PeerId "addr-watcher") (Multiaddr [IP4 0x7f000001, TCP 3333]) $ do
+        (streamA, streamB) <- mkClosableStreamPair
+        _ <- async $ do
+          _ <- negotiateResponder streamB [identifyPushProtocolId]
+          readFramedIdentify streamB maxIdentifySize >>= atomically . writeTQueue pushes
+        pure streamA
+      addConn sw conn
+      atomically (writeTVar addrVar addrB)
+      -- The push fired by switchListen itself may also arrive; wait for one
+      -- carrying the new address.
+      let awaitAddrB = do
+            pushed <- atomically (readTQueue pushes)
+            case pushed of
+              Right info | idListenAddrs info == [encoded addrB] -> pure ()
+              _ -> awaitAddrB
+      timeout 5000000 awaitAddrB `shouldReturn` Just ()
+      switchListenAddrs sw `shouldReturn` [addrB]
+      switchClose sw
 
     it "registerIdentifyHandlers registers both protocol handlers" $ do
       sw <- mkTestSwitch

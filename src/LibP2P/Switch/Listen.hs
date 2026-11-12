@@ -19,10 +19,11 @@ module LibP2P.Switch.Listen
   , switchWithdrawListener
   ) where
 
-import Control.Concurrent.Async (async, cancel)
-import Control.Concurrent.STM (atomically, readTVar, writeTChan, writeTVar)
+import Control.Concurrent.Async (async, cancel, race_)
+import Control.Concurrent.STM (atomically, check, readTVar, writeTChan, writeTVar)
+import Control.Monad (filterM, forM_)
 import Control.Exception (SomeException, catch, finally, try)
-import Data.List (find, partition)
+import Data.List (find)
 import qualified Data.Map.Strict as Map
 import LibP2P.Multiaddr (Multiaddr)
 import LibP2P.MultistreamSelect.Negotiation
@@ -46,6 +47,7 @@ import LibP2P.Switch.Types
   , MuxerSession (..)
   , Switch (..)
   , SwitchEvent (..)
+  , currentListenAddrs
   , defaultConnectionGater
   )
 import LibP2P.Switch.Upgrade (upgradeWithSwitchConfig)
@@ -165,7 +167,7 @@ switchListen sw gater addrs = do
       -- Listen addresses changed: push updated identify info to
       -- connected peers in the background (specs/identify push).
       _ <- async (pushIdentify sw)
-      pure (map alAddress newListeners)
+      pure (map (listenerAddr . alListener) newListeners)
   where
     -- Find a transport for the address, bind, and spawn accept loop
     bindAndListen transports sw' addr = do
@@ -173,12 +175,26 @@ switchListen sw gater addrs = do
         Nothing -> fail $ "switchListen: no transport for " ++ show addr
         Just transport -> do
           listener <- transportListen transport addr
-          loopThread <- async $ acceptLoop sw' listener
+          loopThread <- async $
+            race_ (acceptLoop sw' listener) (watchListenerAddr sw' listener)
           pure [ActiveListener
             { alListener   = listener
             , alAcceptLoop = loopThread
-            , alAddress    = listenerAddr listener
             }]
+
+-- | Push Identify to connected peers whenever the listener's advertised
+-- address changes (e.g. a WebTransport certificate roll), until the Switch
+-- closes. Starts from 'listenerAddr', so a change made before this thread
+-- runs is still pushed.
+watchListenerAddr :: Switch -> Listener -> IO ()
+watchListenerAddr sw listener = go (listenerAddr listener)
+  where
+    go old = do
+      changed <- atomically $ do
+        closed <- readTVar (swClosed sw)
+        new <- listenerCurrentAddr listener
+        if closed then pure Nothing else Just new <$ check (new /= old)
+      forM_ changed $ \new -> pushIdentify sw >> go new
 
 -- | Accept loop: forever accepts connections and spawns handleInbound threads.
 -- Catches exceptions from individual connections without stopping the loop.
@@ -198,9 +214,7 @@ acceptLoop sw listener = loop
 
 -- | Get the current listen addresses from all active listeners.
 switchListenAddrs :: Switch -> IO [Multiaddr]
-switchListenAddrs sw = atomically $ do
-  listeners <- readTVar (swListeners sw)
-  pure (map alAddress listeners)
+switchListenAddrs sw = atomically (currentListenAddrs sw)
 
 -- | Withdraw the listener bound to the given address: cancel its accept
 -- loop, close the underlying transport listener, and remove it from the
@@ -215,7 +229,9 @@ switchWithdrawListener :: Switch -> Multiaddr -> IO ()
 switchWithdrawListener sw addr = do
   withdrawn <- atomically $ do
     listeners <- readTVar (swListeners sw)
-    let (removed, remaining) = partition ((== addr) . alAddress) listeners
+    let matches = fmap (== addr) . listenerCurrentAddr . alListener
+    removed <- filterM matches listeners
+    remaining <- filterM (fmap not . matches) listeners
     writeTVar (swListeners sw) remaining
     pure removed
   mapM_ closeListener withdrawn

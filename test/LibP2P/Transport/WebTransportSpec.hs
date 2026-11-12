@@ -1,6 +1,7 @@
 module LibP2P.Transport.WebTransportSpec (spec) where
 
 import Control.Concurrent.Async (concurrently)
+import Control.Concurrent.STM (atomically)
 import Control.Exception (bracket, try)
 import Control.Monad (replicateM)
 import Crypto.Error qualified as Crypto
@@ -205,6 +206,29 @@ spec = do
             -- Dialers holding the original address still pass the Noise
             -- check, because the expired hash stays bound.
             dialAndAccept client advertised listener
+        )
+
+    it "advertises the rolled certificates once the active one expires" $ do
+      (_, serverKey) <- generateIdentity
+      (_, clientKey) <- generateIdentity
+      realNow <- timeConvert <$> timeCurrent
+      let start = timeAdd realNow (Duration (Hours (-13 * 24)) (Minutes 40) (Seconds 0) (NanoSeconds 0))
+      clock <- newIORef start
+      server <- newWebTransportTransportWithClock (readIORef clock) serverKey
+      client <- newWebTransportTransport clientKey
+      bracket
+        (transportListen server (parseAddr listenAddress))
+        listenerClose
+        ( \listener -> do
+            let original = listenerAddr listener
+            atomically (listenerCurrentAddr listener) `shouldReturn` original
+            writeIORef clock (addHours (13 * 24) start)
+            -- The handshake rolls the certificates.
+            dialAndAccept client (keepLastCerthash original) listener
+            current <- atomically (listenerCurrentAddr listener)
+            length (certhashes current) `shouldBe` 2
+            take 1 (certhashes current) `shouldBe` drop 1 (certhashes original)
+            dialAndAccept client current listener
         )
 
     it "authenticates both peers and exchanges native stream data" $

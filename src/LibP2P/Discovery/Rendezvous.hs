@@ -115,7 +115,7 @@ import LibP2P.MultistreamSelect.Negotiation (
 import LibP2P.Switch (setStreamHandler)
 import LibP2P.Switch.Connection (newStream)
 import LibP2P.Switch.Types (
-  ActiveListener (..),
+  currentListenAddrs,
   Connection (..),
   Switch (..),
  )
@@ -600,14 +600,14 @@ so the Either only reports the impossible.
 -}
 buildLocalPeerRecord :: Switch -> IO (Either String ByteString)
 buildLocalPeerRecord sw = do
-  listeners <- readTVarIO (swListeners sw)
+  addrs <- atomically (currentListenAddrs sw)
   seqNo <- timestampSeq
   let record =
         PeerRecord
           { prPeerId = peerIdBytes (swLocalPeerId sw)
           , prSeq = seqNo
           , prAddresses =
-              map (\(Multiaddr ps) -> encodeProtocols ps) (map alAddress listeners)
+              map (\(Multiaddr ps) -> encodeProtocols ps) addrs
           }
   pure
     ( either

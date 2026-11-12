@@ -57,7 +57,7 @@ module LibP2P.Discovery.MDNS
 
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (Async, async, cancel)
-import Control.Concurrent.STM (TQueue, atomically, readTVarIO, writeTQueue)
+import Control.Concurrent.STM (TQueue, atomically, writeTQueue)
 import Control.Exception (IOException, SomeException, try)
 import Control.Monad (forever, forM_, replicateM_, unless, void, when)
 import Data.Bits ((.&.), shiftR)
@@ -96,7 +96,7 @@ import LibP2P.Discovery.Types
 import LibP2P.Multiaddr (Multiaddr (..), fromText, isRelayedAddr, splitP2P, toText)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
 import LibP2P.Switch.Types
-  ( ActiveListener (..)
+  ( currentListenAddrs
   , Switch (..)
   )
 import Network.Socket
@@ -645,11 +645,11 @@ processResponse sw peerName service events pk =
 -- peers sharing a host (and the tests) still discover one another.
 advertisedAddrs :: Switch -> IO [Text]
 advertisedAddrs sw = do
-  listeners <- readTVarIO (swListeners sw)
+  addrs <- atomically (currentListenAddrs sw)
   let pidBs = peerIdBytes (swLocalPeerId sw)
       withP2P (Multiaddr ps) = Multiaddr (ps ++ [P2P pidBs])
       keep addr = not (isRelayedAddr addr)
-  pure [toText (withP2P addr) | al <- listeners, let addr = alAddress al, keep addr]
+  pure [toText (withP2P addr) | addr <- addrs, keep addr]
 
 --------------------------------------------------------------------------------
 -- Peer name
