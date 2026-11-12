@@ -9,6 +9,7 @@ import Crypto.PubKey.RSA.Types qualified as RSA
 import Data.ByteArray (convert)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Hourglass
   ( DateTime
   , Duration (..)
@@ -30,7 +31,9 @@ import Data.X509
   , SignatureALG (..)
   , SignedCertificate
   , encodeSignedObject
+  , getSigned
   , objectToSignedExact
+  , signedObject
   )
 import LibP2P.Core.Multihash qualified as Multihash
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
@@ -54,10 +57,15 @@ import LibP2P.Transport (
 import LibP2P.Transport.WebTransport (
   canDialWebTransport,
   newWebTransportTransport,
+  newWebTransportTransportWithClock,
   verifyBoundHashes,
  )
 import LibP2P.Transport.WebTransport.Certificate
-  ( verifyWebTransportCertificate
+  ( CertificateSet (..)
+  , WebTransportCertificate (..)
+  , newCertificateSet
+  , rollCertificates
+  , verifyWebTransportCertificate
   )
 import System.Timeout (timeout)
 import Test.Hspec
@@ -128,7 +136,77 @@ spec = do
         :: IO (Either IOError ())
       result `shouldSatisfy` isLeft
 
+  describe "WebTransport certificate rotation" $ do
+    it "starts the next certificate where the active one expires" $ do
+      now <- timeConvert <$> timeCurrent
+      certs <- newCertificateSet now
+      notBeforeOf (csNext certs) `shouldBe` addHours (-1) (wtNotAfter (csActive certs))
+      fmap wtHash (csPrevious certs) `shouldBe` Nothing
+
+    it "keeps the active certificate until it is due" $ do
+      now <- timeConvert <$> timeCurrent
+      certs <- newCertificateSet now
+      rolled <- rollCertificates (addHours (12 * 24) now) certs
+      wtHash (csActive rolled) `shouldBe` wtHash (csActive certs)
+      fmap wtHash (csPrevious rolled) `shouldBe` Nothing
+
+    it "promotes the next certificate at expiry and retains the expired hash" $ do
+      now <- timeConvert <$> timeCurrent
+      certs <- newCertificateSet now
+      rolled <- rollCertificates (wtNotAfter (csActive certs)) certs
+      wtHash (csActive rolled) `shouldBe` wtHash (csNext certs)
+      fmap wtHash (csPrevious rolled) `shouldBe` Just (wtHash (csActive certs))
+      notBeforeOf (csNext rolled) `shouldBe` addHours (-1) (wtNotAfter (csNext certs))
+
+    it "catches up across a gap longer than one validity period" $ do
+      now <- timeConvert <$> timeCurrent
+      certs <- newCertificateSet now
+      let later = addHours (40 * 24) now
+      rolled <- rollCertificates later certs
+      wtNotAfter (csActive rolled) `shouldSatisfy` (> later)
+
   describe "WebTransport loopback" $ do
+    it "advertises the active and next certificate hashes" $ do
+      (_, serverKey) <- generateIdentity
+      transport <- newWebTransportTransport serverKey
+      bracket
+        (transportListen transport (parseAddr listenAddress))
+        listenerClose
+        (\listener -> length (certhashes (listenerAddr listener)) `shouldBe` 2)
+
+    it "serves the next certificate once the active one expires" $ do
+      (_, serverKey) <- generateIdentity
+      (_, clientKey) <- generateIdentity
+      realNow <- timeConvert <$> timeCurrent
+      -- The dialer verifies validity against the real clock, so start the
+      -- server's clock such that the next certificate is already valid today
+      -- while the active one has not yet expired.
+      let start = timeAdd realNow (Duration (Hours (-13 * 24)) (Minutes 40) (Seconds 0) (NanoSeconds 0))
+      clock <- newIORef start
+      server <- newWebTransportTransportWithClock (readIORef clock) serverKey
+      client <- newWebTransportTransport clientKey
+      bracket
+        (transportListen server (parseAddr listenAddress))
+        listenerClose
+        ( \listener -> do
+            let advertised = listenerAddr listener
+                nextOnly = keepLastCerthash advertised
+            beforeRoll <-
+              timeout 5000000 $
+                try (transportDial client nextOnly) ::
+                IO (Maybe (Either IOError RawConnection))
+            case beforeRoll of
+              Just (Left _) -> pure ()
+              Just (Right raw) -> rcClose raw >> expectationFailure "served next certificate early"
+              Nothing -> expectationFailure "pre-rollover dial timed out"
+            writeIORef clock (addHours (13 * 24) start)
+            -- Only the rolled certificate matches this hash.
+            dialAndAccept client nextOnly listener
+            -- Dialers holding the original address still pass the Noise
+            -- check, because the expired hash stays bound.
+            dialAndAccept client advertised listener
+        )
+
     it "authenticates both peers and exchanges native stream data" $
       withWebTransportPair $ \(clientPeer, serverPeer, clientRaw, serverRaw) -> do
         clientMuxer <- expectNative clientRaw
@@ -270,6 +348,34 @@ expectNative :: RawConnection -> IO NativeMuxer
 expectNative raw = case rcEndpoint raw of
   NativeMuxerEndpoint native -> pure native
   ByteStreamEndpoint _ -> fail "expected a native WebTransport endpoint"
+
+notBeforeOf :: WebTransportCertificate -> DateTime
+notBeforeOf certificate = case fst (wtCredential certificate) of
+  CertificateChain [signed] -> fst (certValidity (signedObject (getSigned signed)))
+  _ -> error "expected a one-certificate chain"
+
+addHours :: Int -> DateTime -> DateTime
+addHours hours moment =
+  timeAdd moment (Duration (Hours (fromIntegral hours)) (Minutes 0) (Seconds 0) (NanoSeconds 0))
+
+certhashes :: Multiaddr -> [ByteString]
+certhashes (Multiaddr protocols) = [hashBytes | Certhash hashBytes <- protocols]
+
+keepLastCerthash :: Multiaddr -> Multiaddr
+keepLastCerthash address@(Multiaddr protocols) =
+  Multiaddr (filter (not . isCerthash) protocols <> [Certhash (last (certhashes address))])
+ where
+  isCerthash Certhash{} = True
+  isCerthash _ = False
+
+dialAndAccept :: Transport -> Multiaddr -> Listener -> IO ()
+dialAndAccept client address listener = do
+  connected <-
+    timeout 10000000 $
+      concurrently (transportDial client address) (listenerAccept listener)
+  (clientRaw, serverRaw) <- maybe (fail "WebTransport dial timed out") pure connected
+  rcClose clientRaw
+  rcClose serverRaw
 
 hasCerthash :: Multiaddr -> Bool
 hasCerthash (Multiaddr protocols) = any isCerthash protocols
