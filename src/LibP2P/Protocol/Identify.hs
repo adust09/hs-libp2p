@@ -78,7 +78,7 @@ import LibP2P.Protocol.Identify.Message
   )
 import LibP2P.Switch.ConnPool (allConns)
 import LibP2P.Switch.Types
-  ( ActiveListener (..)
+  ( currentListenAddrs
   , Connection (..)
   , Switch (..)
   )
@@ -340,8 +340,8 @@ buildLocalIdentify :: Switch -> Maybe Connection -> IO IdentifyInfo
 buildLocalIdentify sw mConn = do
   (protocols, listenAddrs) <- atomically $ do
     protos <- Map.keys <$> readTVar (swProtocols sw)
-    listeners <- readTVar (swListeners sw)
-    pure (protos, map alAddress listeners)
+    addrs <- currentListenAddrs sw
+    pure (protos, addrs)
   seqNo <- timestampSeq
   let addrBytes = map (\(Multiaddr ps) -> encodeProtocols ps) listenAddrs
       record = PeerRecord

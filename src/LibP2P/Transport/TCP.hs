@@ -148,6 +148,7 @@ tcpListen (Multiaddr [IP4 w, TCP port]) = do
         mkRawConnection clientSock clientAddr
     , listenerClose = NS.close sock
     , listenerAddr = boundAddr
+    , listenerCurrentAddr = pure boundAddr
     }
 tcpListen (Multiaddr [IP6 bs, TCP port]) = do
   let ipv6 = bytesToIPv6 bs
@@ -166,6 +167,7 @@ tcpListen (Multiaddr [IP6 bs, TCP port]) = do
         mkRawConnection clientSock clientAddr
     , listenerClose = NS.close sock
     , listenerAddr = boundAddr
+    , listenerCurrentAddr = pure boundAddr
     }
 tcpListen _ = fail "tcpListen: unsupported multiaddr"
 

@@ -94,8 +94,9 @@ installTestListener sw addr = do
         { listenerAccept = fail "test listener does not accept"
         , listenerClose = pure ()
         , listenerAddr = addr
+        , listenerCurrentAddr = pure addr
         }
-  atomically $ writeTVar (swListeners sw) [ActiveListener listener worker addr]
+  atomically $ writeTVar (swListeners sw) [ActiveListener listener worker]
 
 -- | A dummy connection for pool tests.
 mkDummyConnection :: Switch -> PeerId -> IO Connection

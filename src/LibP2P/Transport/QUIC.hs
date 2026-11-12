@@ -175,6 +175,7 @@ listenQUIC credential requestedAddress = do
     { listenerAccept = atomically (readTQueue accepted)
     , listenerClose = closeServer worker socket
     , listenerAddr = boundAddress
+    , listenerCurrentAddr = pure boundAddress
     }
 
 serverConfig :: Credential -> TMVar () -> ServerConfig

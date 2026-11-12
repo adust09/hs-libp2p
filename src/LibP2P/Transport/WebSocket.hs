@@ -260,6 +260,7 @@ listenWebSocket tcp config requestedAddress = do
     { listenerAccept = acceptWebSocket config parsed tcpListener
     , listenerClose = listenerClose tcpListener
     , listenerAddr = appendWebSocketProtocol parsed (listenerAddr tcpListener)
+    , listenerCurrentAddr = appendWebSocketProtocol parsed <$> listenerCurrentAddr tcpListener
     }
 
 hasServerTLS :: WebSocketConfig -> Bool
