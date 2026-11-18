@@ -9,8 +9,10 @@
 # Usage (after building both images):
 #   docker compose -f docker-compose.kad-dht-go.yml up --exit-code-from roundtrip
 #
-# GO_PEER_ADDR derives from the Ed25519 seed pinned in
-# interop/get-value-roundtrip/go-peer/main.go.
+# Both services run on the host network: hs cannot dial a bridge DNS
+# hostname inside a multiaddr (issue #249), so the roundtrip role targets
+# /ip4/127.0.0.1/tcp/49001. GO_PEER_ADDR derives from the Ed25519 seed
+# pinned in interop/get-value-roundtrip/go-peer/main.go.
 
 x-test-key: &test-key "cafe0129"
 
@@ -19,14 +21,16 @@ services:
     build:
       context: interop/get-value-roundtrip/go-peer
     image: hs-libp2p-kadserv-go:latest
+    network_mode: host
     stop_grace_period: 2s
 
   roundtrip:
     image: hs-libp2p-kad-dht-node:latest
+    network_mode: host
     depends_on:
       - go-kadserv
     environment:
       ROLE: goroundtrip
       TEST_KEY: *test-key
-      GO_PEER_ADDR: "/ip4/go-kadserv/tcp/49001/p2p/12D3KooWJnvp3ovyeE1BQYyHrWXRSkBwrCSVZ74PfanCvWoc8hFB"
+      GO_PEER_ADDR: "/ip4/127.0.0.1/tcp/49001/p2p/12D3KooWJnvp3ovyeE1BQYyHrWXRSkBwrCSVZ74PfanCvWoc8hFB"
     stop_grace_period: 2s
