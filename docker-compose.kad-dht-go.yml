@@ -32,5 +32,7 @@ services:
     environment:
       ROLE: goroundtrip
       TEST_KEY: *test-key
+      LANG: "C.UTF-8"
+      LC_ALL: "C.UTF-8"
       GO_PEER_ADDR: "/ip4/127.0.0.1/tcp/49001/p2p/12D3KooWJnvp3ovyeE1BQYyHrWXRSkBwrCSVZ74PfanCvWoc8hFB"
     stop_grace_period: 2s

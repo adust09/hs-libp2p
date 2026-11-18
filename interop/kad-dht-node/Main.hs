@@ -345,7 +345,9 @@ runRoundTrip testKey = do
       recordKey    = "/pk/" <> peerIdBytes recordPeerId
       recordValue  = encodePublicKey (publicKey keypair)
   publisher <- roundtripNode goTransportAddr goPeerId "publisher"
-  logInfo $ "PUT " ++ BS8.unpack recordKey ++ " into the go responder"
+  -- Never log the raw key: /pk/ keys are binary multihashes and stderr runs
+  -- in a non-UTF-8 locale in the interop runtime image.
+  logInfo $ "PUT " ++ show (BS8.length recordKey) ++ " bytes into the go responder"
   putResult <- putValue publisher pkValidator recordKey recordValue
   case putResult of
     Left err -> printFail $ "put_failed: " ++ err
