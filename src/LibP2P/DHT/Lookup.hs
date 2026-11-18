@@ -257,7 +257,7 @@ valueLoop node wireKey targetKey candidatesVar queriedVar knownVar bestVar bestP
           results <- mapConcurrently (queryPeerForValue node wireKey) toQuery
 
           -- Process each result
-          mapM_ (processValueResult node targetKey bestVar bestPeersVar outdatedVar validator now) results
+          mapM_ (processValueResult wireKey bestVar bestPeersVar outdatedVar validator) results
 
           -- Merge closer peers from responses
           newEntries <- atomically $ do
@@ -322,16 +322,16 @@ queryPeerForValue node wireKey entry = do
 -- query are validated before being considered; records failing the
 -- validator are ignored as if the peer had returned no record.
 processValueResult
-  :: DHTNode -> DHTKey
+  :: ByteString
   -> TVar (Maybe DHTRecord)
   -> TVar (Set PeerId)
   -> TVar (Set PeerId)
   -> Validator
-  -> UTCTime
   -> (PeerId, Either String [DHTPeer], Maybe DHTRecord)
   -> IO ()
-processValueResult _ _ bestVar bestPeersVar outdatedVar validator _ (pid, _, Just rec)
-  | Left _ <- valValidate validator (recKey rec) (recValue rec) = pure ()
+processValueResult key bestVar bestPeersVar outdatedVar validator (pid, _, Just rec)
+  | recKey rec /= key = pure ()
+  | Left _ <- valValidate validator key (recValue rec) = pure ()
   | otherwise = do
   atomically $ do
     best <- readTVar bestVar
@@ -340,7 +340,7 @@ processValueResult _ _ bestVar bestPeersVar outdatedVar validator _ (pid, _, Jus
         writeTVar bestVar (Just rec)
         writeTVar bestPeersVar (Set.singleton pid)
       Just currentBest -> do
-        case valSelect validator (recKey rec) [recValue currentBest, recValue rec] of
+        case valSelect validator key [recValue currentBest, recValue rec] of
           Right 0 -> do
             -- Current best is still best; this peer has outdated value
             modifyTVar' outdatedVar (Set.insert pid)
@@ -353,7 +353,7 @@ processValueResult _ _ bestVar bestPeersVar outdatedVar validator _ (pid, _, Jus
           _ -> do
             -- Same or error: add to bestPeers
             modifyTVar' bestPeersVar (Set.insert pid)
-processValueResult _ _ _ _ _ _ _ (_, _, Nothing) = pure ()
+processValueResult _ _ _ _ _ (_, _, Nothing) = pure ()
 
 -- | Iterative GET_PROVIDERS: find providers for a content key.
 iterativeGetProviders :: DHTNode -> ByteString -> IO [ProviderEntry]

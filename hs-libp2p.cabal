@@ -312,6 +312,7 @@ test-suite hs-libp2p-test
     LibP2P.DHT.APISpec
     LibP2P.DHT.DHTSpec
     LibP2P.DHT.LookupSpec
+    LibP2P.DHT.KeyBindingSpec
     LibP2P.DHT.MaintenanceSpec
     LibP2P.DHT.ValidatorSpec
     LibP2P.NAT.AutoNAT.MessageSpec

@@ -312,6 +312,19 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.kad-dht.yml down -v
 
+      - name: Build go libp2p GET_VALUE responder image
+        run: docker build -t hs-libp2p-kadserv-go:latest interop/get-value-roundtrip/go-peer
+
+      - name: Run GET_VALUE round-trip (hs publisher → go responder → hs querier)
+        run: >-
+          docker compose -f docker-compose.kad-dht-go.yml up
+          --exit-code-from roundtrip
+          go-kadserv roundtrip
+
+      - name: Tear down round-trip
+        if: always()
+        run: docker compose -f docker-compose.kad-dht-go.yml down -v
+
   hole-punch-self-test:
     name: hole-punch-self-test (separate NATs, TCP)
     runs-on: ubuntu-latest
