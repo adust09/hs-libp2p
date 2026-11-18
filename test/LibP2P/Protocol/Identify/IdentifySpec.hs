@@ -1,6 +1,6 @@
 module LibP2P.Protocol.Identify.IdentifySpec (spec) where
 
-import Control.Concurrent.Async (async, wait)
+import Control.Concurrent.Async (async, cancel, race, wait, waitCatch)
 import Control.Concurrent.STM
   ( TQueue
   , TMVar
@@ -895,8 +895,19 @@ spec = do
       sw <- newSwitch (fromPublicKey (kpPublic kp)) kp
       (opens, keep) <- stalledPeers
       addStalledPeer sw opens keep (PeerId "stalled-timeout")
-      timeout (identifyTimeoutMicros + 2000000) (pushIdentify sw) `shouldReturn` Just ()
+      pushed <- async (pushIdentify sw)
+      awaitOpens opens 1
+      -- The deadline has to run in another thread. Wrapping the push in
+      -- 'timeout' instead would prove nothing: an unbounded push catching
+      -- SomeException swallows the timeout's own marker exception and then
+      -- returns normally, so the assertion passes either way.
+      outcome <- race (threadDelay (identifyTimeoutMicros + 2000000)) (waitCatch pushed)
+      cancel pushed
       readIORef keep >>= mapM_ streamClose
+      case outcome of
+        Left () -> expectationFailure "pushIdentify never gave up on the stalled peer"
+        Right (Left err) -> expectationFailure ("pushIdentify failed: " ++ show err)
+        Right (Right ()) -> pure ()
 
     it "withdraws a listener by the address switchListen returned after it changes" $ do
       Right kp <- generateKeyPair
