@@ -216,7 +216,8 @@ acceptLoop sw listener = loop
 switchListenAddrs :: Switch -> IO [Multiaddr]
 switchListenAddrs sw = atomically (currentListenAddrs sw)
 
--- | Withdraw the listener bound to the given address: cancel its accept
+-- | Withdraw the listener bound to the given address (the one
+-- 'switchListen' returned, or its current advertised address): cancel its accept
 -- loop, close the underlying transport listener, and remove it from the
 -- Switch's listener set so 'switchListenAddrs' stops reporting it.
 --
@@ -229,7 +230,11 @@ switchWithdrawListener :: Switch -> Multiaddr -> IO ()
 switchWithdrawListener sw addr = do
   withdrawn <- atomically $ do
     listeners <- readTVar (swListeners sw)
-    let matches = fmap (== addr) . listenerCurrentAddr . alListener
+    -- The address switchListen returned stays a valid handle after the
+    -- advertised address changes.
+    let matches al
+          | listenerAddr (alListener al) == addr = pure True
+          | otherwise = (== addr) <$> listenerCurrentAddr (alListener al)
     removed <- filterM matches listeners
     remaining <- filterM (fmap not . matches) listeners
     writeTVar (swListeners sw) remaining

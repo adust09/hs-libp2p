@@ -4,13 +4,17 @@ import Control.Concurrent.Async (async, wait)
 import Control.Concurrent.STM
   ( TQueue
   , TMVar
+  , TVar
   , atomically
+  , check
+  , modifyTVar'
   , newEmptyTMVarIO
   , newTQueueIO
   , newTVarIO
   , putTMVar
   , readTQueue
   , readTVar
+  , readTVarIO
   , tryReadTMVar
   , writeTQueue
   , writeTVar
@@ -43,7 +47,7 @@ import LibP2P.MultistreamSelect.Negotiation
 import LibP2P.Protocol.Identify
 import LibP2P.Protocol.Identify.Message (IdentifyInfo (..), decodeIdentify, encodeIdentify, maxIdentifySize)
 import LibP2P.Switch (addTransport, newSwitch, setStreamHandler, switchClose)
-import LibP2P.Switch.Listen (defaultConnectionGater, switchListen, switchListenAddrs)
+import LibP2P.Switch.Listen (defaultConnectionGater, switchListen, switchListenAddrs, switchWithdrawListener)
 import LibP2P.Transport (Listener (..), Transport (..))
 import Control.Concurrent (threadDelay)
 import Control.Monad (forever)
@@ -174,6 +178,53 @@ mkPushConnection pid remoteAddr openStream = do
     , connResourceScope = connScope
     , connRelayLimit = Nothing
     }
+
+addrA, addrB, addrC :: Multiaddr
+addrA = Multiaddr [IP4 0x7f000001, TCP 4101]
+addrB = Multiaddr [IP4 0x7f000001, TCP 4102]
+addrC = Multiaddr [IP4 0x7f000001, TCP 4103]
+
+-- | Listen on 'addrA' through a listener whose advertised address is a
+-- TVar the test can change. Also returns a flag set by 'listenerClose'.
+listenMutable :: Switch -> IO (TVar Multiaddr, IORef Bool)
+listenMutable sw = do
+  addrVar <- newTVarIO addrA
+  closedRef <- newIORef False
+  let listener = Listener
+        { listenerAccept = forever (threadDelay 1000000000) >> fail "unreachable"
+        , listenerClose = writeIORef closedRef True
+        , listenerAddr = addrA
+        , listenerCurrentAddr = readTVar addrVar
+        }
+  addTransport sw Transport
+    { transportDial = const (fail "unused")
+    , transportDialFrom = \_ _ -> fail "unused"
+    , transportListen = const (pure listener)
+    , transportCanDial = const True
+    }
+  _ <- switchListen sw defaultConnectionGater [addrA]
+  pure (addrVar, closedRef)
+
+-- | A counter of streams opened to stalled peers, and the far ends of
+-- those streams. The test holds the far ends so the stalled reads stay
+-- blocked instead of being woken by the RTS deadlock detector.
+stalledPeers :: IO (TVar Int, IORef [StreamIO])
+stalledPeers = (,) <$> newTVarIO 0 <*> newIORef []
+
+-- | Pool a peer whose push streams never answer negotiation.
+addStalledPeer :: Switch -> TVar Int -> IORef [StreamIO] -> PeerId -> IO ()
+addStalledPeer sw opens keep pid = do
+  conn <- mkPushConnection pid (Multiaddr [IP4 0x7f000001, TCP 3334]) $ do
+    (near, far) <- mkClosableStreamPair
+    modifyIORef' keep (far :)
+    atomically (modifyTVar' opens (+ 1))
+    pure near
+  addConn sw conn
+
+awaitOpens :: TVar Int -> Int -> IO ()
+awaitOpens opens n = do
+  reached <- timeout 5000000 (atomically (readTVar opens >>= check . (>= n)))
+  reached `shouldBe` Just ()
 
 -- | Insert a connection into the Switch's connection pool.
 addConn :: Switch -> Connection -> IO ()
@@ -785,23 +836,8 @@ spec = do
       -- connected peers must learn the new address (specs/identify push).
       Right kp <- generateKeyPair
       sw <- newSwitch (fromPublicKey (kpPublic kp)) kp
-      let addrA = Multiaddr [IP4 0x7f000001, TCP 4101]
-          addrB = Multiaddr [IP4 0x7f000001, TCP 4102]
-          encoded (Multiaddr ps) = encodeProtocols ps
-      addrVar <- newTVarIO addrA
-      let listener = Listener
-            { listenerAccept = forever (threadDelay 1000000000) >> fail "unreachable"
-            , listenerClose = pure ()
-            , listenerAddr = addrA
-            , listenerCurrentAddr = readTVar addrVar
-            }
-      addTransport sw Transport
-        { transportDial = const (fail "unused")
-        , transportDialFrom = \_ _ -> fail "unused"
-        , transportListen = const (pure listener)
-        , transportCanDial = const True
-        }
-      _ <- switchListen sw defaultConnectionGater [addrA]
+      let encoded (Multiaddr ps) = encodeProtocols ps
+      (addrVar, _) <- listenMutable sw
       pushes <- newTQueueIO
       conn <- mkPushConnection (PeerId "addr-watcher") (Multiaddr [IP4 0x7f000001, TCP 3333]) $ do
         (streamA, streamB) <- mkClosableStreamPair
@@ -821,6 +857,55 @@ spec = do
       timeout 5000000 awaitAddrB `shouldReturn` Just ()
       switchListenAddrs sw `shouldReturn` [addrB]
       switchClose sw
+
+    it "withdraws a listener while its address-change push is stalled" $ do
+      Right kp <- generateKeyPair
+      sw <- newSwitch (fromPublicKey (kpPublic kp)) kp
+      (opens, keep) <- stalledPeers
+      addStalledPeer sw opens keep (PeerId "stalled-withdraw")
+      (addrVar, closedRef) <- listenMutable sw
+      atomically (writeTVar addrVar addrB)
+      -- One stalled stream from switchListen's own push, one from the watcher.
+      awaitOpens opens 2
+      timeout 1000000 (switchWithdrawListener sw addrB) `shouldReturn` Just ()
+      readIORef closedRef `shouldReturn` True
+      -- A watcher that swallowed the cancellation would push this change.
+      atomically (writeTVar addrVar addrC)
+      threadDelay 300000
+      readTVarIO opens `shouldReturn` 2
+      readIORef keep >>= mapM_ streamClose
+
+    it "closes the switch while address-change pushes to several peers are stalled" $ do
+      Right kp <- generateKeyPair
+      sw <- newSwitch (fromPublicKey (kpPublic kp)) kp
+      (opens, keep) <- stalledPeers
+      mapM_ (addStalledPeer sw opens keep . PeerId) ["stalled-1", "stalled-2"]
+      (addrVar, _) <- listenMutable sw
+      atomically (writeTVar addrVar addrB)
+      awaitOpens opens 2
+      timeout 1000000 (switchClose sw) `shouldReturn` Just ()
+      -- A watcher that swallowed the cancellation would move on to the
+      -- second stalled peer.
+      threadDelay 300000
+      readTVarIO opens `shouldReturn` 2
+      readIORef keep >>= mapM_ streamClose
+
+    it "pushIdentify gives up on a peer that never answers" $ do
+      Right kp <- generateKeyPair
+      sw <- newSwitch (fromPublicKey (kpPublic kp)) kp
+      (opens, keep) <- stalledPeers
+      addStalledPeer sw opens keep (PeerId "stalled-timeout")
+      timeout (identifyTimeoutMicros + 2000000) (pushIdentify sw) `shouldReturn` Just ()
+      readIORef keep >>= mapM_ streamClose
+
+    it "withdraws a listener by the address switchListen returned after it changes" $ do
+      Right kp <- generateKeyPair
+      sw <- newSwitch (fromPublicKey (kpPublic kp)) kp
+      (addrVar, closedRef) <- listenMutable sw
+      atomically (writeTVar addrVar addrB)
+      switchWithdrawListener sw addrA
+      readIORef closedRef `shouldReturn` True
+      switchListenAddrs sw `shouldReturn` []
 
     it "registerIdentifyHandlers registers both protocol handlers" $ do
       sw <- mkTestSwitch
