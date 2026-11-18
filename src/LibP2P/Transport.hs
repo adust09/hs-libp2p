@@ -14,6 +14,7 @@ module LibP2P.Transport
   , Transport (..)
   ) where
 
+import Control.Concurrent.STM (STM)
 import Data.Word (Word32, Word64)
 import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Multiaddr (Multiaddr)
@@ -69,6 +70,11 @@ data Listener = Listener
   { listenerAccept :: !(IO RawConnection)
   , listenerClose :: !(IO ())
   , listenerAddr :: !Multiaddr
+  -- ^ The address advertised when listening started.
+  , listenerCurrentAddr :: !(STM Multiaddr)
+  -- ^ The address to advertise now. Transports whose address changes while
+  -- listening (WebTransport certificate hashes) update it; others return
+  -- 'listenerAddr'.
   }
 
 -- | Transport provides dial/listen capabilities for a specific protocol.

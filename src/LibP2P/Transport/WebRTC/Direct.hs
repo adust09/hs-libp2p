@@ -89,6 +89,7 @@ listenWebRTC identity requestedAddress = do
     { listenerAccept = acceptConnection identity listener advertised
     , listenerClose = close
     , listenerAddr = advertised
+    , listenerCurrentAddr = pure advertised
     }
 
 acceptConnection :: KeyPair -> Ptr FFI.CWebRTCListener -> Multiaddr -> IO RawConnection
