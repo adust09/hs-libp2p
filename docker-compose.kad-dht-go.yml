@@ -1,0 +1,32 @@
+# GET_VALUE round-trip against a stock go-libp2p Kad-DHT responder.
+#
+# The hs publisher PUT_VALUEs a /pk/ record into the go peer, then a fresh hs
+# querier GET_VALUEs the record back. Complements the hs-only self-test with
+# a responder implementation whose wire records CI could not otherwise
+# exercise. No Redis coordination is needed: the round-trip role runs both
+# hs nodes inside one process.
+#
+# Usage (after building both images):
+#   docker compose -f docker-compose.kad-dht-go.yml up --exit-code-from roundtrip
+#
+# GO_PEER_ADDR derives from the Ed25519 seed pinned in
+# interop/get-value-roundtrip/go-peer/main.go.
+
+x-test-key: &test-key "cafe0129"
+
+services:
+  go-kadserv:
+    build:
+      context: interop/get-value-roundtrip/go-peer
+    image: hs-libp2p-kadserv-go:latest
+    stop_grace_period: 2s
+
+  roundtrip:
+    image: hs-libp2p-kad-dht-node:latest
+    depends_on:
+      - go-kadserv
+    environment:
+      ROLE: goroundtrip
+      TEST_KEY: *test-key
+      GO_PEER_ADDR: "/ip4/go-kadserv/tcp/49001/p2p/12D3KooWJnvp3ovyeE1BQYyHrWXRSkBwrCSVZ74PfanCvWoc8hFB"
+    stop_grace_period: 2s

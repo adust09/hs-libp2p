@@ -73,6 +73,7 @@ import LibP2P.DHT
 import LibP2P.DHT.API (findProviders, provide, putValue)
 import LibP2P.DHT.Lookup (bootstrap, iterativeGetValue)
 import LibP2P.DHT.Message (DHTRecord (..))
+import LibP2P.Crypto.Protobuf (encodePublicKey)
 import LibP2P.DHT.Validator (Validator (..), namespacedValidator, pkValidator)
 import LibP2P.Protocol.Identify (registerIdentifyHandlers)
 
@@ -100,6 +101,7 @@ main = do
     "bootstrap" -> runBootstrap testKey
     "provider"  -> runProvider testKey
     "querier"   -> runQuerier testKey
+    "goroundtrip" -> runRoundTrip testKey
     other       -> do
       hPutStrLn stderr $ "Unknown ROLE: " ++ other
       exitFailure
@@ -322,6 +324,66 @@ runQuerier testKey = do
                     if providersOk && valueOk
                       then printPass
                       else printFail "query_mismatch"
+
+------------------------------------------------------------------------------
+-- go-libp2p GET_VALUE round trip
+------------------------------------------------------------------------------
+
+-- | PUT a /pk/ record into a stock go-libp2p Kad-DHT responder
+-- (interop/get-value-roundtrip/go-peer) and GET it back with a fresh node.
+-- This pins the request-key binding to the real go wire: go's ValueStore
+-- only serves records whose embedded key matches the requested key, and the
+-- querier must accept that conforming response.
+runRoundTrip :: String -> IO ()
+runRoundTrip testKey = do
+  goAddr <- getEnvRequired "GO_PEER_ADDR"
+  (goTransportAddr, goPeerId) <- parsePeerAddr goAddr
+  keypair <- do
+    ekp <- generateKeyPair
+    either die pure ekp
+  let recordPeerId = fromPublicKey (publicKey keypair)
+      recordKey    = "/pk/" <> peerIdBytes recordPeerId
+      recordValue  = encodePublicKey (publicKey keypair)
+  publisher <- roundtripNode goTransportAddr goPeerId "publisher"
+  logInfo $ "PUT " ++ BS8.unpack recordKey ++ " into the go responder"
+  putResult <- putValue publisher pkValidator recordKey recordValue
+  case putResult of
+    Left err -> printFail $ "put_failed: " ++ err
+    Right () -> pure ()
+  querier <- roundtripNode goTransportAddr goPeerId "querier"
+  logInfo "GET the record back from the go responder"
+  getResult <- iterativeGetValue querier pkValidator recordKey
+  case getResult of
+    Left err -> printFail $ "get_failed: " ++ err
+    Right rec
+      | recKey rec == recordKey && recValue rec == recordValue -> printPass
+      | otherwise -> printFail "get_mismatch"
+
+roundtripNode :: Multiaddr -> PeerId -> String -> IO DHTNode
+roundtripNode transportAddr peerId label = do
+  (kp, pid) <- genIdentity
+  logInfo $ "Starting " ++ label ++ " node"
+  tcp <- newTCPTransport
+  sw  <- newSwitch pid kp
+  addTransport sw tcp
+  registerIdentifyHandlers sw
+  dhtNode <- newDHTNode sw DHTClient
+  dialResult <- dial sw peerId [transportAddr]
+  case dialResult of
+    Left err -> printFail (label ++ "_dial_failed: " ++ show err) >> die "dial"
+    Right _ -> do
+      -- Dialling does not populate the routing table; seed the responder so
+      -- the PUT and the later GET have exactly one candidate.
+      bootstrap dhtNode [peerId]
+      pure dhtNode
+
+-- | Split ".../p2p/<id>" into its transport multiaddr and peer ID.
+parsePeerAddr :: String -> IO (Multiaddr, PeerId)
+parsePeerAddr raw = case fromText (T.pack raw) of
+  Left err -> die $ "failed to parse GO_PEER_ADDR: " ++ err
+  Right ma -> case splitP2P ma of
+    Nothing -> die "GO_PEER_ADDR is missing a /p2p/ component"
+    Just (transportAddr, peerId) -> pure (transportAddr, peerId)
 
 ------------------------------------------------------------------------------
 -- Identity helpers
