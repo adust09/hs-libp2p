@@ -109,6 +109,7 @@ import Network.Socket
   , close
   , defaultProtocol
   , setSocketOption
+  , whenSupported
   , socket
   , tupleToHostAddress
   , tupleToHostAddress6
@@ -343,7 +344,7 @@ openIPv4Socket :: MDNSConfig -> IO Socket
 openIPv4Socket cfg = do
   sock <- socket AF_INET Datagram defaultProtocol
   setSocketOption sock ReuseAddr 1
-  setSocketOption sock ReusePort 1
+  whenSupported ReusePort $ setSocketOption sock ReusePort 1
   setSockOpt sock (SockOpt (ci ipprotoIP) (ci ipMulticastTTL)) (255 :: CInt)
   setSockOpt
     sock
@@ -363,7 +364,7 @@ openIPv6Socket :: MDNSConfig -> IO Socket
 openIPv6Socket cfg = do
   sock <- socket AF_INET6 Datagram defaultProtocol
   setSocketOption sock ReuseAddr 1
-  setSocketOption sock ReusePort 1
+  whenSupported ReusePort $ setSocketOption sock ReusePort 1
   setSocketOption sock IPv6Only 1
   setSockOpt sock (SockOpt (ci ipprotoIPv6) (ci ipv6MulticastHops)) (255 :: CInt)
   setSockOpt
