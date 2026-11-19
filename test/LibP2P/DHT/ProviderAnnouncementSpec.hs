@@ -1,8 +1,9 @@
 module LibP2P.DHT.ProviderAnnouncementSpec (spec) where
 
-import Control.Concurrent.Async (cancel, mapConcurrently, wait, waitCatch, withAsync)
+import Control.Concurrent.Async
+  ( AsyncCancelled (..), cancel, mapConcurrently, wait, waitCatch, withAsync )
 import Control.Concurrent.STM
-import Control.Exception (IOException, bracket, tryJust)
+import Control.Exception (IOException, bracket, finally, fromException, tryJust)
 import Control.Monad (forever)
 import Data.Either (isLeft)
 import qualified Data.Map.Strict as Map
@@ -18,7 +19,16 @@ import LibP2P.DHT.Types
 import LibP2P.EofStream (mkEofStreamPair)
 import LibP2P.Multiaddr (Multiaddr (..))
 import LibP2P.Multiaddr.Protocol (Protocol (..))
-import LibP2P.MultistreamSelect.Negotiation (StreamIO (..))
+import LibP2P.MultistreamSelect.Negotiation
+  ( NegotiationResult (..), StreamIO (..), negotiateResponder )
+import LibP2P.Switch.Connection (closeConnection)
+import LibP2P.Switch.ConnPool (addConn)
+import LibP2P.Switch.ResourceManager
+  ( MemoryAccount (..), ResourceManager (..), ResourceScope (..)
+  , ResourceUsage (..), reserveConnection
+  )
+import LibP2P.Switch.Types
+  ( ConnState (..), Connection (..), Direction (..), MuxerSession (..), Switch (..) )
 import System.IO.Error (isEOFError)
 import System.Timeout (timeout)
 import Test.Hspec
@@ -118,6 +128,88 @@ spec = describe "send-only ADD_PROVIDER" $ do
         `shouldReturn` Left "only ADD_PROVIDER is send-only"
       sessions <- readTVarIO (dhtStreams node)
       Map.null sessions `shouldBe` True
+
+  negotiationSpec
+
+negotiationSpec :: Spec
+negotiationSpec = describe "fresh-stream negotiation" $ do
+  it "should propagate cancellation and release the stream when negotiation is blocked" $
+    withNegotiatingPeer $ \node remotes closed -> do
+      withAsync (dhtSendMessage node remotePid announcement) $ \sender -> do
+        remote <- within (atomically (readTQueue remotes))
+        _ <- within (streamReadByte remote)
+        within (cancel sender)
+        result <- waitCatch sender
+        case result of
+          Left err -> fromException err `shouldBe` Just AsyncCancelled
+          Right response -> expectationFailure $ "cancellation was swallowed: " ++ show response
+      assertNegotiationReleased node remotes closed
+      assertNextAnnouncement node remotes
+
+  it "should respect a timeout and release the stream when negotiation is blocked" $
+    withNegotiatingPeer $ \node remotes closed -> do
+      withAsync (timeout 100000 (dhtSendMessage node remotePid announcement)) $ \sender -> do
+        remote <- within (atomically (readTQueue remotes))
+        _ <- within (streamReadByte remote)
+        within (wait sender) `shouldReturn` Nothing
+      assertNegotiationReleased node remotes closed
+      assertNextAnnouncement node remotes
+
+assertNegotiationReleased :: DHTNode -> TQueue StreamIO -> TVar Int -> IO ()
+assertNegotiationReleased node remotes closed = do
+  readTVarIO closed `shouldReturn` 1
+  atomically (isEmptyTQueue remotes) `shouldReturn` True
+  let scope = rmSystemScope (swResourceMgr (dhtSwitch node))
+  usage <- readTVarIO (rsUsage scope)
+  ruStreamsOutbound usage `shouldBe` 0
+
+assertNextAnnouncement :: DHTNode -> TQueue StreamIO -> IO ()
+assertNextAnnouncement node remotes =
+  withAsync (dhtSendMessage node remotePid announcement) $ \sender -> do
+    remote <- within (atomically (readTQueue remotes))
+    within (negotiateResponder remote [dhtProtocolId]) `shouldReturn` Accepted dhtProtocolId
+    within (readFramedMessage remote maxDHTMessageSize) `shouldReturn` Right announcement
+    within (wait sender) `shouldReturn` Right ()
+    streamClose remote
+
+withNegotiatingPeer :: (DHTNode -> TQueue StreamIO -> TVar Int -> IO ()) -> IO ()
+withNegotiatingPeer action = bracket (mkTestNode localPid) stopDHTNode $ \node -> do
+  remotes <- newTQueueIO
+  closed <- newTVarIO 0
+  let sw = dhtSwitch node
+      openStream = do
+        (client, remote) <- mkEofStreamPair
+        atomically (writeTQueue remotes remote)
+        pure client { streamClose = do
+          atomically (modifyTVar' closed (+ 1))
+          streamClose client }
+  bracket (newPeerConnection sw openStream) (closeConnection sw) $ \conn -> do
+    atomically (addConn (swConnPool sw) conn)
+    action node remotes closed
+
+newPeerConnection :: Switch -> IO StreamIO -> IO Connection
+newPeerConnection sw openStream = do
+  state <- newTVarIO ConnOpen
+  scope <- atomically (reserveConnection (swResourceMgr sw) remotePid Outbound)
+    >>= either (fail . show) pure
+  pure Connection
+    { connPeerId = remotePid
+    , connDirection = Outbound
+    , connLocalAddr = address
+    , connRemoteAddr = address
+    , connSecurity = "/noise"
+    , connMuxer = "/yamux/1.0.0"
+    , connSession = MuxerSession
+        { muxOpenStream = \account -> do
+            stream <- openStream
+            pure stream { streamClose = streamClose stream `finally` atomically (maClose account) }
+        , muxAcceptStream = fail "no inbound streams in the negotiation test"
+        , muxClose = pure ()
+        }
+    , connState = state
+    , connResourceScope = scope
+    , connRelayLimit = Nothing
+    }
 
 within :: IO a -> IO a
 within action = withAsync action $ \worker -> do

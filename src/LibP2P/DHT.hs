@@ -672,16 +672,16 @@ openDHTStream sw session pid = do
         Right stream -> negotiateOpened conn stream
   where
     negotiateOpened conn stream = do
-      result <- try $ negotiateInitiator stream [dhtProtocolId]
+      let discard = closeQuietly stream >> clearSessionOwner session conn
+      result <- tryJust synchronousException (negotiateInitiator stream [dhtProtocolId])
+        `onException` discard
       case result of
-        Left (e :: SomeException) -> do
-          closeQuietly stream
-          clearSessionOwner session conn
-          pure (Left ("failed to open DHT stream: " ++ show e))
+        Left _ -> do
+          discard
+          pure (Left "failed to open DHT stream")
         Right (Accepted _) -> pure (Right stream)
         Right NoProtocol -> do
-          closeQuietly stream
-          clearSessionOwner session conn
+          discard
           pure (Left "peer does not support /ipfs/kad/1.0.0")
 
 -- | Clear ownership only when it still points at the failed connection.
