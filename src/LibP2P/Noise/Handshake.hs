@@ -7,17 +7,8 @@
 module LibP2P.Noise.Handshake
   ( -- * Handshake types
     HandshakeResult (..)
-  , NoisePayload (..)
   , HandshakeState (..)
-    -- * Payload encoding
-  , encodeNoisePayload
-  , encodeNoisePayloadWithCerthashes
-  , decodeNoisePayload
-  , decodeNoiseCerthashes
-  , buildHandshakePayload
-    -- * Static key signing
-  , signStaticKey
-  , verifyStaticKey
+  , InlinedNegotiationResult (..)
     -- * Handshake lifecycle
   , initHandshakeInitiator
   , initHandshakeResponder
@@ -55,22 +46,22 @@ import qualified Crypto.Noise.DH as DH
 import Crypto.Noise.DH.Curve25519 (Curve25519)
 import Crypto.Noise.HandshakePatterns (noiseXX)
 import Crypto.Noise.Hash.SHA256 (SHA256)
-import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.ByteArray (ScrubbedBytes)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
-import Data.Word (Word64)
-import LibP2P.Core.Varint (decodeUvarint, encodeUvarint)
-import LibP2P.Crypto.Key
-  ( KeyPair (..)
-  , PrivateKey (..)
-  , PublicKey (..)
-  , verify
-  )
+import LibP2P.Crypto.Key (PublicKey (..))
 import qualified LibP2P.Crypto.Key as Key
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
-import LibP2P.Crypto.Protobuf (decodePublicKey, encodePublicKey)
+import LibP2P.Crypto.Protobuf (decodePublicKey)
 import LibP2P.Noise.Session (NoiseSession, mkNoiseSession)
+import LibP2P.Noise.Handshake.Payload
+  ( NoisePayload (..)
+  , buildHandshakePayload
+  , decodeNoisePayload
+  , encodeNoisePayload
+  , verifyStaticKey
+  )
+import LibP2P.MultistreamSelect.Negotiation (ProtocolId)
 
 -- | Type alias for the Noise state with our fixed cipher suite.
 type CacophonyState = NoiseState ChaChaPoly1305 Curve25519 SHA256
@@ -84,174 +75,15 @@ newtype HandshakeState = HandshakeState
 data HandshakeResult = HandshakeResult
   { hrRemotePeerId :: !PeerId
   , hrRemotePublicKey :: !PublicKey
+  , hrNegotiatedMuxer :: !InlinedNegotiationResult
   }
   deriving (Show, Eq)
 
--- | Noise handshake payload (protobuf-encoded in messages 2 and 3).
-data NoisePayload = NoisePayload
-  { npIdentityKey :: !ByteString -- ^ Serialized PublicKey protobuf
-  , npIdentitySig :: !ByteString -- ^ Signature over "noise-libp2p-static-key:" || static_pubkey
-  }
+data InlinedNegotiationResult
+  = Selected !ProtocolId
+  | Fallback
+  | NoOverlap
   deriving (Show, Eq)
-
--- | The prefix for the signed data in Noise handshake.
-noiseStaticKeyPrefix :: ByteString
-noiseStaticKeyPrefix = "noise-libp2p-static-key:"
-
--- | Sign the Noise static public key with the identity private key.
-signStaticKey :: PrivateKey -> ByteString -> Either String ByteString
-signStaticKey sk noiseStaticPubKey =
-  let payload = noiseStaticKeyPrefix <> noiseStaticPubKey
-   in Key.sign sk payload
-
--- | Verify a signature over the Noise static public key.
-verifyStaticKey :: PublicKey -> ByteString -> ByteString -> Bool
-verifyStaticKey pk noiseStaticPubKey sig =
-  let payload = noiseStaticKeyPrefix <> noiseStaticPubKey
-   in verify pk payload sig
-
--- | Build a handshake payload from an identity key pair and Noise static pubkey.
-buildHandshakePayload :: Key.KeyPair -> ByteString -> Either String NoisePayload
-buildHandshakePayload identityKP noiseStaticPub = do
-  identSig <-
-    either (Left . ("buildHandshakePayload: " <>)) Right $
-      signStaticKey (kpPrivate identityKP) noiseStaticPub
-  Right (NoisePayload (encodePublicKey (kpPublic identityKP)) identSig)
-
--- | Encode a NoisePayload as a minimal protobuf message.
-encodeNoisePayload :: NoisePayload -> ByteString
-encodeNoisePayload (NoisePayload identKey identSig) =
-  -- Field 1: tag 0x0a (field 1, wire type 2 = length-delimited)
-  BS.singleton 0x0a
-    <> encodeUvarint (fromIntegral (BS.length identKey))
-    <> identKey
-    -- Field 2: tag 0x12 (field 2, wire type 2 = length-delimited)
-    <> BS.singleton 0x12
-    <> encodeUvarint (fromIntegral (BS.length identSig))
-    <> identSig
-
--- | Encode a Noise payload with libp2p WebTransport certificate hashes.
-encodeNoisePayloadWithCerthashes :: NoisePayload -> [ByteString] -> ByteString
-encodeNoisePayloadWithCerthashes payload [] = encodeNoisePayload payload
-encodeNoisePayloadWithCerthashes payload hashes =
-  encodeNoisePayload payload <> lengthDelimitedField 4 extensions
-  where
-    extensions = BS.concat (map (lengthDelimitedField 1) hashes)
-
--- | Decode WebTransport certificate hashes from Noise payload extensions.
-decodeNoiseCerthashes :: ByteString -> Either String [ByteString]
-decodeNoiseCerthashes = fmap concat . collectOuterExtensions
-
-collectOuterExtensions :: ByteString -> Either String [[ByteString]]
-collectOuterExtensions input
-  | BS.null input = Right []
-  | otherwise = do
-      (tag, rest) <- decodeUvarint input
-      let fieldNum = tag `shiftR` 3
-          wireType = tag .&. 0x7
-      if fieldNum == 4 && wireType == 2
-        then do
-          (extension, trailing) <- parseLengthDelimited rest
-          hashes <- collectCerthashes extension
-          (hashes :) <$> collectOuterExtensions trailing
-        else skipExtensionField wireType rest >>= collectOuterExtensions
-
-collectCerthashes :: ByteString -> Either String [ByteString]
-collectCerthashes input
-  | BS.null input = Right []
-  | otherwise = do
-      (tag, rest) <- decodeUvarint input
-      let fieldNum = tag `shiftR` 3
-          wireType = tag .&. 0x7
-      if fieldNum == 1 && wireType == 2
-        then do
-          (hash, trailing) <- parseLengthDelimited rest
-          (hash :) <$> collectCerthashes trailing
-        else skipExtensionField wireType rest >>= collectCerthashes
-
-lengthDelimitedField :: Word64 -> ByteString -> ByteString
-lengthDelimitedField fieldNumber bytes =
-  encodeUvarint ((fieldNumber `shiftL` 3) .|. 2)
-    <> encodeUvarint (fromIntegral (BS.length bytes))
-    <> bytes
-
-parseLengthDelimited :: ByteString -> Either String (ByteString, ByteString)
-parseLengthDelimited input = do
-  (len, rest) <- decodeUvarint input
-  let fieldLen = fromIntegral len :: Int
-  if BS.length rest < fieldLen
-    then Left "protobuf length-delimited field is truncated"
-    else Right (BS.take fieldLen rest, BS.drop fieldLen rest)
-
-skipExtensionField :: Word64 -> ByteString -> Either String ByteString
-skipExtensionField 0 input = snd <$> decodeUvarint input
-skipExtensionField 1 input = skipExtensionFixed 8 input
-skipExtensionField 2 input = snd <$> parseLengthDelimited input
-skipExtensionField 5 input = skipExtensionFixed 4 input
-skipExtensionField wireType _ =
-  Left $ "unsupported protobuf wire type " <> show wireType
-
-skipExtensionFixed :: Int -> ByteString -> Either String ByteString
-skipExtensionFixed size input
-  | BS.length input < size = Left "protobuf fixed-width field is truncated"
-  | otherwise = Right (BS.drop size input)
-
--- | Decode a NoisePayload from protobuf bytes.
---
--- Protobuf does not constrain field order on the wire, so fields are
--- dispatched by number in a loop rather than matched in a fixed
--- sequence. Unknown fields are skipped according to their wire type
--- (go-libp2p already emits an extensions message as field 4, and other
--- implementations may add more). Both identity_key (field 1) and
--- identity_sig (field 2) must be present; on duplicates the last
--- occurrence wins, per protobuf merge semantics.
-decodeNoisePayload :: ByteString -> Either String NoisePayload
-decodeNoisePayload bs0 = do
-  (mKey, mSig) <- go (Nothing, Nothing) bs0
-  identKey <- maybe (Left "decodeNoisePayload: missing identity_key (field 1)") Right mKey
-  identSig <- maybe (Left "decodeNoisePayload: missing identity_sig (field 2)") Right mSig
-  Right (NoisePayload identKey identSig)
-  where
-    go
-      :: (Maybe ByteString, Maybe ByteString)
-      -> ByteString
-      -> Either String (Maybe ByteString, Maybe ByteString)
-    go acc@(mKey, mSig) input
-      | BS.null input = Right acc
-      | otherwise = do
-          (tag, rest) <- decodeUvarint input
-          let fieldNum = tag `shiftR` 3
-              wireType = tag .&. 0x7
-          case (fieldNum, wireType) of
-            (1, 2) -> do
-              (v, rest') <- lengthDelimited rest
-              go (Just v, mSig) rest'
-            (2, 2) -> do
-              (v, rest') <- lengthDelimited rest
-              go (mKey, Just v) rest'
-            (_, wt) -> do
-              rest' <- skipField wt rest
-              go acc rest'
-
-    lengthDelimited :: ByteString -> Either String (ByteString, ByteString)
-    lengthDelimited input = do
-      (len, rest) <- decodeUvarint input
-      let fieldLen = fromIntegral len :: Int
-      if BS.length rest < fieldLen
-        then Left "decodeNoisePayload: not enough bytes for field"
-        else Right (BS.take fieldLen rest, BS.drop fieldLen rest)
-
-    skipField :: Word64 -> ByteString -> Either String ByteString
-    skipField 0 input = snd <$> decodeUvarint input
-    skipField 1 input = skipFixed 8 input
-    skipField 2 input = snd <$> lengthDelimited input
-    skipField 5 input = skipFixed 4 input
-    skipField wt _ = Left $ "decodeNoisePayload: unsupported wire type " <> show wt
-
-    skipFixed :: Int -> ByteString -> Either String ByteString
-    skipFixed n input
-      | BS.length input < n = Left "decodeNoisePayload: not enough bytes for field"
-      | otherwise = Right (BS.drop n input)
 
 -- | Initialize a handshake state for the initiator role.
 -- Returns (HandshakeState, noiseStaticPublicKey).
@@ -333,12 +165,15 @@ performFullHandshake aliceIdentity bobIdentity = do
     (_payload1, bobState1) <- readHandshakeMsg bobInit msg1
 
     -- Message 2: Bob → Alice (Bob's identity payload)
-    bobPayload <- encodeNoisePayload <$> buildHandshakePayload bobIdentity bobNoiseStaticPub
+    bobPayload <- encodeNoisePayload <$> buildHandshakePayload bobIdentity bobNoiseStaticPub Nothing
     (msg2, bobState2) <- writeHandshakeMsg bobState1 bobPayload
     (payload2, aliceState2) <- readHandshakeMsg aliceState1 msg2
 
     -- Decode Bob's identity
-    bobNP <- decodeNoisePayload payload2
+    bobNP <-
+      case decodeNoisePayload payload2 of
+        Left e -> Left $ show e
+        Right x -> Right x
     bobPubKey <- decodePublicKey (npIdentityKey bobNP)
     let bobRemotePeerId = fromPublicKey bobPubKey
 
@@ -351,12 +186,15 @@ performFullHandshake aliceIdentity bobIdentity = do
           else Right ()
 
     -- Message 3: Alice → Bob (Alice's identity payload)
-    alicePayload <- encodeNoisePayload <$> buildHandshakePayload aliceIdentity aliceNoiseStaticPub
+    alicePayload <- encodeNoisePayload <$> buildHandshakePayload aliceIdentity aliceNoiseStaticPub Nothing
     (msg3, _aliceFinal) <- writeHandshakeMsg aliceState2 alicePayload
     (payload3, bobFinal) <- readHandshakeMsg bobState2 msg3
 
     -- Decode Alice's identity
-    aliceNP <- decodeNoisePayload payload3
+    aliceNP <-
+      case decodeNoisePayload payload3 of
+        Left e -> Left $ show e
+        Right x -> Right x
     alicePubKey <- decodePublicKey (npIdentityKey aliceNP)
     let aliceRemotePeerId = fromPublicKey alicePubKey
 
@@ -381,12 +219,15 @@ performFullHandshakeWithSessions aliceIdentity bobIdentity = do
     (_payload1, bobState1) <- readHandshakeMsg bobInit msg1
 
     -- Message 2: Bob → Alice (Bob's identity payload)
-    bobPayload <- encodeNoisePayload <$> buildHandshakePayload bobIdentity bobNoiseStaticPub
+    bobPayload <- encodeNoisePayload <$> buildHandshakePayload bobIdentity bobNoiseStaticPub Nothing
     (msg2, bobState2) <- writeHandshakeMsg bobState1 bobPayload
     (payload2, aliceState2) <- readHandshakeMsg aliceState1 msg2
 
     -- Verify Bob's identity_sig
-    bobNP <- decodeNoisePayload payload2
+    bobNP <-
+      case decodeNoisePayload payload2 of
+        Left e -> Left $ show e
+        Right x -> Right x
     bobPubKey <- decodePublicKey (npIdentityKey bobNP)
     case getRemoteNoiseStaticKey aliceState2 of
       Nothing -> Left "performFullHandshakeWithSessions: remote Noise static key unavailable after msg2"
@@ -396,12 +237,15 @@ performFullHandshakeWithSessions aliceIdentity bobIdentity = do
           else Right ()
 
     -- Message 3: Alice → Bob (Alice's identity payload)
-    alicePayload <- encodeNoisePayload <$> buildHandshakePayload aliceIdentity aliceNoiseStaticPub
+    alicePayload <- encodeNoisePayload <$> buildHandshakePayload aliceIdentity aliceNoiseStaticPub Nothing
     (msg3, aliceFinal) <- writeHandshakeMsg aliceState2 alicePayload
     (payload3, bobFinal) <- readHandshakeMsg bobState2 msg3
 
     -- Verify Alice's identity_sig
-    aliceNP <- decodeNoisePayload payload3
+    aliceNP <-
+      case decodeNoisePayload payload3 of
+        Left e -> Left $ show e
+        Right x -> Right x
     alicePubKey <- decodePublicKey (npIdentityKey aliceNP)
     case getRemoteNoiseStaticKey bobFinal of
       Nothing -> Left "performFullHandshakeWithSessions: remote Noise static key unavailable after msg3"
