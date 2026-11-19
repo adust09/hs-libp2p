@@ -138,7 +138,17 @@ cabal test --test-option="--match=Integration"
 
 ## Documentation
 
-**[API Reference](https://adust09.github.io/hs-libp2p/)** — Generated Haddock documentation.
+**[API Reference](https://hs-libp2p.shoukitsuda.workers.dev/)** — Generated Haddock documentation.
+
+The `Haddock` workflow builds documentation on pull requests to `main` and publishes
+it to Cloudflare Workers Static Assets on pushes to `main`. It can also be run
+manually on `main`. Changes on `develop` are not published.
+
+Deployment requires the repository secrets `CLOUDFLARE_ACCOUNT_ID` and
+`CLOUDFLARE_API_TOKEN`. Scope the token to the target account with Workers Scripts:
+Edit and Account Settings: Read permissions. `wrangler.toml` serves the generated
+`docs-out` directory; pull request builds upload it as the `haddock-site` artifact
+without deploying.
 
 ## Specification
 
