@@ -3,59 +3,65 @@ name: Haddock
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: "pages"
+  group: cloudflare-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  haddock:
+  build-docs:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: haskell-actions/setup@v2
         with:
           ghc-version: '9.10.1'
           cabal-version: '3.12'
-
       - uses: actions/cache@v4
         with:
-          path: |
-            ~/.cabal/store
-            dist-newstyle
-          key: ${{ runner.os }}-haddock-${{ hashFiles('hs-libp2p.cabal', 'cabal.project') }}
-          restore-keys: ${{ runner.os }}-haddock-
-
+          path: ~/.cabal/store
+          key: ${{ runner.os }}-haddock-deps-9.10.1-${{ hashFiles('hs-libp2p.cabal', 'cabal.project') }}
+          restore-keys: ${{ runner.os }}-haddock-deps-9.10.1-
       - name: Build dependencies
         run: cabal update && cabal build --only-dependencies
-
       - name: Generate Haddock
-        run: cabal haddock --haddock-hyperlink-source --haddock-quickjump --haddock-html-location='https://hackage.haskell.org/package/$pkg-$version/docs'
-
+        run: cabal haddock lib:hs-libp2p --haddock-hyperlink-source --haddock-quickjump --haddock-html-location='https://hackage.haskell.org/package/$pkg-$version/docs'
       - name: Prepare docs directory
         run: |
-          HADDOCK_DIR=$(find dist-newstyle -path '*/doc/html/libp2p-hs' -type d | head -1)
-          if [ -z "$HADDOCK_DIR" ]; then
-            echo "[ERROR] no haddock docs directory found under dist-newstyle"
-            find dist-newstyle -type d -path '*/doc/html/*' | head -20
-            exit 1
-          fi
+          HADDOCK_DIR=$(find dist-newstyle -path '*/doc/html/hs-libp2p' -type d -print -quit)
+          test -n "$HADDOCK_DIR"
+          test -s "$HADDOCK_DIR/index.html"
           cp -r "$HADDOCK_DIR" docs-out
-
-      - uses: actions/configure-pages@v5
-
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
+          name: haddock-site
           path: docs-out
+          if-no-files-found: error
+          retention-days: 7
 
-      - id: deployment
-        uses: actions/deploy-pages@v4
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build-docs
+    runs-on: ubuntu-latest
+    environment:
+      name: cloudflare
+      url: ${{ steps.deployment.outputs.deployment-url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: haddock-site
+          path: docs-out
+      - name: Deploy to Cloudflare Workers
+        id: deployment
+        uses: cloudflare/wrangler-action@953926a2e2182532811c01a25e53647d93bf07c0 # v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          wranglerVersion: '4.164.0'

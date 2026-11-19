@@ -1,5 +1,7 @@
 dist
 dist-*
+docs-out/
+.wrangler/
 cabal-dev
 *.o
 *.hi
