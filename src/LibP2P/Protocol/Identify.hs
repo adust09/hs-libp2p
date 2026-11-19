@@ -37,7 +37,7 @@ module LibP2P.Protocol.Identify
 
 import Control.Applicative ((<|>))
 import Control.Concurrent.STM (atomically, modifyTVar', readTVar, writeTVar)
-import Control.Exception (SomeException, bracket, catch, finally, try)
+import Control.Exception (SomeAsyncException, SomeException, bracket, catch, finally, fromException, throwIO, try)
 import LibP2P.Switch.Connection (newStreamAllowingLimited)
 import Control.Monad (void)
 import Data.Text (Text)
@@ -78,7 +78,7 @@ import LibP2P.Protocol.Identify.Message
   )
 import LibP2P.Switch.ConnPool (allConns)
 import LibP2P.Switch.Types
-  ( ActiveListener (..)
+  ( currentListenAddrs
   , Connection (..)
   , Switch (..)
   )
@@ -315,12 +315,17 @@ mergeIdentify known update = IdentifyInfo
 -- push protocol id, send one Identify message and close the stream.
 -- Call this whenever local state advertised via identify changes
 -- (listen addresses, registered protocols). Failures on individual
--- peers (e.g. push protocol not supported) are ignored.
+-- peers (e.g. push protocol not supported) are ignored, and each peer's
+-- exchange is bounded by 'identifyTimeoutMicros'. Cancellation of the
+-- caller propagates.
 pushIdentify :: Switch -> IO ()
 pushIdentify sw = do
   conns <- atomically $ allConns (swConnPool sw)
-  mapM_ (\conn -> pushToConn conn `catch` \(_ :: SomeException) -> pure ()) conns
+  mapM_ (\conn -> void (timeout identifyTimeoutMicros (pushToConn conn)) `catch` ignoreSync) conns
   where
+    ignoreSync e = case fromException e of
+      Just (_ :: SomeAsyncException) -> throwIO e
+      Nothing -> pure ()
     pushToConn conn = do
       opened <- newStreamAllowingLimited sw conn
       case opened of
@@ -340,8 +345,8 @@ buildLocalIdentify :: Switch -> Maybe Connection -> IO IdentifyInfo
 buildLocalIdentify sw mConn = do
   (protocols, listenAddrs) <- atomically $ do
     protos <- Map.keys <$> readTVar (swProtocols sw)
-    listeners <- readTVar (swListeners sw)
-    pure (protos, map alAddress listeners)
+    addrs <- currentListenAddrs sw
+    pure (protos, addrs)
   seqNo <- timestampSeq
   let addrBytes = map (\(Multiaddr ps) -> encodeProtocols ps) listenAddrs
       record = PeerRecord

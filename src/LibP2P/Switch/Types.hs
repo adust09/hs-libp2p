@@ -19,10 +19,11 @@ module LibP2P.Switch.Types
   , BackoffEntry (..)
   , ResourceError (..)
   , ActiveListener (..)
+  , currentListenAddrs
   ) where
 
 import Control.Concurrent.Async (Async)
-import Control.Concurrent.STM (TChan, TMVar, TVar)
+import Control.Concurrent.STM (STM, TChan, TMVar, TVar, readTVar)
 import Data.Map.Strict (Map)
 import Data.Time.Clock (UTCTime)
 import LibP2P.Crypto.Key (KeyPair)
@@ -38,7 +39,7 @@ import LibP2P.Switch.ResourceManager
   , ResourceManager
   , ResourceScope
   )
-import LibP2P.Transport (Listener, RelayCircuitLimit, Transport)
+import LibP2P.Transport (Listener (..), RelayCircuitLimit, Transport)
 import LibP2P.Yamux.Types (YamuxConfig, defaultYamuxConfig)
 
 -- | Connection state machine.
@@ -143,8 +144,12 @@ data BackoffEntry = BackoffEntry
 data ActiveListener = ActiveListener
   { alListener   :: !Listener      -- ^ The transport listener (accept, close)
   , alAcceptLoop :: !(Async ())    -- ^ Background thread accepting connections
-  , alAddress    :: !Multiaddr     -- ^ Actual bound address (port 0 resolved)
   }
+
+-- | The address each active listener advertises now.
+currentListenAddrs :: Switch -> STM [Multiaddr]
+currentListenAddrs sw =
+  readTVar (swListeners sw) >>= mapM (listenerCurrentAddr . alListener)
 
 -- | Switch-wide settings, fixed when the Switch is created.
 data SwitchConfig = SwitchConfig

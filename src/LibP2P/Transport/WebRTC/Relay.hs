@@ -151,6 +151,7 @@ listenSignaled sw state requested = do
     { listenerAccept = acceptWebRTCConnection listenerState
     , listenerClose = close
     , listenerAddr = advertised
+    , listenerCurrentAddr = pure advertised
     }
 
 startCircuitPump :: Listener -> WebRTCListenerState -> IO (Async ())

@@ -2,13 +2,16 @@ module LibP2P.DHT.CandidateDialSpec (spec) where
 
 import Control.Concurrent.Async (mapConcurrently, wait, withAsync)
 import Control.Concurrent.STM
-import Control.Exception (bracket, bracketOnError, finally)
+import Control.Exception
+  ( MaskingState (..), bracket, bracketOnError, finally, getMaskingState )
 import Control.Monad (void, when)
 import qualified Data.ByteString as BS
 import Data.Either (isLeft)
+import Data.IORef (atomicModifyIORef', newIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, isNothing)
 import Data.Time (getCurrentTime)
+import GHC.Clock (getMonotonicTimeNSec)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
 import LibP2P.Crypto.Key (publicKey)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes)
@@ -43,7 +46,9 @@ data TestNode = TestNode
 spec :: Spec
 spec = describe "DHT candidate dialing over TCP" $ do
   valueLookupSpec
+  announcementSpec
   addressLookupSpec
+  dialingRegressionSpec
   addressBoundSpec
   admissionSpec
   ownershipSpec
@@ -73,6 +78,21 @@ valueLookupSpec = do
       map peProvider result `shouldContain` [peer c]
       connectedTo a c `shouldReturn` True
 
+announcementSpec :: Spec
+announcementSpec =
+  it "should dial an unconnected peer for an announcement and align its next RPC" $
+    withTopology $ \a _ c -> do
+      seed (tnDHT a) c
+      let announcement = emptyDHTMessage
+            { msgType = AddProvider
+            , msgKey = contentKey
+            , msgProviderPeers = [DHTPeer (peerIdBytes (peer a)) [toBytes (tnAddress a)] Connected]
+            }
+      within (dhtSendMessage (tnDHT a) (peer c) announcement) `shouldReturn` Right ()
+      response <- within $ dhtSendRequest (tnDHT a) (peer c)
+        (emptyDHTMessage { msgType = GetProviders, msgKey = contentKey })
+      fmap (map dhtPeerId . msgProviderPeers) response `shouldBe` Right [peerIdBytes (peer a)]
+
 addressLookupSpec :: Spec
 addressLookupSpec = do
   it "should use peer-store addresses when a direct RPC has no connection or routing entry" $
@@ -94,6 +114,53 @@ addressLookupSpec = do
       result <- within $ findPeer (node { dhtSendRequest = sender }) (peer c)
       map entryPeerId result `shouldContain` [peer c]
       connectedTo a c `shouldReturn` True
+
+dialingRegressionSpec :: Spec
+dialingRegressionSpec = describe "dialing review regressions" $ do
+  it "should use a peer-store address when the routing-table address is gated" $
+    withTopology $ \a _ c -> do
+      now <- getCurrentTime
+      let stale = Multiaddr [IP4 0x7f000001, TCP 1]
+          entry = BucketEntry (peer c) (peerIdToKey (peer c)) [stale] now NotConnected
+          info = IdentifyInfo
+            { idProtocolVersion = Nothing, idAgentVersion = Nothing, idPublicKey = Nothing
+            , idListenAddrs = [toBytes (tnAddress c)], idObservedAddr = Nothing
+            , idProtocols = [], idSignedPeerRecord = Nothing
+            }
+      atomically $ do
+        modifyTVar' (dhtRoutingTable (tnDHT a)) (fst . insertPeer entry)
+        modifyTVar' (swPeerStore (switch a)) (Map.insert (peer c) info)
+      setConnectionGater (switch a) defaultConnectionGater
+        { gateDialAddr = \address -> pure (address /= stale) }
+      response <- within $ dhtSendRequest (tnDHT a) (peer c)
+        (emptyDHTMessage { msgType = FindNode, msgKey = peerIdBytes (peer c) })
+      fmap msgType response `shouldBe` Right FindNode
+
+  it "should enforce notifier deadlines when DHT establishes the connection" $
+    withTopology $ \a _ c -> do
+      observed <- newEmptyTMVarIO
+      let notifier conn = when (connPeerId conn == peer c) $ do
+            state <- getMaskingState
+            result <- timeout 10000 busyFor100ms
+            atomically $ putTMVar observed (state, result)
+      atomically $ modifyTVar' (swNotifiers (switch a)) (notifier :)
+      seed (tnDHT a) c
+      response <- within $ dhtSendRequest (tnDHT a) (peer c)
+        (emptyDHTMessage { msgType = FindNode, msgKey = peerIdBytes (peer c) })
+      fmap msgType response `shouldBe` Right FindNode
+      within (atomically (takeTMVar observed)) `shouldReturn` (Unmasked, Nothing)
+
+-- Non-blocking work distinguishes inherited masking from an interruptible STM wait.
+busyFor100ms :: IO ()
+busyFor100ms = do
+  deadline <- (+ 100000000) <$> getMonotonicTimeNSec
+  counter <- newIORef (0 :: Int)
+  let loop = do
+        now <- getMonotonicTimeNSec
+        when (now < deadline) $ do
+          atomicModifyIORef' counter (\n -> (n + 1, ()))
+          loop
+  loop
 
 addressBoundSpec :: Spec
 addressBoundSpec =

@@ -8,30 +8,36 @@ WebTransport streams are exposed directly as the native libp2p muxer.
 -}
 module LibP2P.Transport.WebTransport (
   newWebTransportTransport,
+  newWebTransportTransportWithClock,
   canDialWebTransport,
   verifyBoundHashes,
 ) where
 
 import Control.Applicative ((<|>))
-import Control.Concurrent (modifyMVar_, newMVar)
+import Control.Concurrent (modifyMVar, modifyMVar_, newMVar, threadDelay)
 import Control.Concurrent.Async (Async, async, cancel, race, waitCatch)
 import Control.Concurrent.STM (
+  STM,
   TMVar,
   TQueue,
   atomically,
   newEmptyTMVarIO,
   newTQueueIO,
+  newTVarIO,
   putTMVar,
   readTMVar,
   readTQueue,
+  readTVar,
   tryPutTMVar,
   writeTQueue,
+  writeTVar,
  )
 import Control.Exception (SomeException, displayException, finally, onException, try)
-import Control.Monad (unless, void, when)
+import Control.Monad (forever, unless, void, when)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
+import Data.Hourglass (DateTime, timeConvert)
 import Data.IP (IPv6, fromHostAddress6, toHostAddress6)
 import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Text qualified as Text
@@ -56,7 +62,11 @@ import LibP2P.Transport (
   Transport (..),
  )
 import LibP2P.Transport.WebTransport.Certificate (
-  newWebTransportCredential,
+  CertificateSet (..),
+  WebTransportCertificate (..),
+  boundCertificateHashes,
+  newCertificateSet,
+  rollCertificates,
   verifyWebTransportCertificate,
  )
 import LibP2P.Transport.WebTransport.HTTP3 (
@@ -80,7 +90,8 @@ import Network.QUIC.Internal (
  )
 import Network.QUIC.Server qualified as Server
 import Network.Socket qualified as Socket
-import Network.TLS (Credential, Credentials (..))
+import Network.TLS (Credentials (..), ServerHooks (onServerNameIndication))
+import Time.System (timeCurrent)
 
 webTransportALPN :: ByteString
 webTransportALPN = "h3"
@@ -88,19 +99,34 @@ webTransportALPN = "h3"
 webTransportMaxDatagramFrameSize :: Int
 webTransportMaxDatagramFrameSize = 65535
 
-{- | Construct a WebTransport transport with one short-lived self-signed TLS
-certificate. The listener address includes its SHA-256 @/certhash@.
+{- | Construct a WebTransport transport with rolling short-lived self-signed
+TLS certificates. Listener addresses include the SHA-256 @/certhash@ of the
+active certificate and of its successor, and 'listenerCurrentAddr' follows
+the certificates as they roll.
 -}
 newWebTransportTransport :: KeyPair -> IO Transport
-newWebTransportTransport identity = do
-  (credential, certificateHash) <- newWebTransportCredential
+newWebTransportTransport =
+  newWebTransportTransportWithClock (timeConvert <$> timeCurrent)
+
+-- | 'newWebTransportTransport' with an injectable clock for certificate rolling.
+newWebTransportTransportWithClock :: IO DateTime -> KeyPair -> IO Transport
+newWebTransportTransportWithClock clock identity = do
+  initial <- clock >>= newCertificateSet
+  certificates <- newMVar initial
+  published <- newTVarIO initial
+  -- Rolled on handshakes and by each listener's roll timer.
+  let currentCertificates = modifyMVar certificates $ \current -> do
+        now <- clock
+        rolled <- rollCertificates now current
+        atomically (writeTVar published rolled)
+        pure (rolled, rolled)
   pure
     Transport
       { transportDial = dialWebTransport identity
       , transportDialFrom = \local remote -> case local of
           Nothing -> dialWebTransport identity remote
           Just _ -> fail "WebTransport does not support binding an existing listen address"
-      , transportListen = listenWebTransport identity credential certificateHash
+      , transportListen = listenWebTransport identity currentCertificates (readTVar published)
       , transportCanDial = canDialWebTransport
       }
 
@@ -213,38 +239,59 @@ verifyExpectedPeer (Just expected) actual =
     fail "WebTransport Noise peer ID does not match the /p2p address"
 
 listenWebTransport ::
-  KeyPair -> Credential -> ByteString -> Multiaddr -> IO Listener
-listenWebTransport identity credential certificateHash requestedAddress = do
+  KeyPair -> IO CertificateSet -> STM CertificateSet -> Multiaddr -> IO Listener
+listenWebTransport identity currentCertificates publishedCertificates requestedAddress = do
   socketAddress <- either fail pure (listenSocketAddress requestedAddress)
   socket <- openServerSocket socketAddress
   boundBase <- Socket.getSocketName socket >>= socketAddressToWebTransport
-  let advertised = appendCerthash boundBase certificateHash
+  let advertise certificates =
+        foldl
+          appendCerthash
+          boundBase
+          [wtHash (csActive certificates), wtHash (csNext certificates)]
+  advertised <- advertise <$> currentCertificates
   accepted <- newTQueueIO
   ready <- newEmptyTMVarIO
   worker <-
     async $
       Server.runWithSockets
         [socket]
-        (serverConfig credential ready)
-        (acceptConnection identity certificateHash advertised accepted)
+        (serverConfig currentCertificates ready)
+        (acceptConnection identity currentCertificates advertised accepted)
   waitForServer worker ready `onException` closeServer worker socket
+  -- Roll without waiting for a handshake, so the advertised address moves on
+  -- before the successor certificate expires. Rolling is a no-op until due.
+  roller <- async $ forever (threadDelay rollCheckMicros >> void currentCertificates)
   pure
     Listener
       { listenerAccept = atomically (readTQueue accepted)
-      , listenerClose = closeServer worker socket
+      , listenerClose = cancel roller >> closeServer worker socket
       , listenerAddr = advertised
+      , listenerCurrentAddr = advertise <$> publishedCertificates
       }
 
-serverConfig :: Credential -> TMVar () -> ServerConfig
-serverConfig credential ready =
+-- | How often a listener checks whether its certificates are due to roll,
+-- well inside the 30-minute rotation margin.
+rollCheckMicros :: Int
+rollCheckMicros = 60 * 1000000
+
+serverConfig :: IO CertificateSet -> TMVar () -> ServerConfig
+serverConfig currentCertificates ready =
   defaultServerConfig
     { scVersions = [Version 1]
-    , scCredentials = Credentials [credential]
+    , scCredentials = mempty
+    , scTlsHooks =
+        (scTlsHooks defaultServerConfig)
+          { onServerNameIndication = const (activeCredential <$> currentCertificates)
+          }
     , scRequireClientCert = False
     , scMaxDatagramFrameSize = webTransportMaxDatagramFrameSize
     , scALPN = Just selectALPN
     , scHooks = defaultHooks{onServerReady = atomically (putTMVar ready ())}
     }
+
+activeCredential :: CertificateSet -> Credentials
+activeCredential certificates = Credentials [wtCredential (csActive certificates)]
 
 selectALPN :: Version -> [ByteString] -> IO ByteString
 selectALPN _ protocols
@@ -253,16 +300,17 @@ selectALPN _ protocols
 
 acceptConnection ::
   KeyPair ->
-  ByteString ->
+  IO CertificateSet ->
   Multiaddr ->
   TQueue RawConnection ->
   QUIC.Connection ->
   IO ()
-acceptConnection identity certificateHash localAddress accepted connection = do
+acceptConnection identity currentCertificates localAddress accepted connection = do
   session <- acceptWebTransport connection
   noiseStream <- acceptWebTransportStream session >>= streamToStreamIO
+  certificateHashes <- boundCertificateHashes <$> currentCertificates
   handshake <-
-    performWebTransportResponder identity [certificateHash] noiseStream
+    performWebTransportResponder identity certificateHashes noiseStream
       `finally` streamClose noiseStream
   info <- QUIC.getConnectionInfo connection
   remoteAddress <- socketAddressToWebTransport (QUIC.remoteSockAddr info)

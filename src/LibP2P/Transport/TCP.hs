@@ -93,12 +93,12 @@ bindLocal sock local = case stripP2P local of
   Multiaddr [IP6 bs, TCP port] -> NS.bind sock (ipv6SockAddr bs port)
   _ -> fail "tcpDialFrom: local bind address is not TCP"
 
--- | SO_REUSEADDR + SO_REUSEPORT so a listen socket and a hole-punch
--- dial socket can share the same local port.
+-- | Share the listen port with hole-punch dials. Winsock has no SO_REUSEPORT.
 enableAddrReuse :: NS.Socket -> IO ()
 enableAddrReuse sock = do
   NS.setSocketOption sock NS.ReuseAddr 1
-  NS.setSocketOption sock NS.ReusePort 1
+  NS.whenSupported NS.ReusePort $
+    NS.setSocketOption sock NS.ReusePort 1
 
 ipv4SockAddr :: Word32 -> Word16 -> NS.SockAddr
 ipv4SockAddr w port =
@@ -148,6 +148,7 @@ tcpListen (Multiaddr [IP4 w, TCP port]) = do
         mkRawConnection clientSock clientAddr
     , listenerClose = NS.close sock
     , listenerAddr = boundAddr
+    , listenerCurrentAddr = pure boundAddr
     }
 tcpListen (Multiaddr [IP6 bs, TCP port]) = do
   let ipv6 = bytesToIPv6 bs
@@ -166,6 +167,7 @@ tcpListen (Multiaddr [IP6 bs, TCP port]) = do
         mkRawConnection clientSock clientAddr
     , listenerClose = NS.close sock
     , listenerAddr = boundAddr
+    , listenerCurrentAddr = pure boundAddr
     }
 tcpListen _ = fail "tcpListen: unsupported multiaddr"
 
