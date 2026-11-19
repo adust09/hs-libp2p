@@ -13,6 +13,8 @@
 module LibP2P.Switch.Dial
   ( -- * Main entry point
     dial
+    -- * Address resolution
+  , resolveDialAddresses
     -- * Dial options
   , DialOpts (..)
   , defaultDialOpts

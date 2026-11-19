@@ -4,7 +4,11 @@ SHA-256 certificate hash is supplied out of band, but require a validity
 period of at most 14 days.
 -}
 module LibP2P.Transport.WebTransport.Certificate (
-  newWebTransportCredential,
+  CertificateSet (..),
+  WebTransportCertificate (..),
+  boundCertificateHashes,
+  newCertificateSet,
+  rollCertificates,
   verifyWebTransportCertificate,
 ) where
 
@@ -48,21 +52,73 @@ import Time.System (timeCurrent)
 certificateValidityHours :: Int
 certificateValidityHours = 13 * 24
 
+{- | Replace the active certificate this long before it expires. A successor's
+validity starts an hour before its predecessor's ends, so clients whose clocks
+are up to this far off in either direction accept the certificate being served.
+-}
+rotationMarginMinutes :: Int
+rotationMarginMinutes = 30
+
 maximumValiditySeconds :: Integer
 maximumValiditySeconds = 14 * 24 * 60 * 60
 
 certificateSignatureAlgorithm :: SignatureALG
 certificateSignatureAlgorithm = SignatureALG_IntrinsicHash PubKeyALG_Ed25519
 
-{- | Generate a browser-acceptable short-lived Ed25519 certificate and return
-its SHA-256 multihash for use in a @/certhash@ multiaddr.
+{- | A short-lived certificate with its SHA-256 multihash, as carried in a
+@/certhash@ multiaddr component.
 -}
-newWebTransportCredential :: IO (Credential, ByteString)
-newWebTransportCredential = do
+data WebTransportCertificate = WebTransportCertificate
+  { wtCredential :: !Credential
+  , wtHash :: !ByteString
+  , wtNotAfter :: !DateTime
+  }
+
+{- | The rolling certificates of a WebTransport server: the one being served,
+the one that follows it, and the most recently replaced one.
+-}
+data CertificateSet = CertificateSet
+  { csPrevious :: !(Maybe WebTransportCertificate)
+  , csActive :: !WebTransportCertificate
+  , csNext :: !WebTransportCertificate
+  }
+
+-- | Create an active certificate and its already generated successor.
+newCertificateSet :: DateTime -> IO CertificateSet
+newCertificateSet now = do
+  active <- newWebTransportCertificate now
+  next <- newWebTransportCertificate (wtNotAfter active)
+  pure (CertificateSet Nothing active next)
+
+{- | Advance the set until its active certificate is not due for replacement.
+Loops so that a node waking from a long suspend skips any lapsed periods.
+-}
+rollCertificates :: DateTime -> CertificateSet -> IO CertificateSet
+rollCertificates now certificates
+  | now < timeAdd (wtNotAfter active) (minutesDuration (-rotationMarginMinutes)) =
+      pure certificates
+  | otherwise = do
+      following <- newWebTransportCertificate (wtNotAfter next)
+      rollCertificates now (CertificateSet (Just active) next following)
+ where
+  active = csActive certificates
+  next = csNext certificates
+
+{- | Hashes a server must bind in the Noise extension: every certificate it
+serves or has advertised, plus the one it most recently stopped serving.
+-}
+boundCertificateHashes :: CertificateSet -> [ByteString]
+boundCertificateHashes (CertificateSet previous active next) =
+  map wtHash (maybe [] pure previous <> [active, next])
+
+{- | Generate a browser-acceptable short-lived Ed25519 certificate whose
+validity period begins at the given time.
+-}
+newWebTransportCertificate :: DateTime -> IO WebTransportCertificate
+newWebTransportCertificate start = do
   secret <- newTLSSecret
-  now <- timeConvert <$> timeCurrent
   let publicKey = Ed25519.toPublic secret
-      certificate = makeCertificate now (PubKeyEd25519 publicKey)
+      certificate = makeCertificate start (PubKeyEd25519 publicKey)
       signCertificate bytes =
         ( convert (Ed25519.sign secret publicKey bytes)
         , certificateSignatureAlgorithm
@@ -71,13 +127,18 @@ newWebTransportCredential = do
       (signedCertificate, ()) = objectToSignedExact signCertificate certificate
       der = encodeSignedObject signedCertificate
       credential = (CertificateChain [signedCertificate], PrivKeyEd25519 secret)
-  pure (credential, Multihash.encodeMultihash Multihash.SHA256 der)
+  pure
+    WebTransportCertificate
+      { wtCredential = credential
+      , wtHash = Multihash.encodeMultihash Multihash.SHA256 der
+      , wtNotAfter = snd (certValidity certificate)
+      }
 
 newTLSSecret :: IO Ed25519.SecretKey
 newTLSSecret = do
   seed <- getRandomBytes 32 :: IO ByteString
   case Crypto.eitherCryptoError (Ed25519.secretKey seed) of
-    Left err -> fail $ "newWebTransportCredential: " <> show err
+    Left err -> fail $ "newWebTransportCertificate: " <> show err
     Right secret -> pure secret
 
 makeCertificate :: DateTime -> PubKey -> Certificate
@@ -99,6 +160,10 @@ makeCertificate now publicKey =
 hoursDuration :: Int -> Duration
 hoursDuration hours =
   Duration (Hours (fromIntegral hours)) (Minutes 0) (Seconds 0) (NanoSeconds 0)
+
+minutesDuration :: Int -> Duration
+minutesDuration minutes =
+  Duration (Hours 0) (Minutes (fromIntegral minutes)) (Seconds 0) (NanoSeconds 0)
 
 {- | Verify a one-certificate WebTransport chain against any advertised
 SHA-256 multihash and enforce the browser certificate constraints.

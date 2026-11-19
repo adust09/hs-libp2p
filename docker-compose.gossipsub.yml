@@ -3,7 +3,7 @@
 # (the gossipsub mode itself is a local extension, not an upstream contract).
 #
 # Test 1 (Rust listener, HS dialer):
-#   docker compose -f docker-compose.gossipsub.yml up --build --exit-code-from rust-listener redis rust-listener hs-dialer
+#   docker compose -f docker-compose.gossipsub.yml up --build --exit-code-from hs-dialer redis rust-listener hs-dialer
 #
 # Test 2 (HS listener, Rust dialer):
 #   docker compose -f docker-compose.gossipsub.yml up --build --exit-code-from rust-dialer redis hs-listener rust-dialer

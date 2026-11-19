@@ -455,7 +455,7 @@ publish router topic payload mKeyPair = do
   -- IWANT from the mcache, so our own messages must be cached too (#155).
   atomically $ do
     modifyTVar' (gsSeen router) $
-      Map.insert msgId (SeenMessage now (ValidationComplete ValidationAccept))
+      Map.insert msgId (SeenMessage now (AcceptedValidation now Set.empty))
     modifyTVar' (gsMessageCache router) (cachePut msgId msg)
 
   -- Build RPC with published message and apply any live IDONTWANTs.

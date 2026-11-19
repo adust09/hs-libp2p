@@ -529,8 +529,11 @@ data SeenMessage = SeenMessage
   } deriving (Show, Eq)
 
 data SeenValidation
-  = PendingValidation !(Map PeerId UTCTime)
-  | ValidationComplete !ValidationResult
+  = PendingValidation !(Set PeerId)
+  | AcceptedValidation !UTCTime !(Set PeerId)
+    -- ^ Validation completion time and sources already seen, including the first sender.
+  | RejectedValidation
+  | IgnoredValidation
   deriving (Show, Eq)
 
 -- | GossipSub router state with STM-managed concurrent state.

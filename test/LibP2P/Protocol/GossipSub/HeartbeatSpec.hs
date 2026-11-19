@@ -411,7 +411,7 @@ spec = do
         (router, _, timeRef) <- mkHeartbeatRouter localPid fixedTime
         -- Add seen entry at fixedTime
         atomically $ modifyTVar' (gsSeen router) $
-          Map.insert (BS.pack [1]) (SeenMessage fixedTime (ValidationComplete ValidationAccept))
+          Map.insert (BS.pack [1]) (SeenMessage fixedTime (AcceptedValidation fixedTime Set.empty))
         -- Advance time past SeenTTL (120s)
         writeIORef timeRef (addUTCTime 121 fixedTime)
         heartbeatOnce router
@@ -421,7 +421,7 @@ spec = do
       it "preserves unexpired entries" $ do
         (router, _, timeRef) <- mkHeartbeatRouter localPid fixedTime
         atomically $ modifyTVar' (gsSeen router) $
-          Map.insert (BS.pack [1]) (SeenMessage fixedTime (ValidationComplete ValidationAccept))
+          Map.insert (BS.pack [1]) (SeenMessage fixedTime (AcceptedValidation fixedTime Set.empty))
         -- Only 10s later — still within TTL
         writeIORef timeRef (addUTCTime 10 fixedTime)
         heartbeatOnce router
