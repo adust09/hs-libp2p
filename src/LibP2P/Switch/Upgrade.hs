@@ -42,6 +42,7 @@ import LibP2P.Core.Binary (readWord16BE)
 import LibP2P.Crypto.Key (KeyPair (..))
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
 import LibP2P.Yamux.Frame (maxStreamWindowSize)
+import LibP2P.PNet (protectConnection)
 import LibP2P.Yamux.Session
   ( closeSession
   , keepaliveLoop
@@ -506,7 +507,8 @@ upgradeAsWithConfig
 upgradeAsWithConfig yamuxConfig rm =
   upgradeAsWithOptions yamuxConfig rm (scSecurityProtocols defaultSwitchConfig)
 
--- | Upgrade with both settings carried by a 'SwitchConfig'.
+-- | Upgrade with the settings carried by a 'SwitchConfig', first joining
+-- its private network if it has one.
 upgradeWithSwitchConfig
   :: SwitchConfig
   -> ResourceManager
@@ -514,11 +516,15 @@ upgradeWithSwitchConfig
   -> KeyPair
   -> RawConnection
   -> IO Connection
-upgradeWithSwitchConfig config rm =
+upgradeWithSwitchConfig config rm dir identityKP rawConn = do
+  protected <- maybe pure protectConnection (scPrivateNetwork config) rawConn
   upgradeAsWithOptions
     (scYamuxConfig config)
     rm
     (scSecurityProtocols config)
+    dir
+    identityKP
+    protected
 
 -- | Upgrade with an explicit security preference list. Exported for conformance
 -- tests and embedders that need to require one secure transport.

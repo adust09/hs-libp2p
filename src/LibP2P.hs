@@ -47,6 +47,9 @@ module LibP2P
   , newSwitchWithConfig
   , SwitchConfig (..)
   , defaultSwitchConfig
+  , PSK
+  , pskFromBytes
+  , decodeSwarmKey
   , YamuxConfig (..)
   , defaultYamuxConfig
   , Micros
@@ -393,6 +396,7 @@ import LibP2P.Switch.Connection
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (ConnectionGater (..), defaultConnectionGater, switchListen, switchListenAddrs)
 import LibP2P.Switch (addTransport, newSwitch, newSwitchWithConfig, removeStreamHandler, setConnectionGater, setStreamHandler, subscribeSwitchEvents, switchClose)
+import LibP2P.PNet (PSK, decodeSwarmKey, pskFromBytes)
 import LibP2P.Switch.Types (Connection (..), DialError (..), Direction (..), ResourceError (..), StreamHandler, Switch, SwitchConfig (..), SwitchEvent (..), defaultSwitchConfig)
 import LibP2P.Transport.TCP (newTCPTransport)
 import LibP2P.Transport.WebSocket
