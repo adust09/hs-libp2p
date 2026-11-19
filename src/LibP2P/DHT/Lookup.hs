@@ -24,8 +24,10 @@ module LibP2P.DHT.Lookup
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (async, cancel, mapConcurrently)
 import Control.Concurrent.STM
-import Control.Exception (SomeException, catch)
-import Control.Monad (forever, void)
+import Control.Exception (SomeException, catchJust)
+import Control.Monad (forever, void, when)
+import Data.Containers.ListUtils (nubOrd)
+import qualified Data.Map.Strict as Map
 import Crypto.Random (getRandomBytes)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -33,6 +35,7 @@ import Data.Maybe (fromMaybe, listToMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Time (UTCTime, getCurrentTime)
+import LibP2P.Core.Exception (synchronousException)
 import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import LibP2P.DHT
   ( DHTNode (..)
@@ -52,6 +55,9 @@ import LibP2P.DHT.RoutingTable
   , occupiedBuckets
   )
 import LibP2P.DHT.Types
+import LibP2P.Multiaddr (toBytes)
+import LibP2P.Protocol.Identify.Message (IdentifyInfo (..))
+import LibP2P.Switch.Types (Switch (..))
 import System.Timeout (timeout)
 
 -- | Result of an iterative lookup.
@@ -140,12 +146,13 @@ lookupLoop node wireKey targetKey candidatesVar queriedVar knownVar now queryTyp
             candidates <- readTVar candidatesVar
             let newPeers = concatMap (either (const []) id) results
                 -- Convert DHTPeers to BucketEntries, excluding already known
-                newEntries = filter (\e -> not (Set.member (entryPeerId e) known))
+                newEntries = filter (\e -> entryPeerId e /= dhtLocalPeerId node && not (Set.member (entryPeerId e) known))
                            $ map (dhtPeerToEntry now) newPeers
                 -- Mark new entries as known
                 newKnown = Set.union known (Set.fromList (map entryPeerId newEntries))
                 -- Merge and re-sort by XOR distance
-                merged = sortByDistance targetKey (candidates ++ newEntries)
+                survivors = dropFailed candidates (zip toQuery results)
+                merged = sortByDistance targetKey (survivors ++ newEntries)
             writeTVar candidatesVar merged
             writeTVar knownVar newKnown
             pure newEntries
@@ -183,7 +190,7 @@ queryPeer node wireKey queryType entry = do
         , msgKey  = wireKey
         }
   result <- (dhtSendRequest node) (entryPeerId entry) request
-    `catch` (\(e :: SomeException) -> pure (Left (show e)))
+    `catchSynchronous` (\(e :: SomeException) -> pure (Left (show e)))
   pure $ case result of
     Left err -> Left err
     Right resp -> Right (msgCloserPeers resp)
@@ -264,10 +271,11 @@ valueLoop node wireKey targetKey candidatesVar queriedVar knownVar bestVar bestP
             known <- readTVar knownVar
             candidates <- readTVar candidatesVar
             let newPeers = concatMap (\(_, peers, _) -> either (const []) id peers) results
-                newEntries = filter (\e -> not (Set.member (entryPeerId e) known))
+                newEntries = filter (\e -> entryPeerId e /= dhtLocalPeerId node && not (Set.member (entryPeerId e) known))
                            $ map (dhtPeerToEntry now) newPeers
                 newKnown = Set.union known (Set.fromList (map entryPeerId newEntries))
-                merged = sortByDistance targetKey (candidates ++ newEntries)
+                survivors = dropFailed candidates ([(entry, response) | (entry, (_, response, _)) <- zip toQuery results])
+                merged = sortByDistance targetKey (survivors ++ newEntries)
             writeTVar candidatesVar merged
             writeTVar knownVar newKnown
             pure newEntries
@@ -301,7 +309,7 @@ valueLoop node wireKey targetKey candidatesVar queriedVar knownVar bestVar bestP
                 , msgRecord = Just rec
                 }
           mapM_ (\pid -> (dhtSendRequest node) pid putMsg
-                          `catch` (\(_ :: SomeException) -> pure (Left "repair failed")))
+                          `catchSynchronous` (\(_ :: SomeException) -> pure (Left "repair failed")))
                 (Set.toList outdated)
           pure (Right rec)
 
@@ -311,7 +319,7 @@ queryPeerForValue :: DHTNode -> ByteString -> BucketEntry
 queryPeerForValue node wireKey entry = do
   let request = emptyDHTMessage { msgType = GetValue, msgKey = wireKey }
   result <- (dhtSendRequest node) (entryPeerId entry) request
-    `catch` (\(e :: SomeException) -> pure (Left (show e)))
+    `catchSynchronous` (\(e :: SomeException) -> pure (Left (show e)))
   pure $ case result of
     Left err -> (entryPeerId entry, Left err, Nothing)
     Right resp -> (entryPeerId entry, Right (msgCloserPeers resp), msgRecord resp)
@@ -410,10 +418,11 @@ providerLoop node wireKey targetKey candidatesVar queriedVar knownVar providersV
             currentProviders <- readTVar providersVar
             let allCloser = concatMap (\(_, closer, _) -> either (const []) id closer) results
                 allProviders = concatMap (\(_, _, provs) -> provs) results
-                newEntries = filter (\e -> not (Set.member (entryPeerId e) known))
+                newEntries = filter (\e -> entryPeerId e /= dhtLocalPeerId node && not (Set.member (entryPeerId e) known))
                            $ map (dhtPeerToEntry now) allCloser
                 newKnown = Set.union known (Set.fromList (map entryPeerId newEntries))
-                merged = sortByDistance targetKey (candidates ++ newEntries)
+                survivors = dropFailed candidates ([(entry, response) | (entry, (_, response, _)) <- zip toQuery results])
+                merged = sortByDistance targetKey (survivors ++ newEntries)
                 newProviderEntries = map (dhtPeerToProvider now) allProviders
             writeTVar candidatesVar merged
             writeTVar knownVar newKnown
@@ -440,7 +449,7 @@ queryPeerForProviders :: DHTNode -> ByteString -> BucketEntry
 queryPeerForProviders node wireKey entry = do
   let request = emptyDHTMessage { msgType = GetProviders, msgKey = wireKey }
   result <- (dhtSendRequest node) (entryPeerId entry) request
-    `catch` (\(e :: SomeException) -> pure (Left (show e)))
+    `catchSynchronous` (\(e :: SomeException) -> pure (Left (show e)))
   pure $ case result of
     Left err -> (entryPeerId entry, Left err, [])
     Right resp -> (entryPeerId entry, Right (msgCloserPeers resp), msgProviderPeers resp)
@@ -483,7 +492,7 @@ refreshBucket node routingTable cpl = do
           target = keyToDHTKey wireKey
       void $
         lookupByKey node wireKey target
-          `catch` (\(_ :: SomeException) -> pure [])
+          `catchSynchronous` (\(_ :: SomeException) -> pure [])
  where
   belongsToBucket entry =
     entryPeerId entry /= dhtLocalPeerId node
@@ -532,9 +541,38 @@ startBootstrap node seeds intervalMicros = do
 -- the full-bucket eviction policy of 'addPeerToTable'.
 insertLookupPeers :: DHTNode -> [BucketEntry] -> [BucketEntry] -> IO ()
 insertLookupPeers node responders discovered = do
+  mapM_ (rememberCandidateAddresses node) discovered
   now <- getCurrentTime
   mapM_ (\e -> addPeerToTable node e { entryLastSeen = now }) responders
   mapM_ (addPeerToTable node) discovered
+
+-- | Keep learned addresses even if a full routing bucket rejects a candidate.
+rememberCandidateAddresses :: DHTNode -> BucketEntry -> IO ()
+rememberCandidateAddresses node entry = when (not (null addresses)) $ atomically $
+  modifyTVar' (swPeerStore (dhtSwitch node)) $ Map.alter update (entryPeerId entry)
+  where
+    addresses = map toBytes (entryAddrs entry)
+    bounded known = take 64 (nubOrd (addresses ++ known))
+    update existing = Just $ case existing of
+      Nothing -> IdentifyInfo
+        { idProtocolVersion = Nothing
+        , idAgentVersion = Nothing
+        , idPublicKey = Nothing
+        , idListenAddrs = bounded []
+        , idObservedAddr = Nothing
+        , idProtocols = []
+        , idSignedPeerRecord = Nothing
+        }
+      Just info -> info { idListenAddrs = bounded (idListenAddrs info) }
+
+-- | Failed candidates are not successful closest-peer lookup results.
+dropFailed :: [BucketEntry] -> [(BucketEntry, Either a b)] -> [BucketEntry]
+dropFailed candidates results =
+  let failed = Set.fromList [entryPeerId entry | (entry, Left _) <- results]
+  in filter (\entry -> not (Set.member (entryPeerId entry) failed)) candidates
+
+catchSynchronous :: IO a -> (SomeException -> IO a) -> IO a
+catchSynchronous = catchJust synchronousException
 
 -- | Convert a DHTPeer to a BucketEntry seen at the given time.
 -- Per specs/kad-dht, multiaddrs carried by Peer records are decoded and

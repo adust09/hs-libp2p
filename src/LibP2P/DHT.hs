@@ -47,9 +47,10 @@ import Control.Concurrent.Async (Async, cancel)
 import Control.Concurrent.MVar (MVar, newMVar, putMVar, takeMVar, tryTakeMVar)
 import Control.Concurrent.STM
 import Control.Exception
-  ( SomeAsyncException, SomeException, catch, fromException, mask, onException, try, tryJust )
+  ( SomeException, catchJust, mask, onException, try, tryJust )
 import Control.Monad (when)
 import Data.ByteString (ByteString)
+import Data.Containers.ListUtils (nubOrdOn)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (find)
 import Data.Map.Strict (Map)
@@ -59,6 +60,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
 import Data.Time.Format.ISO8601 (iso8601Show)
+import LibP2P.Core.Exception (synchronousException)
 import LibP2P.Crypto.PeerId (PeerId (..), peerIdBytes)
 import LibP2P.DHT.Distance (keyToDHTKey, peerIdToKey)
 import LibP2P.DHT.Maintenance
@@ -96,6 +98,7 @@ import LibP2P.MultistreamSelect.Negotiation
   , negotiateInitiator
   )
 import LibP2P.Switch (setStreamHandler)
+import LibP2P.Switch.Dial (dial, resolveDialAddresses)
 import LibP2P.Switch.Connection (newStream)
 import LibP2P.Switch.ConnPool (lookupConn)
 import LibP2P.Switch.Types (ConnState, Connection (..), Switch (..))
@@ -215,8 +218,8 @@ newDHTNodeWithConfig maintenanceConfig sw mode = do
         , dhtMode             = mode
         , dhtValidator        = defaultValidator
         , dhtStreams          = streams
-        , dhtSendRequest      = sendRequestViaSwitch sw stopped streams
-        , dhtSendMessage      = sendMessageViaSwitch sw stopped streams
+        , dhtSendRequest      = sendRequestViaSwitch sw rt stopped streams
+        , dhtSendMessage      = sendMessageViaSwitch sw rt stopped streams
         , dhtDisconnectHook   = hook
         , dhtStopped          = stopped
         , dhtQueryTimeout     = defaultQueryTimeoutMicros
@@ -453,8 +456,8 @@ addPeerToTable node entry = do
   where
     evictOrKeep lrs = do
       let ping = emptyDHTMessage { msgType = FindNode, msgKey = peerIdBytes lrs }
-      response <- dhtSendRequest node lrs ping
-        `catch` \(e :: SomeException) -> pure (Left (show e))
+      response <- catchJust synchronousException (dhtSendRequest node lrs ping)
+        (\e -> pure (Left (show e)))
       case response of
         Right _ -> do
           -- LRS peer is alive: move it to most-recently-seen and drop
@@ -491,31 +494,32 @@ refreshPeer pid now rt =
 -- to different peers stay concurrent.
 sendRequestViaSwitch
   :: Switch
+  -> TVar RoutingTable
   -> TVar Bool
   -> TVar (Map PeerId PeerSession)
   -> PeerId
   -> DHTMessage
   -> IO (Either String DHTMessage)
-sendRequestViaSwitch sw stoppedVar sessionsVar pid request
+sendRequestViaSwitch sw routingTable stoppedVar sessionsVar pid request
   | msgType request == AddProvider = pure (Left "ADD_PROVIDER requires dhtSendMessage")
-  | otherwise = withPeerStream sw stoppedVar sessionsVar pid $ \stream ->
+  | otherwise = withPeerStream sw routingTable stoppedVar sessionsVar pid $ \stream ->
       streamIOResult $ do
         writeFramedMessage stream request
         readFramedMessage stream maxDHTMessageSize
 
 sendMessageViaSwitch
-  :: Switch -> TVar Bool -> TVar (Map PeerId PeerSession)
+  :: Switch -> TVar RoutingTable -> TVar Bool -> TVar (Map PeerId PeerSession)
   -> PeerId -> DHTMessage -> IO (Either String ())
-sendMessageViaSwitch sw stoppedVar sessionsVar pid message
+sendMessageViaSwitch sw routingTable stoppedVar sessionsVar pid message
   | msgType message /= AddProvider = pure (Left "only ADD_PROVIDER is send-only")
-  | otherwise = withPeerStream sw stoppedVar sessionsVar pid $ \stream ->
+  | otherwise = withPeerStream sw routingTable stoppedVar sessionsVar pid $ \stream ->
       streamIOResult (Right <$> writeFramedMessage stream message)
 
 -- | Serialize an entire RPC or announcement on the same peer session.
 withPeerStream
-  :: Switch -> TVar Bool -> TVar (Map PeerId PeerSession)
+  :: Switch -> TVar RoutingTable -> TVar Bool -> TVar (Map PeerId PeerSession)
   -> PeerId -> (StreamIO -> IO (Either String a)) -> IO (Either String a)
-withPeerStream sw stoppedVar sessionsVar pid exchangeStream = do
+withPeerStream sw routingTable stoppedVar sessionsVar pid exchangeStream = do
   mSession <- peerSession stoppedVar sessionsVar pid
   case mSession of
     Nothing -> pure (Left "DHT node is stopped")
@@ -545,17 +549,25 @@ withPeerStream sw stoppedVar sessionsVar pid exchangeStream = do
           openAndExchange session
 
     openAndExchange session = do
-      opened <- openDHTStream sw session pid
-      case opened of
+      connection <- connectDHTPeer sw routingTable session pid
+      case connection of
         Left err -> pure (Nothing, Left err)
-        Right stream ->
-          (`onException` closeQuietly stream) $ do
-            result <- exchangeStream stream
-            case result of
-              Left err -> do
-                closeQuietly stream
-                pure (Nothing, Left err)
-              ok -> pure (Just stream, ok)
+        Right conn -> exchangeFreshStream sw session conn exchangeStream
+
+-- Dialing stays outside this mask so Switch-owned threads inherit normal cancellation.
+exchangeFreshStream
+  :: Switch -> PeerSession -> Connection -> (StreamIO -> IO (Either String a))
+  -> IO (Maybe StreamIO, Either String a)
+exchangeFreshStream sw session conn exchangeStream = mask $ \restore -> do
+  opened <- openDHTStream sw session conn
+  case opened of
+    Left err -> pure (Nothing, Left err)
+    Right stream ->
+      (`onException` closeQuietly stream) $ restore $ do
+        result <- exchangeStream stream
+        case result of
+          Left err -> closeQuietly stream >> pure (Nothing, Left err)
+          ok -> pure (Just stream, ok)
 
 -- | Look up the peer's session, creating one unless the node is stopped.
 -- Two racing callers agree on one session in the same transaction that
@@ -647,31 +659,17 @@ streamIOResult action = do
     Left _ -> Left "DHT stream I/O failed"
     Right response -> response
 
-synchronousException :: SomeException -> Maybe SomeException
-synchronousException exception =
-  case fromException exception :: Maybe SomeAsyncException of
-    Just _ -> Nothing
-    Nothing -> Just exception
-
 -- | Open a new muxer stream to the peer and negotiate @/ipfs/kad/1.0.0@.
-openDHTStream :: Switch -> PeerSession -> PeerId -> IO (Either String StreamIO)
-openDHTStream sw session pid = do
-  mConn <- atomically $ do
-    invalid <- readTVar (psInvalid session)
-    found <- if invalid then pure Nothing else lookupConn (swConnPool sw) pid
-    writeTVar (psOwner session) (connState <$> found)
-    pure found
-  case mConn of
-    Nothing -> pure (Left "no open connection to peer")
-    Just conn -> do
-      opened <- newStream sw conn
-      case opened of
-        Left err -> do
-          clearSessionOwner session conn
-          pure (Left ("stream reservation failed: " ++ show err))
-        Right stream -> negotiateOpened conn stream
+openDHTStream :: Switch -> PeerSession -> Connection -> IO (Either String StreamIO)
+openDHTStream sw session conn = do
+  opened <- newStream sw conn
+  case opened of
+    Left err -> do
+      clearSessionOwner session conn
+      pure (Left ("stream reservation failed: " ++ show err))
+    Right stream -> negotiateOpened stream
   where
-    negotiateOpened conn stream = do
+    negotiateOpened stream = do
       let discard = closeQuietly stream >> clearSessionOwner session conn
       result <- tryJust synchronousException (negotiateInitiator stream [dhtProtocolId])
         `onException` discard
@@ -683,6 +681,24 @@ openDHTStream sw session pid = do
         Right NoProtocol -> do
           discard
           pure (Left "peer does not support /ipfs/kad/1.0.0")
+
+-- | Use normal Switch dialing to retain identity checks, gating and dial deduplication.
+connectDHTPeer
+  :: Switch -> TVar RoutingTable -> PeerSession -> PeerId -> IO (Either String Connection)
+connectDHTPeer sw routingTable session pid = do
+  invalid <- readTVarIO (psInvalid session)
+  if invalid then pure (Left "DHT session is closed") else do
+    table <- readTVarIO routingTable
+    known <- resolveDialAddresses sw pid []
+    let learned = concat [entryAddrs entry | entry <- allPeers table, entryPeerId entry == pid]
+    result <- dial sw pid (nubOrdOn toBytes (known ++ learned))
+    atomically $ do
+      closed <- readTVar (psInvalid session)
+      case result of
+        Right conn | not closed -> do
+          writeTVar (psOwner session) (Just (connState conn))
+          pure (Right conn)
+        _ -> pure (Left "could not connect to DHT peer")
 
 -- | Clear ownership only when it still points at the failed connection.
 clearSessionOwner :: PeerSession -> Connection -> IO ()
