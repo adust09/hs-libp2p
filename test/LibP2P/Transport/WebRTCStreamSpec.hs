@@ -4,7 +4,7 @@ import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (cancel, poll, wait, waitCatch, withAsync)
 import Control.Concurrent.STM
 import Control.Exception (IOException, SomeException, bracket, catch, uninterruptibleMask_)
-import Control.Monad (when)
+import Control.Monad (replicateM, replicateM_, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Either (isLeft)
@@ -147,6 +147,18 @@ closeSpec = do
       nextSent fixture `shouldReturn` fin
       readTVarIO (fixtureClosed fixture) `shouldReturn` True
       awaitRelease fixture
+  it "should process a data-bearing FIN_ACK while the receive buffer is full" $
+    withFixture $ \fixture -> do
+      replicateM_ 218 $ push fixture (message Nothing (BS.replicate 1200 97))
+      withAsync (streamClose (fixtureStream fixture)) $ \closer -> do
+        within (nextSent fixture) `shouldReturn` fin
+        push fixture (message (Just 3) (BS.replicate 1200 98))
+        within $ wait closer
+      readTVarIO (fixtureClosed fixture) `shouldReturn` False
+      push fixture fin
+      total <- sum . map BS.length <$> replicateM 219 (readBytes fixture 1200)
+      total `shouldBe` 219 * 1200
+      within (streamReadByte (fixtureStream fixture)) `shouldThrow` isEOFError
   it "should send FIN and release the channel only once across repeated closes" $
     withFixture $ \fixture -> do
       withAsync (streamClose (fixtureStream fixture)) $ \closer -> do
@@ -216,6 +228,24 @@ shutdownSpec = do
       withAsync (threadDelay 2000000 >> atomically (writeTVar stopped True)) $ \_ -> do
         within $ streamClose (fixtureStream fixture)
         awaitRelease fixture
+
+  it "should unblock a backpressured send when the receive worker rejects a malformed frame" $ do
+    entered <- newEmptyTMVarIO
+    stopped <- newTVarIO False
+    let blocked channel = channel
+          { dcSend = \_ -> do
+              atomically $ putTMVar entered ()
+              atomically $ readTVar stopped >>= check
+              fail "scripted send interrupted"
+          , dcShutdown = atomically (writeTVar stopped True) >> dcShutdown channel
+          }
+    withFixtureChannel 2000000 blocked $ \fixture -> do
+      withAsync (streamWrite (fixtureStream fixture) "data") $ \writer -> do
+        within $ atomically $ takeTMVar entered
+        atomically $ writeTQueue (fixtureIncoming fixture) (Just (encodeUvarint 16384))
+        outcome <- within $ waitCatch writer
+        outcome `shouldSatisfy` isLeft
+      awaitRelease fixture
 
 duplexSpec :: Spec
 duplexSpec =

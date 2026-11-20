@@ -22,11 +22,11 @@ import Control.Exception
   , onException
   , throwIO
   )
-import Control.Monad (unless, void, when)
+import Control.Monad (forM_, unless, void, when)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
-import Data.Maybe (isNothing)
+import Data.Maybe (isJust, isNothing)
 import Data.Sequence (Seq, ViewL (..), (<|), (|>))
 import qualified Data.Sequence as Seq
 import Data.Word (Word64)
@@ -88,6 +88,9 @@ data ChannelState = ChannelState
   , channelPhysicalClosed :: !Bool
   , channelBuffered :: !(Seq ByteString)
   , channelBufferedSize :: !Int
+  , channelFinalPending :: !(Maybe ByteString)
+    -- ^ Payload of a data-bearing FIN waiting for buffer capacity. Readers
+    -- withhold EOF until it is committed, keeping payload-before-EOF atomic.
   }
 
 data ChannelRuntime = ChannelRuntime
@@ -103,7 +106,7 @@ data ChannelRuntime = ChannelRuntime
 channelToStreamIO :: Int -> ChannelIO -> IO StreamIO
 channelToStreamIO closeTimeoutMicros channel = mask $ \restore -> do
   when (closeTimeoutMicros <= 0) $ fail "WebRTC close timeout must be positive"
-  state <- newTVarIO (ChannelState Receiving Sending False Seq.empty 0)
+  state <- newTVarIO (ChannelState Receiving Sending False Seq.empty 0 Nothing)
   runtime <- ChannelRuntime channel state <$> newMVar () <*> newMVar True <*> newMVar False
   worker <- async $
     (restore (receiveLoop runtime BS.empty) `catch` recordFailure runtime)
@@ -116,10 +119,28 @@ channelToStreamIO closeTimeoutMicros channel = mask $ \restore -> do
     , streamClose = close
     }
 
+-- Commit a parked FIN payload once capacity allows; False means nothing is
+-- parked or it fits and was committed, True means it is still parked.
+tryCommitFinal :: TVar ChannelState -> STM Bool
+tryCommitFinal stateVar = do
+  state <- readTVar stateVar
+  case channelFinalPending state of
+    Nothing -> pure False
+    Just bytes
+      | channelBufferedSize state + BS.length bytes <= 256 * 1024 -> do
+          writeTVar stateVar state
+            { channelBuffered = channelBuffered state |> bytes
+            , channelBufferedSize = channelBufferedSize state + BS.length bytes
+            , channelFinalPending = Nothing
+            }
+          pure False
+      | otherwise -> pure True
+
 readChannel :: TVar ChannelState -> Int -> IO ByteString
 readChannel stateVar requested
   | requested <= 0 = pure BS.empty
   | otherwise = atomically $ do
+      tryCommitFinal stateVar
       state <- readTVar stateVar
       case channelReceiveState state of
         ReceiveReset -> throwSTM (streamIOException WebRTCStreamReset)
@@ -134,6 +155,7 @@ readChannel stateVar requested
               }
             pure result
           EmptyL
+            | isJust (channelFinalPending state) -> retry
             | channelReceiveState state == Receiving && not (channelPhysicalClosed state) -> retry
             | otherwise -> throwSTM (mkIOError eofErrorType "WebRTC stream ended" Nothing Nothing)
 
@@ -182,27 +204,58 @@ receiveLoop runtime buffered = do
       Nothing -> pure ()
       Just (framed, remaining) -> do
         decoded <- either (throwIO . WebRTCFrameError) pure (decodeMessage framed Nothing Nothing)
-        accepted <- atomically $ applyMessage (crState runtime) decoded
+        (accepted, deferred) <- atomically $ applyMessage (crState runtime) decoded
+        forM_ deferred $ \bytes -> void $ atomically $ bufferReceive (crState runtime) bytes
+        void $ atomically $ tryCommitFinal (crState runtime)
         when (accepted && snd decoded == Just 0) $ acknowledgeFIN runtime
         state <- readTVarIO (crState runtime)
         unless (channelPhysicalClosed state || bothHalvesFinished state) $
           receiveLoop runtime remaining
 
--- Payload and FIN become visible in the same transaction: EOF cannot overtake data.
-applyMessage :: TVar ChannelState -> (Maybe ByteString, Maybe Word64) -> STM Bool
+-- Flags apply even when the buffer is full, so control frames are never starved
+-- by receive backpressure: a data-bearing frame whose payload does not fit has
+-- it deferred, and the worker buffers it before the next frame. A data-bearing
+-- FIN keeps its payload and end-of-stream atomic for readers; with no capacity
+-- the payload parks in 'channelFinalPending' and readers withhold EOF until it
+-- commits.
+applyMessage
+  :: TVar ChannelState -> (Maybe ByteString, Maybe Word64)
+  -> STM (Bool, Maybe ByteString)
 applyMessage stateVar (payload, flag) = do
   state <- readTVar stateVar
-  if channelPhysicalClosed state then pure False else do
+  if channelPhysicalClosed state then pure (False, Nothing) else do
     let updated = applyFlag flag state
         dataAllowed = channelReceiveState state == Receiving && flag /= Just 2
         bytes = if dataAllowed then maybe BS.empty id payload else BS.empty
-        total = channelBufferedSize updated + BS.length bytes
-    check (total <= 256 * 1024)
-    writeTVar stateVar updated
-      { channelBuffered = if BS.null bytes then channelBuffered updated else channelBuffered updated |> bytes
-      , channelBufferedSize = total
-      }
-    pure True
+        parked = maybe 0 BS.length (channelFinalPending state)
+        buffer b = updated
+          { channelBuffered = channelBuffered updated |> b
+          , channelBufferedSize = channelBufferedSize updated + BS.length b
+          }
+    if BS.null bytes
+      then writeTVar stateVar updated >> pure (True, Nothing)
+      else if flag == Just 0
+        then
+          if channelBufferedSize updated + parked + BS.length bytes <= 256 * 1024
+            then writeTVar stateVar (buffer bytes) >> pure (True, Nothing)
+            else writeTVar stateVar updated { channelFinalPending = Just bytes }
+              >> pure (True, Nothing)
+        else
+          if channelBufferedSize updated + parked + BS.length bytes <= 256 * 1024
+            then writeTVar stateVar (buffer bytes) >> pure (True, Nothing)
+            else writeTVar stateVar updated >> pure (True, Just bytes)
+
+-- Buffer a deferred payload backpressured on capacity, so message order is
+-- preserved without stalling control flags.
+bufferReceive :: TVar ChannelState -> ByteString -> STM ()
+bufferReceive stateVar bytes = do
+  state <- readTVar stateVar
+  let parked = maybe 0 BS.length (channelFinalPending state)
+  check (channelBufferedSize state + parked + BS.length bytes <= 256 * 1024)
+  writeTVar stateVar state
+    { channelBuffered = channelBuffered state |> bytes
+    , channelBufferedSize = channelBufferedSize state + BS.length bytes
+    }
 
 applyFlag :: Maybe Word64 -> ChannelState -> ChannelState
 applyFlag (Just 0) state
@@ -211,7 +264,8 @@ applyFlag (Just 1) state
   | channelSendState state `elem` [Sending, SentFIN] = state { channelSendState = SendStopped }
 applyFlag (Just 2) state
   | channelReceiveState state == Receiving = state
-      { channelReceiveState = ReceiveReset, channelBuffered = Seq.empty, channelBufferedSize = 0 }
+      { channelReceiveState = ReceiveReset, channelBuffered = Seq.empty
+      , channelBufferedSize = 0, channelFinalPending = Nothing }
 applyFlag (Just 3) state
   | channelSendState state == SentFIN = state { channelSendState = ReceivedFINAck }
 applyFlag _ state = state
@@ -241,7 +295,9 @@ shutdownChannel runtime = do
 finishChannel :: ChannelRuntime -> IO ()
 finishChannel runtime = withMVar (crWriteLock runtime) $ \_ -> do
   alive <- modifyMVar (crLifetime runtime) $ \owned -> pure (False, owned)
-  atomically $ modifyTVar' (crState runtime) markClosed
+  atomically $ do
+    void $ tryCommitFinal (crState runtime)
+    modifyTVar' (crState runtime) markClosed
   when alive $ dcClose (crChannel runtime)
 
 markClosed :: ChannelState -> ChannelState
@@ -253,10 +309,14 @@ markClosed state = state
   }
 
 -- Preserve the underlying failure text; late failures after FIN stay silent.
+-- Shutdown still runs, so a blocked foreign send or receive cannot deadlock
+-- the worker's final close.
 recordFailure :: ChannelRuntime -> SomeException -> IO ()
-recordFailure runtime exception = atomically $ modifyTVar' (crState runtime) $ \state ->
-  if channelPhysicalClosed state || channelReceiveState state /= Receiving then state else state
-    { channelReceiveState = ReceiveFailed (WebRTCFrameError (failureText exception)) }
+recordFailure runtime exception = do
+  atomically $ modifyTVar' (crState runtime) $ \state ->
+    if channelPhysicalClosed state || channelReceiveState state /= Receiving then state else state
+      { channelReceiveState = ReceiveFailed (WebRTCFrameError (failureText exception)) }
+  shutdownChannel runtime
 
 receiveFrame :: ChannelIO -> ByteString -> IO (Maybe (ByteString, ByteString))
 receiveFrame channel buffered = case extractFrame buffered of
