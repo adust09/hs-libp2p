@@ -42,6 +42,9 @@ HsWebRtcChannel *hs_webrtc_connection_accept_channel(const HsWebRtcConnection *c
 int32_t hs_webrtc_channel_send(const HsWebRtcChannel *channel, const uint8_t *data, size_t length);
 int32_t hs_webrtc_channel_recv(const HsWebRtcChannel *channel, uint8_t **output, size_t *length);
 void hs_webrtc_bytes_free(uint8_t *data, size_t length);
+/* Wake blocked I/O without freeing the handle. May be called repeatedly. */
+void hs_webrtc_channel_shutdown(const HsWebRtcChannel *channel);
+/* Free exactly once, after shutdown and all concurrent I/O calls have returned. */
 void hs_webrtc_channel_close(HsWebRtcChannel *channel);
 void hs_webrtc_connection_close(HsWebRtcConnection *connection);
 

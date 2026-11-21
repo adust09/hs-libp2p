@@ -5,7 +5,8 @@ module LibP2P.Transport.WebRTCSpec (spec) where
 #ifdef WITH_WEBRTC
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (concurrently)
-import Control.Exception (bracket)
+import Control.Concurrent.STM (atomically, newEmptyTMVarIO, putTMVar, takeTMVar)
+import Control.Exception (SomeException, bracket, finally, throwIO, try)
 import Control.Monad (replicateM)
 import Data.ByteArray.Encoding (Base (Base16), convertFromBase)
 import Data.ByteString qualified as BS
@@ -18,10 +19,12 @@ import LibP2P.Crypto.Key (KeyPair, publicKey)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey, peerIdBytes)
 import LibP2P.Multiaddr (Multiaddr (..), fromText)
 import LibP2P.Multiaddr.Protocol (Protocol (..))
-import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkMemoryStreamPair)
+import LibP2P.MultistreamSelect.Negotiation
+  ( NegotiationResult (..), StreamIO (..), mkMemoryStreamPair, negotiateInitiator )
 import LibP2P.NAT (defaultNATConfig, registerNATHandlers)
 import LibP2P.Protocol.Ping (PingResult (..), registerPingHandler, sendPing)
-import LibP2P.Switch (addTransport, newSwitch, switchClose)
+import LibP2P.Switch (addTransport, newSwitch, setStreamHandler, switchClose)
+import LibP2P.Switch.Connection (newStream)
 import LibP2P.Switch.Dial (dial)
 import LibP2P.Switch.Listen (defaultConnectionGater, switchListen)
 import LibP2P.Switch.Types (Connection (..), Switch)
@@ -48,6 +51,7 @@ import LibP2P.Transport.WebRTC.Signaling (
   readSignalingMessage,
   writeSignalingMessage,
  )
+import System.IO.Error (isEOFError)
 import System.Timeout (timeout)
 import Test.Hspec
 
@@ -116,6 +120,8 @@ spec = do
         nativeMuxerProtocol clientMuxer `shouldBe` "/webrtc-direct"
         exchangePayload clientMuxer serverMuxer
 
+    directHalfCloseSpec
+
     it "advertises exactly one SHA-256 certificate hash" $ do
       (_, serverKey) <- generateIdentity
       transport <- webRTCDirectTransport serverKey
@@ -148,7 +154,7 @@ spec = do
             other -> expectationFailure $ "WebRTC Direct Ping failed: " <> show other
 
     it "runs Ping over Circuit Relay signaling and direct WebRTC" $
-      withRelayWebRTC $ \clientSwitch serverPeer address -> do
+      withRelayWebRTC $ \clientSwitch _ serverPeer address -> do
         connectionResult <- timeout 20000000 $ dial clientSwitch serverPeer [address]
         connection <- case connectionResult of
           Nothing -> fail "relay-signaled WebRTC dial timed out"
@@ -161,7 +167,61 @@ spec = do
           Just (Right (PingResult rtt)) -> rtt `shouldSatisfy` (> 0)
           other -> expectationFailure $ "relay-signaled WebRTC Ping failed: " <> show other
 
-withRelayWebRTC :: (Switch -> PeerId -> Multiaddr -> IO a) -> IO a
+    relayHalfCloseSpec
+
+directHalfCloseSpec :: Spec
+directHalfCloseSpec =
+  it "should receive the final response after half-closing a native Direct stream" $
+    withWebRTCPair $ \(_, _, clientRaw, serverRaw) -> do
+      clientMuxer <- expectNative clientRaw
+      serverMuxer <- expectNative serverRaw
+      client <- nativeOpenStream clientMuxer
+      streamWrite client "request"
+      server <- nativeAcceptStream serverMuxer
+      within $ streamClose client
+      within (readExactly server 7) `shouldReturn` "request"
+      within (streamReadByte server) `shouldThrow` isEOFError
+      streamWrite server (BS.replicate 4096 0x63)
+      within $ streamClose server
+      within (readExactly client 4096) `shouldReturn` BS.replicate 4096 0x63
+      within (streamReadByte client) `shouldThrow` isEOFError
+
+relayHalfCloseSpec :: Spec
+relayHalfCloseSpec =
+  it "should preserve the final response over a half-closed relay-signaled stream" $
+    withRelayWebRTC $ \clientSwitch serverSwitch serverPeer address -> do
+      completed <- newEmptyTMVarIO
+      setStreamHandler serverSwitch halfCloseProtocol $ \_ server -> do
+        outcome <- try (serveHalfClose server) :: IO (Either SomeException ())
+        atomically $ putTMVar completed outcome
+      result <- timeout 20000000 $ dial clientSwitch serverPeer [address]
+      connection <- case result of
+        Just (Right conn) -> pure conn
+        _ -> fail "relay-signaled half-close dial failed"
+      client <- newStream clientSwitch connection >>= either (fail . show) pure
+      within (negotiateInitiator client [halfCloseProtocol]) `shouldReturn` Accepted halfCloseProtocol
+      clientOutcome <- try $ do
+        streamWrite client "request"
+        within $ streamClose client
+        within (readExactly client 4096) `shouldReturn` BS.replicate 4096 0x72
+        within (streamReadByte client) `shouldThrow` isEOFError
+      serverOutcome <- within $ atomically $ takeTMVar completed
+      either throwIO pure serverOutcome
+      either throwIO pure (clientOutcome :: Either SomeException ())
+
+serveHalfClose :: StreamIO -> IO ()
+serveHalfClose server = (`finally` streamClose server) $ do
+  within (readExactly server 7) `shouldReturn` "request"
+  within (streamReadByte server) `shouldThrow` isEOFError
+  streamWrite server (BS.replicate 4096 0x72)
+
+halfCloseProtocol :: Text
+halfCloseProtocol = "/test/webrtc-half-close/1.0.0"
+
+within :: IO a -> IO a
+within action = timeout 5000000 action >>= maybe (fail "WebRTC half-close timed out") pure
+
+withRelayWebRTC :: (Switch -> Switch -> PeerId -> Multiaddr -> IO a) -> IO a
 withRelayWebRTC action = do
   (relayPeer, relayKey) <- generateIdentity
   bracket (newSwitch relayPeer relayKey) switchClose $ \relaySwitch -> do
@@ -185,7 +245,7 @@ withRelayWebRTC action = do
         _ <- registerNATHandlers clientSwitch defaultNATConfig
         webRTCTransport clientSwitch defaultWebRTCConfig >>= addTransport clientSwitch
         threadDelay 300000
-        action clientSwitch serverPeer $
+        action clientSwitch serverSwitch serverPeer $
           appendProtocols serverAddress [P2P (peerIdBytes serverPeer)]
 
 appendProtocols :: Multiaddr -> [Protocol] -> Multiaddr

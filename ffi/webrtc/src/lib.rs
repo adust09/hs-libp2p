@@ -487,6 +487,38 @@ pub struct HsWebRtcChannel {
     token: u64,
 }
 
+fn wait_channel_send(
+    channel: &HsWebRtcChannel,
+    response: mpsc::Receiver<Result<(), String>>,
+) -> Result<(), String> {
+    let shared = channel
+        .connection
+        .state
+        .lock()
+        .unwrap()
+        .channels
+        .get(&channel.token)
+        .cloned()
+        .ok_or("unknown WebRTC data channel")?;
+    loop {
+        match response.recv_timeout(Duration::from_millis(20)) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("WebRTC connection worker stopped".into());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let state = shared.state.lock().unwrap();
+                if state.closed {
+                    return Err("WebRTC data channel closed".into());
+                }
+                if let Some(error) = &state.error {
+                    return Err(error.clone());
+                }
+            }
+        }
+    }
+}
+
 fn crypto_provider() -> Arc<CryptoProvider> {
     Arc::new(str0m_rust_crypto::default_provider())
 }
