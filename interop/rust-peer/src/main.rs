@@ -140,7 +140,7 @@ async fn run_listener(
     })
     .await;
 
-    let json = match result {
+    let json = match &result {
         Ok(msg) => serde_json::json!({
             "gossipSubInterop": true,
             "role": "listener",
@@ -157,8 +157,15 @@ async fn run_listener(
     eprintln!("Result: {json}");
     redis_conn.rpush::<_, _, ()>("gossipResult", json.to_string())?;
 
-    // Keep alive briefly for response delivery
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    if result.is_err() {
+        return Err("timeout waiting for message".into());
+    }
+
+    // Swarm must keep being polled to flush the queued reply.
+    let _ = timeout(Duration::from_secs(3), async {
+        while swarm.next().await.is_some() {}
+    })
+    .await;
     Ok(())
 }
 

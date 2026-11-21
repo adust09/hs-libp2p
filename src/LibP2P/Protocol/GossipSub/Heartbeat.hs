@@ -489,7 +489,7 @@ cleanSeenCache router = do
   now <- gsGetTime router
   let ttl = paramSeenTTL (gsParams router)
   atomically $ modifyTVar' (gsSeen router) $
-    Map.filter (\ts -> diffUTCTime now ts <= ttl)
+    Map.filter (\entry -> diffUTCTime now (seenAt entry) <= ttl)
 
 -- Helpers
 

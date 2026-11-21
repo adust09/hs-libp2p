@@ -402,12 +402,12 @@ jobs:
           cache-from: type=gha,scope=gossipsub-rust
           cache-to: type=gha,mode=max,scope=gossipsub-rust
 
-      # The Rust listener exits zero only after it receives the Haskell payload.
-      - name: Rust listener receives the Haskell message
+      # Require the Haskell dialer to receive the Rust reply, not just send its request.
+      - name: Haskell dialer receives the Rust reply
         timeout-minutes: 10
         run: >-
           docker compose -f docker-compose.gossipsub.yml up --no-build
-          --abort-on-container-exit --exit-code-from rust-listener
+          --abort-on-container-exit --exit-code-from hs-dialer
           redis rust-listener hs-dialer
 
       - name: Reset Redis and containers between directions
