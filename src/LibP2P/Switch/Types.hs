@@ -31,6 +31,7 @@ import LibP2P.Switch.CertifiedRecords (CertifiedRecord)
 import LibP2P.Crypto.PeerId (PeerId)
 import LibP2P.Multiaddr (Multiaddr)
 import LibP2P.MultistreamSelect.Negotiation (ProtocolId, StreamIO)
+import LibP2P.PNet (PSK)
 import LibP2P.Protocol.Identify.Message (IdentifyInfo)
 import LibP2P.Switch.ResourceManager
   ( Direction (..)
@@ -157,6 +158,10 @@ data SwitchConfig = SwitchConfig
   , scSecurityProtocols :: ![ProtocolId]
   -- ^ Secure channels offered, in preference order. The default is Noise,
   -- then TLS 1.3 ("/tls/1.0.0").
+  , scPrivateNetwork :: !(Maybe PSK)
+  -- ^ Pre-shared key of the private network to join (specs/pnet). When set,
+  -- every connection is encrypted with it before security negotiation, and
+  -- transports without a raw byte stream (QUIC, WebTransport, WebRTC) are refused.
   }
   deriving (Show, Eq)
 
@@ -164,6 +169,7 @@ defaultSwitchConfig :: SwitchConfig
 defaultSwitchConfig = SwitchConfig
   { scYamuxConfig = defaultYamuxConfig
   , scSecurityProtocols = ["/noise", "/tls/1.0.0"]
+  , scPrivateNetwork = Nothing
   }
 
 -- | The Switch: central coordinator of the libp2p networking stack.

@@ -148,6 +148,7 @@ library
     LibP2P.Noise.Handshake
     LibP2P.Noise.Session
     LibP2P.Noise.WebTransport
+    LibP2P.PNet
     LibP2P.Protocol.GossipSub.Types
     LibP2P.Protocol.GossipSub.Message
     LibP2P.Protocol.GossipSub.Extensions
@@ -326,6 +327,7 @@ test-suite hs-libp2p-test
     LibP2P.Protocol.Perf.PerfSpec
     LibP2P.Noise.HandshakeSpec
     LibP2P.Noise.ForeignPeerSpec
+    LibP2P.PNetSpec
     LibP2P.DHT.DistanceSpec
     LibP2P.DHT.RoutingTableSpec
     LibP2P.DHT.MessageSpec
