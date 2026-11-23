@@ -1,18 +1,10 @@
 # Pin APT to the snapshot used to create the base image. The image digest alone
 # does not prevent Debian sid packages from changing between rebuilds.
-# deb.debian.org is a fallback for snapshot.debian.org outages; it serves
-# current sid, so pinning is only degraded while the snapshot is down.
 FROM debian:sid-slim@sha256:5ac67a4d7c0de96e83873e4dd8f7ea3b507ba292fb2cce60a0c3f73322df5cae AS pinned-debian
 
 RUN printf '%s\n' \
        'Types: deb' \
        'URIs: http://snapshot.debian.org/archive/debian/20261027T000000Z' \
-       'Suites: sid' \
-       'Components: main' \
-       'Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp' \
-       '' \
-       'Types: deb' \
-       'URIs: http://deb.debian.org/debian' \
        'Suites: sid' \
        'Components: main' \
        'Signed-By: /usr/share/keyrings/debian-archive-keyring.pgp' \
@@ -37,6 +29,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get install -y --no-install-recommends \
        cabal-install \
        ca-certificates \
+       curl \
        gcc \
        ghc \
        libc6-dev \
@@ -65,6 +58,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
        --disable-shared)" /out/libp2p-hole-punch \
     && apt-get purge -y --auto-remove \
        cabal-install \
+       curl \
        gcc \
        ghc \
        libc6-dev \
