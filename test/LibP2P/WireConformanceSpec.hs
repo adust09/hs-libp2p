@@ -13,6 +13,7 @@ module LibP2P.WireConformanceSpec (spec) where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.List.NonEmpty as NE
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import LibP2P.DHT.Message
   ( DHTMessage (..)
@@ -31,7 +32,7 @@ import LibP2P.MultistreamSelect.Negotiation
   , negotiateResponder
   )
 import LibP2P.MultistreamSelect.Wire (encodeMessage)
-import LibP2P.Noise.Handshake (NoisePayload (..), encodeNoisePayload)
+import LibP2P.Noise.Handshake.Payload (NoisePayload (..), encodeNoisePayload, NoiseExtensions (NoiseExtensions))
 import LibP2P.Protocol.GossipSub.Message (encodeRPC)
 import LibP2P.Protocol.GossipSub.Types (RPC (..), SubOpts (..))
 import LibP2P.Protocol.Identify (encodeFramedIdentify)
@@ -241,14 +242,39 @@ spec = do
       encodeRPC rpc `shouldBe` expected
 
   describe "noise handshake payload protobuf (specs/noise/README.md)" $ do
-    it "NoiseHandshakePayload matches a hand-derived vector" $ do
+    it "NoiseHandshakePayload without extensions matches a hand-derived vector" $ do
       -- Fields: 1 identity_key (bytes), 2 identity_sig (bytes).
+      -- A payload with no extensions must emit no field 4 at all — the
+      -- baseline every peer that omits NoiseExtensions sees on the wire.
       let payload = NoisePayload
             { npIdentityKey = "IDKEY"
             , npIdentitySig = "IDSIG"
+            , npExts = Nothing
             }
           expected = BS.concat
             [ BS.pack [0x0a, 0x05], "IDKEY"
             , BS.pack [0x12, 0x05], "IDSIG"
+            ]
+      encodeNoisePayload payload `shouldBe` expected
+
+    it "NoiseHandshakePayload with NoiseExtensions matches a hand-derived vector" $ do
+      -- Fields: 1 identity_key, 2 identity_sig, 4 NoiseExtensions
+      -- { repeated bytes webtransport_certhashes = 1;
+      --   repeated string stream_muxers = 2 } (specs/noise payload schema).
+      let payload = NoisePayload
+            { npIdentityKey = "IDKEY"
+            , npIdentitySig = "IDSIG"
+            , npExts = Just $ NoiseExtensions
+                [BS.replicate 8 0x22, BS.replicate 8 0x33] $
+                NE.nonEmpty ["/yamux/1.0.0", "/mplex/6.7.0"]
+            }
+          expected = BS.concat
+            [ BS.pack [0x0a, 0x05], "IDKEY"                   -- field 1
+            , BS.pack [0x12, 0x05], "IDSIG"                   -- field 2
+            , BS.pack [0x22, 0x30]                            -- field 4: 48-byte message
+            , BS.pack [0x0a, 0x08], BS.replicate 8 0x22       --   1 webtransport_certhashes
+            , BS.pack [0x0a, 0x08], BS.replicate 8 0x33       --   1 webtransport_certhashes
+            , BS.pack [0x12, 0x0c], "/yamux/1.0.0"            --   2 stream_muxers
+            , BS.pack [0x12, 0x0c], "/mplex/6.7.0"            --   2 stream_muxers
             ]
       encodeNoisePayload payload `shouldBe` expected

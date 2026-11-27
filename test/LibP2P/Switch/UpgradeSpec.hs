@@ -1,6 +1,6 @@
 module LibP2P.Switch.UpgradeSpec (spec) where
 
-import Control.Concurrent.Async (concurrently)
+import Control.Concurrent.Async (concurrently, wait, withAsync)
 import qualified Data.ByteString as BS
 import Data.IORef (newIORef)
 import LibP2P.Crypto.Ed25519 (generateKeyPair)
@@ -8,9 +8,25 @@ import LibP2P.Crypto.Key (KeyPair, publicKey)
 import LibP2P.Crypto.PeerId (PeerId, fromPublicKey)
 import LibP2P.Multiaddr (Multiaddr (..))
 import LibP2P.Multiaddr.Protocol (Protocol (..))
-import LibP2P.MultistreamSelect.Negotiation (StreamIO (..), mkMemoryStreamPair)
+import LibP2P.MultistreamSelect.Negotiation
+  ( NegotiationResult (..)
+  , StreamIO (..)
+  , mkMemoryStreamPair
+  , negotiateInitiator
+  , negotiateResponder
+  )
 import LibP2P.Noise.Framing (maxNoisePlaintextSize)
-import LibP2P.Noise.Handshake (HandshakeResult (..))
+import LibP2P.Noise.Handshake (HandshakeResult (..), InlinedNegotiationResult(..))
+import LibP2P.Yamux.Frame
+  ( FrameType (..)
+  , Flags (..)
+  , YamuxHeader (..)
+  , decodeHeader
+  , defaultFlags
+  , encodeHeader
+  , headerSize
+  )
+import System.Timeout (timeout)
 import LibP2P.Security.TLS (tlsProtocolId)
 import LibP2P.Switch.ResourceManager
   ( DefaultLimits (..)
@@ -23,6 +39,10 @@ import LibP2P.Switch.Upgrade hiding (upgradeInbound, upgradeOutbound)
 import qualified LibP2P.Switch.Upgrade as Upgrade
 import LibP2P.Transport (ConnectionEndpoint (..), RawConnection (..), RelayCircuitLimit (..))
 import Test.Hspec
+import Control.Monad (forM_)
+import Data.List (isInfixOf)
+import Control.Exception (IOException)
+import LibP2P.Noise.Handshake.Payload (buildInlinedExtensions)
 
 -- | Generate a test identity (PeerId, KeyPair).
 mkTestIdentity :: IO (PeerId, KeyPair)
@@ -91,11 +111,52 @@ spec = do
       (streamA, streamB) <- mkMemoryStreamPair
       ((_sessA, resultA), (_sessB, resultB)) <-
         concurrently
-          (performStreamHandshake kpA Outbound streamA)
-          (performStreamHandshake kpB Inbound streamB)
+          (performStreamHandshake kpA Nothing Outbound streamA)
+          (performStreamHandshake kpB Nothing Inbound streamB)
       -- A sees B's PeerId, B sees A's PeerId
       hrRemotePeerId resultA `shouldBe` pidB
       hrRemotePeerId resultB `shouldBe` pidA
+    it "selects the correct muxer if supplied" $ do
+      let responderMuxers = [ "/mplex/6.7.0", "/yamux/1.0.0" ] -- Sent in 2nd message
+      let initiatorMuxers = [ "/yamux/1.0.0", "/mplex/6.7.0" ] -- Sent in 3rd message
+      (_pidA, kpA) <- mkTestIdentity
+      (_pidB, kpB) <- mkTestIdentity
+      (streamA, streamB) <- mkMemoryStreamPair
+      ((_sessA, resultA), (_sessB, resultB)) <- do
+        let initiatorExts = buildInlinedExtensions initiatorMuxers
+        let responderExts = buildInlinedExtensions responderMuxers
+        concurrently
+          (performStreamHandshake kpA initiatorExts Outbound streamA)
+          (performStreamHandshake kpB responderExts Inbound streamB)
+      let (muxerA, muxerB) = (hrNegotiatedMuxer resultA, hrNegotiatedMuxer resultB)
+      muxerA `shouldBe` Selected "/yamux/1.0.0"
+      muxerB `shouldBe` Selected "/yamux/1.0.0"
+    it "falls back if either party does not supply the muxer list" $ do
+      forM_ [ ([], ["/mplex/6.8.0", "/yamux/1.1.0"])
+            , (["/mplex/6.8.0", "/yamux/1.1.0"], []) ] $ \(responderMuxers, initiatorMuxers) -> do
+          (_pidA, kpA) <- mkTestIdentity
+          (_pidB, kpB) <- mkTestIdentity
+          (streamA, streamB) <- mkMemoryStreamPair
+          ((_sessA, resultA), (_sessB, resultB)) <- do
+            let initiatorExts = buildInlinedExtensions initiatorMuxers
+            let responderExts = buildInlinedExtensions responderMuxers
+            concurrently
+              (performStreamHandshake kpA initiatorExts Outbound streamA)
+              (performStreamHandshake kpB responderExts Inbound streamB)
+          let (muxerA, muxerB) = (hrNegotiatedMuxer resultA, hrNegotiatedMuxer resultB)
+          muxerA `shouldBe` Fallback
+          muxerB `shouldBe` Fallback
+    it "fails if the supplied muxers have no overlap" $ do
+      let responderExts = buildInlinedExtensions [ "/mplex/6.8.0", "/yamux/1.1.0" ] -- Sent in 2nd message
+      let initiatorExts = buildInlinedExtensions [ "/yamux/1.0.0", "/mplex/6.7.0" ] -- Sent in 3rd message
+      (_pidA, kpA) <- mkTestIdentity
+      (_pidB, kpB) <- mkTestIdentity
+      (streamA, streamB) <- mkMemoryStreamPair
+      let isNonOverlapping = \e ->
+            "both peers supply non-overlapping muxer lists" `isInfixOf` (show (e :: IOException))
+      (concurrently
+          (performStreamHandshake kpA initiatorExts Outbound streamA)
+          (performStreamHandshake kpB responderExts Inbound streamB)) `shouldThrow` isNonOverlapping
 
   describe "noiseSessionToStreamIO" $ do
     it "encrypted write on one side is decrypted read on other side" $ do
@@ -105,8 +166,8 @@ spec = do
       -- Perform handshake to get sessions
       ((sessA, _), (sessB, _)) <-
         concurrently
-          (performStreamHandshake kpA Outbound rawA)
-          (performStreamHandshake kpB Inbound rawB)
+          (performStreamHandshake kpA Nothing Outbound rawA)
+          (performStreamHandshake kpB Nothing Inbound rawB)
       -- Create encrypted StreamIOs
       sendRefA <- newIORef sessA
       recvRefA <- newIORef sessA
@@ -131,8 +192,8 @@ spec = do
       (rawA, rawB) <- mkMemoryStreamPair
       ((sessA, _), (sessB, _)) <-
         concurrently
-          (performStreamHandshake kpA Outbound rawA)
-          (performStreamHandshake kpB Inbound rawB)
+          (performStreamHandshake kpA Nothing Outbound rawA)
+          (performStreamHandshake kpB Nothing Inbound rawB)
       sendRefA <- newIORef sessA
       recvRefA <- newIORef sessA
       bufRefA  <- newIORef BS.empty
@@ -162,8 +223,8 @@ spec = do
       (rawA, rawB) <- mkMemoryStreamPair
       ((sessA, _), (sessB, _)) <-
         concurrently
-          (performStreamHandshake kpA Outbound rawA)
-          (performStreamHandshake kpB Inbound rawB)
+          (performStreamHandshake kpA Nothing Outbound rawA)
+          (performStreamHandshake kpB Nothing Inbound rawB)
       sendRefA <- newIORef sessA
       recvRefA <- newIORef sessA
       bufRefA  <- newIORef BS.empty
@@ -196,8 +257,8 @@ spec = do
       (rawA, rawB) <- mkMemoryStreamPair
       ((sessA, _), (sessB, _)) <-
         concurrently
-          (performStreamHandshake kpA Outbound rawA)
-          (performStreamHandshake kpB Inbound rawB)
+          (performStreamHandshake kpA Nothing Outbound rawA)
+          (performStreamHandshake kpB Nothing Inbound rawB)
       sendRefA <- newIORef sessA
       recvRefA <- newIORef sessA
       bufRefA  <- newIORef BS.empty
@@ -385,3 +446,144 @@ spec = do
       received `shouldBe` payload
       muxClose (connSession connA)
       muxClose (connSession connB)
+
+    it "inline muxer selection skips the /yamux/1.0.0 multistream-select" $ do
+      (_pidA, kpA) <- mkTestIdentity
+      (_pidB, kpB) <- mkTestIdentity
+      (rawA, rawB) <- mkMemoryStreamPair
+      rawConnA <- mkMockRawConn rawA localAddr remoteAddr
+
+      -- Scripted peer: multistream-select /noise, then the Noise handshake
+      -- carrying NoiseExtensions, and from then on it reads the encrypted
+      -- channel directly. It never answers a multistream-select proposal for
+      -- the muxer, so a dialer that did not skip step 4 would block waiting
+      -- for that answer instead of speaking Yamux.
+      let responderExts = buildInlinedExtensions ["/yamux/1.0.0"]
+          scriptedResponder = do
+            neg <- negotiateResponder rawB ["/noise"]
+            neg `shouldBe` Accepted "/noise"
+            (sess, _hr) <- performStreamHandshake kpB responderExts Inbound rawB
+            sendRef <- newIORef sess
+            recvRef <- newIORef sess
+            bufRef <- newIORef BS.empty
+            let enc = noiseSessionToStreamIO sendRef recvRef bufRef rawB
+            hdrBytes <- readExact enc headerSize
+            case decodeHeader hdrBytes of
+              Left err -> expectationFailure ("undecodable Yamux header: " <> err)
+              Right hdr -> do
+                -- A multistream proposal for "/yamux/1.0.0" is 0x11 followed
+                -- by that string and a newline, and would land here instead
+                -- of a version-0 Yamux data header carrying SYN on the
+                -- dialer's first (odd) stream id.
+                yhVersion hdr `shouldBe` 0
+                yhType hdr `shouldBe` FrameData
+                flagSYN (yhFlags hdr) `shouldBe` True
+                yhStreamId hdr `shouldBe` 1
+                -- ACK the stream, mirroring 'acceptStream'.
+                streamWrite enc $ encodeHeader hdr
+                  { yhType = FrameWindowUpdate
+                  , yhFlags = defaultFlags {flagACK = True}
+                  , yhLength = 0
+                  }
+
+      mConn <- timeout 5000000 $
+        withAsync scriptedResponder $ \responder -> do
+          connA <- upgradeOutbound kpA rawConnA
+          _ <- muxOpenStream (connSession connA)
+          wait responder
+          pure connA
+      case mConn of
+        Nothing ->
+          expectationFailure
+            "upgradeOutbound waited for a muxer multistream-select round trip"
+        Just connA -> muxClose (connSession connA)
+
+    it "dialer falls back to muxer multistream-select when the peer omits NoiseExtensions (#251)" $ do
+      (_pidA, kpA) <- mkTestIdentity
+      (_pidB, kpB) <- mkTestIdentity
+      (rawA, rawB) <- mkMemoryStreamPair
+      rawConnA <- mkMockRawConn rawA localAddr remoteAddr
+
+      -- A peer that leaves field 4 out of its handshake payload is the
+      -- pre-existing wire format (rust-libp2p, js-libp2p, older go-libp2p).
+      -- Both sides must see Fallback, so the dialer runs the post-handshake
+      -- multistream-select and this peer — which never inlines — only ever
+      -- answers that exchange. A dialer that inlined anyway would hand the
+      -- peer a Yamux frame where a multistream header is expected.
+      let scriptedResponder = do
+            neg <- negotiateResponder rawB ["/noise"]
+            neg `shouldBe` Accepted "/noise"
+            (sess, hr) <- performStreamHandshake kpB Nothing Inbound rawB
+            hrNegotiatedMuxer hr `shouldBe` Fallback
+            sendRef <- newIORef sess
+            recvRef <- newIORef sess
+            bufRef <- newIORef BS.empty
+            let enc = noiseSessionToStreamIO sendRef recvRef bufRef rawB
+            muxNeg <- negotiateResponder enc ["/yamux/1.0.0"]
+            muxNeg `shouldBe` Accepted "/yamux/1.0.0"
+            hdrBytes <- readExact enc headerSize
+            case decodeHeader hdrBytes of
+              Left err -> expectationFailure ("undecodable Yamux header: " <> err)
+              Right hdr -> do
+                yhVersion hdr `shouldBe` 0
+                yhType hdr `shouldBe` FrameData
+                flagSYN (yhFlags hdr) `shouldBe` True
+                yhStreamId hdr `shouldBe` 1
+                streamWrite enc $ encodeHeader hdr
+                  { yhType = FrameWindowUpdate
+                  , yhFlags = defaultFlags {flagACK = True}
+                  , yhLength = 0
+                  }
+
+      mConn <- timeout 5000000 $
+        withAsync scriptedResponder $ \responder -> do
+          connA <- upgradeOutbound kpA rawConnA
+          _ <- muxOpenStream (connSession connA)
+          wait responder
+          pure connA
+      case mConn of
+        Nothing ->
+          expectationFailure
+            "upgradeOutbound did not run the post-handshake muxer negotiation"
+        Just connA -> muxClose (connSession connA)
+
+    it "listener falls back to muxer multistream-select when the peer omits NoiseExtensions (#251)" $ do
+      (_pidA, kpA) <- mkTestIdentity
+      (_pidB, kpB) <- mkTestIdentity
+      (rawA, rawB) <- mkMemoryStreamPair
+      rawConnA <- mkMockRawConn rawA localAddr remoteAddr
+
+      -- Mirror of the dialer case: the peer is the initiator and omits
+      -- field 4, so the listener must fall back too. The peer only speaks
+      -- multistream-select for the muxer, then opens a client stream that
+      -- the listener's yamux server session accepts.
+      let scriptedInitiator = do
+            neg <- negotiateInitiator rawB ["/noise"]
+            neg `shouldBe` Accepted "/noise"
+            (sess, hr) <- performStreamHandshake kpB Nothing Outbound rawB
+            hrNegotiatedMuxer hr `shouldBe` Fallback
+            sendRef <- newIORef sess
+            recvRef <- newIORef sess
+            bufRef <- newIORef BS.empty
+            let enc = noiseSessionToStreamIO sendRef recvRef bufRef rawB
+            muxNeg <- negotiateInitiator enc ["/yamux/1.0.0"]
+            muxNeg `shouldBe` Accepted "/yamux/1.0.0"
+            streamWrite enc $ encodeHeader YamuxHeader
+              { yhVersion = 0
+              , yhType = FrameData
+              , yhFlags = defaultFlags {flagSYN = True}
+              , yhStreamId = 1
+              , yhLength = 0
+              }
+
+      mConn <- timeout 5000000 $
+        withAsync scriptedInitiator $ \initiator -> do
+          connA <- upgradeInbound kpA rawConnA
+          stream <- muxAcceptStream (connSession connA)
+          wait initiator
+          pure (connA, stream)
+      case mConn of
+        Nothing ->
+          expectationFailure
+            "upgradeInbound did not run the post-handshake muxer negotiation"
+        Just (connA, _stream) -> muxClose (connSession connA)
