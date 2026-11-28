@@ -33,6 +33,7 @@ module LibP2P.Transport.WebRTC.FFI (
   channelSend,
   channelReceive,
   channelClose,
+  channelStreamIO,
   connectionClose,
 ) where
 
@@ -48,6 +49,9 @@ import Foreign.Marshal.Alloc (alloca, allocaBytes)
 import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Storable (peek, poke)
+import LibP2P.MultistreamSelect.Negotiation (StreamIO)
+import LibP2P.Transport.WebRTC.Stream (ChannelIO (..))
+import qualified LibP2P.Transport.WebRTC.Stream as Stream
 
 data CWebRTCListener
 data CWebRTCConnection
@@ -140,6 +144,9 @@ foreign import ccall interruptible "hs_webrtc_channel_recv"
 
 foreign import ccall unsafe "hs_webrtc_bytes_free"
   cBytesFree :: Ptr Word8 -> CSize -> IO ()
+
+foreign import ccall safe "hs_webrtc_channel_shutdown"
+  cChannelShutdown :: Ptr CWebRTCChannel -> IO ()
 
 foreign import ccall safe "hs_webrtc_channel_close"
   cChannelClose :: Ptr CWebRTCChannel -> IO ()
@@ -290,6 +297,15 @@ channelReceive channel = alloca $ \outputPtr -> alloca $ \lengthPtr -> do
 
 channelClose :: Ptr CWebRTCChannel -> IO ()
 channelClose = cChannelClose
+
+-- 10000000 is the FIN_ACK patience for local close, in microseconds (10 s).
+channelStreamIO :: Ptr CWebRTCChannel -> IO StreamIO
+channelStreamIO channel = Stream.channelToStreamIO 10000000 ChannelIO
+  { dcSend = channelSend channel
+  , dcReceive = channelReceive channel
+  , dcShutdown = cChannelShutdown channel
+  , dcClose = channelClose channel
+  }
 
 connectionClose :: Ptr CWebRTCConnection -> IO ()
 connectionClose = cConnectionClose

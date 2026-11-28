@@ -32,7 +32,7 @@ import LibP2P.Transport (
   Transport (..),
  )
 import LibP2P.Transport.WebRTC.FFI qualified as FFI
-import LibP2P.Transport.WebRTC.Stream (channelToStreamIO, closeOnce)
+import LibP2P.Transport.WebRTC.Stream (closeOnce)
 import Network.Socket qualified as Socket
 import Text.Read (readMaybe)
 
@@ -104,7 +104,7 @@ establishConnection ::
   Multiaddr -> Maybe PeerId -> IO RawConnection
 establishConnection identity direction connection advertisedLocal remoteAddress expectedPeer = do
   noiseChannel <- FFI.connectionNoiseChannel connection
-  noiseStream <- channelToStreamIO noiseChannel
+  noiseStream <- FFI.channelStreamIO noiseChannel
   prologue <- webRTCNoisePrologue direction connection
   let noiseDirection = case direction of
         Outbound -> Inbound
@@ -119,8 +119,8 @@ establishConnection identity direction connection advertisedLocal remoteAddress 
         { nativePeerId = hrRemotePeerId handshake
         , nativeSecurity = "/noise"
         , nativeMuxerProtocol = "/webrtc-direct"
-        , nativeOpenStream = FFI.connectionOpenChannel connection >>= channelToStreamIO
-        , nativeAcceptStream = FFI.connectionAcceptChannel connection >>= channelToStreamIO
+        , nativeOpenStream = FFI.connectionOpenChannel connection >>= FFI.channelStreamIO
+        , nativeAcceptStream = FFI.connectionAcceptChannel connection >>= FFI.channelStreamIO
         , nativeClose = close
         }
   pure RawConnection

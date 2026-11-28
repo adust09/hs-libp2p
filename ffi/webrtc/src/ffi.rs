@@ -445,14 +445,10 @@ pub extern "C" fn hs_webrtc_channel_send(
         set_error("WebRTC connection worker stopped");
         return -1;
     }
-    match rx.recv() {
-        Ok(Ok(())) => 0,
-        Ok(Err(err)) => {
+    match wait_channel_send(channel, rx) {
+        Ok(()) => 0,
+        Err(err) => {
             set_error(err);
-            -1
-        }
-        Err(_) => {
-            set_error("WebRTC connection worker stopped");
             -1
         }
     }
@@ -515,15 +511,39 @@ pub extern "C" fn hs_webrtc_bytes_free(data: *mut u8, length: usize) {
     }
 }
 
+// Wake blocked I/O without freeing a handle still borrowed by another caller.
+#[unsafe(no_mangle)]
+pub extern "C" fn hs_webrtc_channel_shutdown(channel: *const HsWebRtcChannel) {
+    if channel.is_null() {
+        return;
+    }
+    let channel = unsafe { &*channel };
+    let shared = {
+        let state = channel.connection.state.lock().unwrap();
+        state.channels.get(&channel.token).cloned()
+    };
+    if let Some(shared) = shared {
+        let mut state = shared.state.lock().unwrap();
+        if state.closed {
+            return;
+        }
+        state.closed = true;
+        shared.ready.notify_all();
+    } else {
+        return;
+    }
+    let _ = channel.connection.command.send(Command::CloseChannel {
+        token: channel.token,
+    });
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn hs_webrtc_channel_close(channel: *mut HsWebRtcChannel) {
     if channel.is_null() {
         return;
     }
-    let channel = unsafe { Box::from_raw(channel) };
-    let _ = channel.connection.command.send(Command::CloseChannel {
-        token: channel.token,
-    });
+    hs_webrtc_channel_shutdown(channel);
+    unsafe { drop(Box::from_raw(channel)) };
 }
 
 #[unsafe(no_mangle)]
@@ -538,6 +558,36 @@ pub extern "C" fn hs_webrtc_connection_close(connection: *mut HsWebRtcConnection
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_unblock_sender_when_channel_shutdown_interrupts_backend_backpressure() {
+        let (command, commands) = mpsc::channel();
+        let address = "127.0.0.1:1".parse().unwrap();
+        let shared = Arc::new(SharedConnection::new(command, Vec::new(), address, address));
+        let channel = channel_handle(shared, 0);
+        let handle = channel as usize;
+        let (done, result) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            done.send(hs_webrtc_channel_send(
+                handle as *const HsWebRtcChannel,
+                b"x".as_ptr(),
+                1,
+            ))
+            .unwrap();
+        });
+        let _pending_send = commands.recv_timeout(Duration::from_secs(1)).unwrap();
+        hs_webrtc_channel_shutdown(channel);
+        hs_webrtc_channel_shutdown(channel);
+        assert!(matches!(
+            commands.recv().unwrap(),
+            Command::CloseChannel { .. }
+        ));
+        assert!(commands.try_recv().is_err());
+        assert_eq!(result.recv_timeout(Duration::from_secs(1)).unwrap(), -1);
+        writer.join().unwrap();
+        hs_webrtc_channel_close(channel);
+        assert!(commands.try_recv().is_err());
+    }
 
     #[test]
     fn connects_v2_and_exchanges_noise_channel_data() {
@@ -704,6 +754,20 @@ mod tests {
             payload
         );
         hs_webrtc_bytes_free(received, received_len);
+        let receiver_handle = server_channel as usize;
+        let receiver = thread::spawn(move || {
+            let mut output = ptr::null_mut();
+            let mut length = 0;
+            let status = hs_webrtc_channel_recv(
+                receiver_handle as *const HsWebRtcChannel,
+                &mut output,
+                &mut length,
+            );
+            hs_webrtc_bytes_free(output, length);
+            status
+        });
+        hs_webrtc_channel_shutdown(server_channel);
+        assert_eq!(receiver.join().unwrap(), 1);
         hs_webrtc_channel_close(client_channel);
         hs_webrtc_channel_close(server_channel);
     }
