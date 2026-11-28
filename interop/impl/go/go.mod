@@ -1,4 +1,4 @@
-module hs-libp2p/interop/get-value-roundtrip/go-peer
+module hs-libp2p/interop/impl/go
 
 go 1.26.0
 

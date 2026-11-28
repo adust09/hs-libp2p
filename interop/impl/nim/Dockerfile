@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.5-labs
-FROM nimlang/nim:2.2.12 AS builder
+FROM nimlang/nim:2.2.12@sha256:c89292b167d457a3d8576ed06c2ee9ced9a0df5a65c421dd5e54fdc54fb272db AS builder
 
 WORKDIR /app
 
@@ -36,7 +36,7 @@ RUN cd nim-libp2p \
       -d:chronicles_colors=None --threads:on \
       -o:/app/perf-interop ./interop/perf/main.nim
 
-FROM debian:trixie-slim AS runtime
+FROM debian:trixie-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0 AS runtime
 
 COPY --from=builder /app/perf-interop /app/perf-interop
 

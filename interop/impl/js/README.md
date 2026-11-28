@@ -12,7 +12,7 @@ signaling. Redis coordinates the relay and listener multiaddrs.
 Run both directions from the repository root:
 
 ```bash
-./interop/webrtc/run.sh
+./interop/impl/js/run.sh
 ```
 
 A successful run prints `js_to_hs_ping_ms` for the first direction and the

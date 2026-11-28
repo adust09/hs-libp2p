@@ -330,7 +330,7 @@ runQuerier testKey = do
 ------------------------------------------------------------------------------
 
 -- | PUT a /pk/ record into a stock go-libp2p Kad-DHT responder
--- (interop/get-value-roundtrip/go-peer) and GET it back with a fresh node.
+-- (interop/impl/go) and GET it back with a fresh node.
 -- This pins the request-key binding to the real go wire: go's ValueStore
 -- only serves records whose embedded key matches the requested key, and the
 -- querier must accept that conforming response.

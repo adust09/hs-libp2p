@@ -25,5 +25,5 @@ cabal.project.local~
 cabal.project.freeze
 go-libp2p/
 nim-libp2p/
-interop/rust-peer/target/
+interop/impl/rust/target/
 ffi/webrtc/target/
