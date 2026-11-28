@@ -10,7 +10,7 @@ services:
   js-interop:
     build:
       context: .
-      dockerfile: interop/webrtc/Dockerfile
+      dockerfile: interop/impl/js/Dockerfile
     environment:
       ROLE: ${WEBRTC_JS_ROLE:-hs-listener}
       REDIS_ADDR: redis:6379

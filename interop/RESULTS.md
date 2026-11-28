@@ -27,7 +27,7 @@ v2 server carried SDP offer/answer signaling; the resulting SCTP data channel
 carried libp2p streams directly between the peers.
 
 ```bash
-./interop/webrtc/run.sh
+./interop/impl/js/run.sh
 ```
 
 Both dialers exited 0. The js-libp2p client measured a 3 ms Ping RTT to the
@@ -238,7 +238,7 @@ docker compose -f docker-compose.cross.yml run --rm \
 - This validates the upstream transport-interop **ping** contract against go-libp2p.
   Continuous proof in CI and upstream registration in `libp2p/test-plans` are tracked
   separately.
-- A GossipSub cross-test against the bundled `interop/rust-peer/`
+- A GossipSub cross-test against the bundled `interop/impl/rust/`
   (`make -C interop cross-gossipsub`) exists but validates GossipSub messaging, not the
   transport-interop ping spec; a true rust transport-interop ping check uses the official
   rust container and is deferred to the upstream-submission work.

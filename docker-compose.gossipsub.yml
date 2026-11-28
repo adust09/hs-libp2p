@@ -36,7 +36,7 @@ services:
   rust-listener:
     image: hs-libp2p-gossipsub-rust:latest
     build:
-      context: ./interop/rust-peer
+      context: ./interop/impl/rust
     depends_on:
       redis:
         condition: service_healthy
@@ -70,7 +70,7 @@ services:
   rust-dialer:
     image: hs-libp2p-gossipsub-rust:latest
     build:
-      context: ./interop/rust-peer
+      context: ./interop/impl/rust
     depends_on:
       redis:
         condition: service_healthy
