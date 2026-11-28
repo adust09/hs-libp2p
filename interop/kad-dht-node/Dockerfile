@@ -3,7 +3,7 @@
 # Follows the same pattern as the transport interop Dockerfile at /Dockerfile.
 
 # Stage 1: Build with GHC 9.10
-FROM haskell:9.10-slim-bookworm AS builder
+FROM haskell:9.10-slim-bookworm@sha256:ce03edeb96b0975fdebf21217cfe250beb75199b49e3be6677810eb5a8cb3cea AS builder
 
 WORKDIR /app
 
@@ -30,7 +30,7 @@ RUN cabal build libp2p-kad-dht-node \
     && strip /app/libp2p-kad-dht-node
 
 # Stage 2: Minimal runtime image
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
