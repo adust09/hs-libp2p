@@ -93,7 +93,7 @@ announceProvider node addrs key = do
   where
     sendProvider providerMsg entry = void $
       tryJust synchronousException
-        (dhtSendRequest node (entryPeerId entry) providerMsg)
+        (dhtSendMessage node (entryPeerId entry) providerMsg)
 
 synchronousException :: SomeException -> Maybe SomeException
 synchronousException exception =

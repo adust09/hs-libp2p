@@ -231,6 +231,7 @@ listenCircuit sw st refreshCfg addr = do
     { listenerAccept = acceptFrom queue
     , listenerClose  = unregisterQueue st (caRelayId circuit)
     , listenerAddr   = listenAddr
+    , listenerCurrentAddr = pure listenAddr
     }
 
 -- | Extract the expiration time the relay granted, per circuit-v2's

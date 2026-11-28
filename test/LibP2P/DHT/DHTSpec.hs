@@ -450,10 +450,8 @@ spec = do
       streamClose clientStream
       handleDHTRequest node serverStream remotePid testAddr
 
-      result <- readFramedMessage clientStream maxDHTMessageSize
-      case result of
-        Right resp -> msgType resp `shouldBe` AddProvider
-        Left err -> expectationFailure $ "Failed: " ++ err
+      timeout 10000 (readFramedMessage clientStream maxDHTMessageSize)
+        `shouldReturn` Nothing
 
       -- Mismatched provider must NOT be stored
       stored <- getProviders node key
@@ -475,10 +473,8 @@ spec = do
       streamClose clientStream
       handleDHTRequest node serverStream remotePid testAddr
 
-      result <- readFramedMessage clientStream maxDHTMessageSize
-      case result of
-        Right resp -> msgType resp `shouldBe` AddProvider
-        Left err -> expectationFailure $ "Failed: " ++ err
+      timeout 10000 (readFramedMessage clientStream maxDHTMessageSize)
+        `shouldReturn` Nothing
 
       -- Provider should now be persisted
       stored <- getProviders node key
@@ -500,7 +496,8 @@ spec = do
       writeFramedMessage clientStream1 addReq
       streamClose clientStream1
       handleDHTRequest node serverStream1 remotePid testAddr
-      _ <- readFramedMessage clientStream1 maxDHTMessageSize
+      timeout 10000 (readFramedMessage clientStream1 maxDHTMessageSize)
+        `shouldReturn` Nothing
 
       -- Send GET_PROVIDERS for the same key
       (clientStream2, serverStream2) <- mkStreamPair

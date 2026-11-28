@@ -41,6 +41,33 @@ jobs:
           LC_ALL: C
         run: cabal test all --test-show-details=direct
 
+  windows-tcp:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Haskell
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: '9.10.3'
+          cabal-version: '3.12'
+        id: windows-haskell
+
+      - name: Cache Cabal
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.windows-haskell.outputs.cabal-store }}
+            dist-newstyle
+          key: ${{ runner.os }}-cabal-tcp-${{ hashFiles('hs-libp2p.cabal', 'cabal.project') }}
+
+      - name: Test TCP portability and listen-port reuse
+        shell: bash
+        run: |
+          cabal update
+          cabal test hs-libp2p-test --test-show-details=direct --test-option=--match --test-option=LibP2P.Transport.TCP
+
   webrtc-tests:
     runs-on: ubuntu-latest
 

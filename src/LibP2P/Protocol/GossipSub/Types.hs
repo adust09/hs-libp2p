@@ -59,6 +59,8 @@ module LibP2P.Protocol.GossipSub.Types
   , CacheEntry (..)
   , MessageCache (..)
     -- * Router state
+  , SeenMessage (..)
+  , SeenValidation (..)
   , GossipSubRouter (..)
     -- * Defaults
   , emptyRPC
@@ -520,6 +522,20 @@ data MessageCache = MessageCache
 
 -- Router state
 
+-- | Validation outcomes share the lifetime of the message's deduplication entry.
+data SeenMessage = SeenMessage
+  { seenAt :: !UTCTime
+  , seenValidation :: !SeenValidation
+  } deriving (Show, Eq)
+
+data SeenValidation
+  = PendingValidation !(Set PeerId)
+  | AcceptedValidation !UTCTime !(Set PeerId)
+    -- ^ Validation completion time and sources already seen, including the first sender.
+  | RejectedValidation
+  | IgnoredValidation
+  deriving (Show, Eq)
+
 -- | GossipSub router state with STM-managed concurrent state.
 data GossipSubRouter = GossipSubRouter
   { gsParams      :: !GossipSubParams
@@ -544,7 +560,7 @@ data GossipSubRouter = GossipSubRouter
   , gsPartialMessagesHooks :: !(TVar (Maybe PartialMessagesHooks))
     -- ^ Installed partial-message runtime, if enabled.
     -- Message deduplication
-  , gsSeen        :: !(TVar (Map MessageId UTCTime))
+  , gsSeen        :: !(TVar (Map MessageId SeenMessage))
     -- Backoff state
   , gsBackoff     :: !(TVar (Map (PeerId, Topic) UTCTime))
   , gsRetainedScores :: !(TVar (Map PeerId (PeerState, UTCTime)))
